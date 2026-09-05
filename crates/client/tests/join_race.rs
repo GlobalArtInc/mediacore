@@ -40,7 +40,7 @@ fn join_frame() -> Message {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_join_response_is_never_missed_by_a_late_subscriber() {
+async fn a_hundred_joins_in_a_row_all_get_their_response() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -86,10 +86,13 @@ async fn the_join_response_is_never_missed_by_a_late_subscriber() {
         let client = Client::connect_with(&format!("ws://{addr}"), "token", options.clone())
             .await
             .unwrap_or_else(|error| {
-                panic!("attempt {attempt} lost the join response to the reader task: {error}")
+                panic!("attempt {attempt} never got its join response: {error}")
             });
 
-        assert_eq!(client.join().participant.as_ref().unwrap().identity, "alice");
+        assert_eq!(
+            client.join().participant.as_ref().unwrap().identity,
+            "alice"
+        );
     }
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
