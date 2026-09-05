@@ -76,4 +76,4 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-`protoc` is required to build `crates/proto`.
+The protobuf definitions are compiled by `protox`, so no system `protoc` is needed.

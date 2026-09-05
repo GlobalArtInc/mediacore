@@ -16,7 +16,8 @@ fn main() -> Result<()> {
     }
     println!("cargo:rerun-if-changed=protobufs/logger/options.proto");
 
-    let mut config = prost_build::Config::new();
-    config.protoc_arg("--experimental_allow_proto3_optional");
-    config.compile_protos(PROTOS, &["protobufs"])
+    let descriptors = protox::compile(PROTOS, ["protobufs"])
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    prost_build::Config::new().compile_fds(descriptors)
 }
