@@ -98,7 +98,7 @@ impl Client {
             subscriber.clone(),
             options.event_buffer,
         );
-        let mut responses = signalling.handle.subscribe();
+        let mut responses = signalling.responses;
 
         let join = responses
             .wait_for(options.response_timeout, |message| match message {

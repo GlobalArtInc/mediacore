@@ -51,4 +51,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        env:
+          RUST_LOG: mediacore=debug,mediacore_transport=debug,mediacore_server=debug
+        run: cargo test --workspace -- --nocapture --test-threads=1

@@ -141,6 +141,7 @@ impl SignalStream {
 
 pub(crate) struct Signalling {
     pub(crate) handle: SignalHandle,
+    pub(crate) responses: SignalStream,
     pub(crate) reader: tokio::task::JoinHandle<()>,
     pub(crate) writer: tokio::task::JoinHandle<()>,
 }
@@ -169,11 +170,14 @@ pub(crate) fn start(
         subscriber,
     };
 
+    let subscribed = handle.subscribe();
+
     let writer = tokio::spawn(write_loop(sink, outbox));
     let reader = tokio::spawn(read_loop(stream, responses, events, state, routes));
 
     Signalling {
         handle,
+        responses: subscribed,
         reader,
         writer,
     }
