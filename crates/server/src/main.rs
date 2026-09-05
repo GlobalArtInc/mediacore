@@ -24,10 +24,11 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = format!("{}:{}", config.bind_addresses[0], config.port).parse()?;
     let node_id = config.node_id.clone();
-    let state = AppState::new(config);
+    let state = AppState::start(config).await?;
+    let ice = state.media.local_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    tracing::info!(%addr, %node_id, "mediacore is listening");
+    tracing::info!(%addr, %ice, %node_id, "mediacore is listening");
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(shutdown())
         .await?;

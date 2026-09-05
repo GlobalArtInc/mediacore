@@ -10,9 +10,11 @@ repository = "https://github.com/GlobalArtInc/mediacore"
 
 [workspace.dependencies]
 mediacore-auth = { path = "crates/auth" }
+mediacore-client = { path = "crates/client" }
 mediacore-config = { path = "crates/config" }
 mediacore-proto = { path = "crates/proto" }
 mediacore-room = { path = "crates/room" }
+mediacore-transport = { path = "crates/transport" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
@@ -28,8 +30,10 @@ protox = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-tungstenite = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

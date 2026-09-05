@@ -22,7 +22,16 @@ async fn index() -> &'static str {
 async fn healthz(State(state): State<AppState>) -> String {
     let rooms = state.registry.rooms();
     let participants: usize = rooms.iter().map(|room| room.participant_count()).sum();
-    format!("rooms={} participants={participants}", rooms.len())
+    let media = state.publishers.totals();
+
+    format!(
+        "rooms={} participants={participants} publishers={} rtp_packets={} rtp_bytes={} ice={}",
+        rooms.len(),
+        state.publishers.count(),
+        media.rtp_packets,
+        media.rtp_bytes,
+        state.media.local_addr()
+    )
 }
 
 async fn validate(

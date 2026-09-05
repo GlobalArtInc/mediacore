@@ -1,0 +1,216 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use mediacore_config::RtcConfig;
+use mediacore_transport::str0m::Candidate;
+use mediacore_transport::{
+    PeerConfig, RouterConfig, SpawnedPeer, TransportCrypto, TransportError, UdpRouter, spawn_peer,
+};
+
+const ROUTE_PROBE_TARGET: &str = "192.0.2.1:9";
+
+pub struct MediaEngine {
+    crypto: TransportCrypto,
+    udp: UdpRouter,
+    advertise: Vec<SocketAddr>,
+    candidates: Vec<String>,
+    ice_disconnected_grace: std::time::Duration,
+}
+
+impl MediaEngine {
+    pub async fn start(config: &RtcConfig) -> anyhow::Result<Self> {
+        let crypto = TransportCrypto::new()?;
+        let bind: IpAddr = config.bind_address.parse()?;
+        let udp = bind_ice_socket(config, bind).await?;
+        let advertise = resolve_advertise(config, udp.local_addr());
+
+        anyhow::ensure!(
+            !advertise.is_empty(),
+            "no advertised ice address could be resolved, set rtc.advertise_addresses"
+        );
+
+        let candidates = advertise
+            .iter()
+            .filter_map(|addr| match Candidate::host(*addr, "udp") {
+                Ok(candidate) => Some(candidate.to_sdp_string()),
+                Err(error) => {
+                    tracing::warn!(%addr, %error, "cannot build a host candidate");
+                    None
+                }
+            })
+            .collect();
+
+        tracing::info!(
+            local = %udp.local_addr(),
+            ?advertise,
+            fingerprint = %crypto.fingerprint(),
+            ice_disconnected_timeout = config.ice_disconnected_timeout,
+            "media transport ready"
+        );
+
+        udp.spawn_reader();
+
+        Ok(Self {
+            crypto,
+            udp,
+            advertise,
+            candidates,
+            ice_disconnected_grace: config.ice_disconnected_grace(),
+        })
+    }
+
+    pub fn spawn_publisher(&self) -> Result<SpawnedPeer, TransportError> {
+        spawn_peer(
+            &self.crypto,
+            &self.udp,
+            PeerConfig {
+                advertise: self.advertise.clone(),
+                ice_disconnected_grace: self.ice_disconnected_grace,
+                ..PeerConfig::publisher()
+            },
+        )
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.udp.local_addr()
+    }
+
+    pub fn advertised(&self) -> &[SocketAddr] {
+        &self.advertise
+    }
+
+    pub fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+}
+
+async fn bind_ice_socket(config: &RtcConfig, bind: IpAddr) -> anyhow::Result<UdpRouter> {
+    let ports = config.candidate_ports();
+    let mut last: Option<TransportError> = None;
+
+    for port in &ports {
+        let attempt = UdpRouter::bind(RouterConfig {
+            bind: SocketAddr::new(bind, *port),
+            ..RouterConfig::default()
+        })
+        .await;
+
+        match attempt {
+            Ok(udp) => return Ok(udp),
+            Err(error) => last = Some(error),
+        }
+    }
+
+    let first = ports.first().copied().unwrap_or_default();
+    let last_port = ports.last().copied().unwrap_or_default();
+
+    match last {
+        Some(error) => Err(anyhow::Error::new(error).context(format!(
+            "no free udp port in {first}..={last_port} on {bind}"
+        ))),
+        None => anyhow::bail!("rtc configuration produced no port to bind"),
+    }
+}
+
+fn resolve_advertise(config: &RtcConfig, local: SocketAddr) -> Vec<SocketAddr> {
+    if config.use_external_ip {
+        tracing::warn!(
+            "rtc.use_external_ip is not implemented, falling back to the configured addresses"
+        );
+    }
+
+    let configured = config.advertise(local.port());
+    if !configured.is_empty() {
+        return configured;
+    }
+
+    if !config.node_ip.is_empty()
+        && let Ok(ip) = config.node_ip.parse::<IpAddr>()
+    {
+        return vec![SocketAddr::new(ip, local.port())];
+    }
+
+    if config.use_socket_address && !local.ip().is_unspecified() {
+        return vec![local];
+    }
+
+    let ip = primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    tracing::info!(%ip, "advertising the primary local address");
+
+    vec![SocketAddr::new(ip, local.port())]
+}
+
+fn primary_local_ip() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect(ROUTE_PROBE_TARGET).ok()?;
+
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(body: &str) -> RtcConfig {
+        mediacore_config::Config::parse(&format!("keys:\n  k: s\nrtc:\n{body}"))
+            .expect("config parses")
+            .rtc
+    }
+
+    #[test]
+    fn explicit_addresses_win_over_everything_else() {
+        let rtc = config("  advertise_addresses:\n    - 203.0.113.7\n  node_ip: 198.51.100.4\n");
+        let local = SocketAddr::from(([0, 0, 0, 0], 7882));
+
+        assert_eq!(
+            resolve_advertise(&rtc, local),
+            vec![SocketAddr::from(([203, 0, 113, 7], 7882))]
+        );
+    }
+
+    #[test]
+    fn the_node_ip_is_used_when_no_address_is_listed() {
+        let rtc = config("  node_ip: 198.51.100.4\n");
+        let local = SocketAddr::from(([0, 0, 0, 0], 7882));
+
+        assert_eq!(
+            resolve_advertise(&rtc, local),
+            vec![SocketAddr::from(([198, 51, 100, 4], 7882))]
+        );
+    }
+
+    #[test]
+    fn a_bound_address_is_advertised_as_it_is() {
+        let rtc = config("  use_socket_address: true\n");
+        let local = SocketAddr::from(([127, 0, 0, 1], 40000));
+
+        assert_eq!(resolve_advertise(&rtc, local), vec![local]);
+    }
+
+    #[test]
+    fn a_wildcard_bind_never_advertises_the_wildcard() {
+        let rtc = config("  use_socket_address: true\n");
+        let local = SocketAddr::from(([0, 0, 0, 0], 7882));
+
+        let advertised = resolve_advertise(&rtc, local);
+
+        assert_eq!(advertised.len(), 1);
+        assert!(!advertised[0].ip().is_unspecified());
+        assert_eq!(advertised[0].port(), 7882);
+    }
+
+    #[tokio::test]
+    async fn the_engine_binds_a_socket_and_offers_a_host_candidate() {
+        let rtc = config(
+            "  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n  bind_address: 127.0.0.1\n",
+        );
+        let engine = MediaEngine::start(&rtc).await.unwrap();
+
+        assert_eq!(engine.local_addr().ip().to_string(), "127.0.0.1");
+        assert_eq!(engine.advertised(), [engine.local_addr()]);
+        assert!(engine.candidates()[0].contains("typ host"));
+
+        let peer = engine.spawn_publisher().unwrap();
+        peer.handle.close();
+    }
+}

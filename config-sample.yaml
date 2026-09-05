@@ -14,6 +14,12 @@ room:
   max_participants: 0
 
 rtc:
+  udp_port: 7882
   port_range_start: 50000
   port_range_end: 60000
+  bind_address: 0.0.0.0
+  advertise_addresses: []
+  use_socket_address: true
   use_external_ip: false
+  node_ip: ""
+  ice_disconnected_timeout: 20

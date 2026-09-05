@@ -14,6 +14,7 @@ use prost::Message as _;
 use serde::Deserialize;
 use tokio::time::Instant;
 
+use crate::peer::PublisherSession;
 use crate::state::AppState;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -101,12 +102,25 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
         return;
     }
 
+    let mut publisher = PublisherSession::new(&state, &sid);
     let mut last_seen = Instant::now();
     let mut timeouts = tokio::time::interval(TIMEOUT_INTERVAL);
     timeouts.tick().await;
 
     loop {
         tokio::select! {
+            event = publisher.next_event() => {
+                let Some(event) = event else { break };
+
+                if !publisher.on_event(&joined, event) {
+                    let _ = send(
+                        &mut sink,
+                        mediacore_room::leave(livekit::DisconnectReason::MediaFailure),
+                    )
+                    .await;
+                    break;
+                }
+            }
             outgoing = rx.recv() => {
                 let Some(response) = outgoing else { break };
                 let Some(message) = response.message else { continue };
@@ -126,7 +140,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     Some(Ok(Message::Binary(data))) => {
                         match livekit::SignalRequest::decode(data.as_ref()) {
                             Ok(request) => {
-                                if !handle_request(&joined, request) {
+                                if !handle_request(&state, &joined, &mut publisher, request).await {
                                     break;
                                 }
                             }
@@ -160,16 +174,38 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
         }
     }
 
+    publisher.close(&state, &sid);
     state.registry.leave(&room_name, &sid);
     tracing::info!(room = %room_name, %identity, %sid, "participant left");
 }
 
-fn handle_request(joined: &Joined, request: livekit::SignalRequest) -> bool {
+async fn handle_request(
+    state: &AppState,
+    joined: &Joined,
+    publisher: &mut PublisherSession,
+    request: livekit::SignalRequest,
+) -> bool {
     let Some(message) = request.message else {
         return true;
     };
 
     match message {
+        signal_request::Message::AddTrack(add_track) => {
+            add_track_request(joined, add_track);
+            true
+        }
+        signal_request::Message::Offer(offer) => {
+            publisher.on_offer(state, joined, offer).await;
+            true
+        }
+        signal_request::Message::Trickle(trickle) => {
+            publisher.on_trickle(joined, trickle).await;
+            true
+        }
+        signal_request::Message::Mute(mute) => {
+            mute_request(joined, mute);
+            true
+        }
         signal_request::Message::PingReq(ping) => {
             joined
                 .participant
@@ -197,13 +233,65 @@ fn handle_request(joined: &Joined, request: livekit::SignalRequest) -> bool {
     }
 }
 
+fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
+    match joined.room.publish_track(&joined.participant.sid, &request) {
+        Ok(track) => {
+            tracing::info!(
+                identity = %joined.participant.identity,
+                track = %track.sid,
+                cid = %track.cid,
+                kind = ?track.kind,
+                "track published"
+            );
+
+            joined
+                .participant
+                .send(signal_response::Message::TrackPublished(
+                    livekit::TrackPublishedResponse {
+                        cid: request.cid.clone(),
+                        track: Some(track.to_proto()),
+                    },
+                ));
+        }
+        Err(error) => {
+            tracing::info!(
+                identity = %joined.participant.identity,
+                cid = %request.cid,
+                %error,
+                "refusing to publish a track"
+            );
+
+            joined
+                .participant
+                .send(signal_response::Message::RequestResponse(
+                    livekit::RequestResponse {
+                        reason: error.reason() as i32,
+                        message: error.to_string(),
+                        request: Some(livekit::request_response::Request::AddTrack(request)),
+                        ..Default::default()
+                    },
+                ));
+        }
+    }
+}
+
+fn mute_request(joined: &Joined, request: livekit::MuteTrackRequest) {
+    if joined
+        .room
+        .set_track_muted(&joined.participant.sid, &request.sid, request.muted)
+        .is_none()
+    {
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            track = %request.sid,
+            "cannot mute a track that is not published"
+        );
+    }
+}
+
 fn request_name(message: &signal_request::Message) -> &'static str {
     match message {
-        signal_request::Message::Offer(_) => "offer",
         signal_request::Message::Answer(_) => "answer",
-        signal_request::Message::Trickle(_) => "trickle",
-        signal_request::Message::AddTrack(_) => "add_track",
-        signal_request::Message::Mute(_) => "mute",
         signal_request::Message::Subscription(_) => "subscription",
         signal_request::Message::TrackSetting(_) => "track_setting",
         signal_request::Message::SyncState(_) => "sync_state",
@@ -222,7 +310,7 @@ fn build_join_response(state: &AppState, joined: &Joined) -> livekit::JoinRespon
         ),
         other_participants: joined.others.clone(),
         server_version: SERVER_VERSION.to_owned(),
-        subscriber_primary: true,
+        subscriber_primary: false,
         ping_timeout: PING_TIMEOUT_SECONDS,
         ping_interval: PING_INTERVAL_SECONDS,
         server_info: Some(livekit::ServerInfo {

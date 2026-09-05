@@ -20,10 +20,15 @@ type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 async fn spawn_server() -> SocketAddr {
     let mut config = Config::parse(&format!("keys:\n  {API_KEY}: {API_SECRET}\n")).unwrap();
     config.port = 0;
+    config.rtc.udp_port = 0;
+    config.rtc.port_range_start = 0;
+    config.rtc.port_range_end = 0;
+    config.rtc.bind_address = "127.0.0.1".to_owned();
 
+    let state = AppState::start(config).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = http::router(AppState::new(config));
+    let router = http::router(state);
 
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -220,5 +225,6 @@ async fn room_state_is_visible_over_http() {
 
     let (status, body) = http_get(addr, "/healthz").await;
     assert_eq!(status, 200);
-    assert_eq!(body, "rooms=1 participants=1");
+    assert!(body.starts_with("rooms=1 participants=1 publishers=1 rtp_packets=0"));
+    assert!(body.contains("ice=127.0.0.1:"));
 }
