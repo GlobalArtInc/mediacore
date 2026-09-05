@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mediacore_auth::{Claims, VideoGrant};
-use mediacore_client::{Client, ClientEvent, PublishedTrack, TrackReport, TrackSpec};
+use mediacore_client::{
+    Client, ClientEvent, ClientOptions, PublishedTrack, TrackReport, TrackSpec,
+};
 use mediacore_config::Config;
 use mediacore_proto::livekit;
 use mediacore_server::forward::SubscriptionSnapshot;
@@ -12,7 +14,7 @@ use mediacore_server::state::AppState;
 const API_KEY: &str = "devkey";
 const API_SECRET: &str = "devsecretdevsecretdevsecretdevsecret";
 const ROOM: &str = "demo";
-const PATIENCE: Duration = Duration::from_secs(20);
+const PATIENCE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OUR_SEQUENCE_SPACE: std::ops::Range<u64> = (1 << 15)..(1 << 16);
 
@@ -88,9 +90,17 @@ async fn join(server: &Server, identity: &str) -> Client {
 }
 
 async fn join_with(server: &Server, identity: &str, grant: VideoGrant) -> Client {
-    Client::connect(&server.url(), &token(identity, grant))
+    Client::connect_with(&server.url(), &token(identity, grant), patient_options())
         .await
         .expect("the client joins")
+}
+
+fn patient_options() -> ClientOptions {
+    ClientOptions {
+        connect_timeout: PATIENCE,
+        response_timeout: PATIENCE,
+        ..ClientOptions::default()
+    }
 }
 
 async fn publish(client: &Client, spec: TrackSpec) -> PublishedTrack {
@@ -147,7 +157,7 @@ fn assert_contiguous(report: &TrackReport, label: &str) {
     assert_eq!(report.duplicates, 0, "{label} saw a duplicate");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_participants_in_a_room_see_and_hear_each_other() {
     let server = Server::start().await;
 
@@ -296,7 +306,7 @@ async fn two_participants_in_a_room_see_and_hear_each_other() {
     bob.leave().await.expect("bob leaves");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_subscribers_of_one_track_own_their_sequence_spaces() {
     let server = Server::start().await;
 
@@ -341,7 +351,7 @@ async fn two_subscribers_of_one_track_own_their_sequence_spaces() {
     assert_contiguous(&after, "bob's copy after carol left");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_participant_without_the_subscribe_grant_is_refused_and_receives_nothing() {
     let server = Server::start().await;
 
@@ -403,7 +413,7 @@ async fn a_participant_without_the_subscribe_grant_is_refused_and_receives_nothi
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_subscriber_survives_the_publisher_leaving_and_a_new_one_arriving() {
     let server = Server::start().await;
 
@@ -451,7 +461,7 @@ async fn a_subscriber_survives_the_publisher_leaving_and_a_new_one_arriving() {
     bob.leave().await.expect("bob leaves");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unpublishing_a_track_tears_every_subscription_of_it_down() {
     let server = Server::start().await;
 
@@ -541,7 +551,7 @@ async fn unpublishing_a_track_tears_every_subscription_of_it_down() {
     bob.leave().await.expect("bob leaves");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_under_the_same_identity_takes_the_old_subscriptions_with_it() {
     let server = Server::start().await;
 

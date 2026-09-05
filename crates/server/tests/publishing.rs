@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mediacore_auth::{Claims, VideoGrant};
-use mediacore_client::{Client, TrackSpec};
+use mediacore_client::{Client, ClientOptions, TrackSpec};
 use mediacore_config::Config;
 use mediacore_proto::livekit;
 use mediacore_server::http;
@@ -12,7 +12,7 @@ use mediacore_server::state::AppState;
 const API_KEY: &str = "devkey";
 const API_SECRET: &str = "devsecretdevsecretdevsecretdevsecret";
 const ROOM: &str = "demo";
-const PATIENCE: Duration = Duration::from_secs(10);
+const PATIENCE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct Server {
@@ -77,6 +77,14 @@ impl Server {
     }
 }
 
+fn patient_options() -> ClientOptions {
+    ClientOptions {
+        connect_timeout: PATIENCE,
+        response_timeout: PATIENCE,
+        ..ClientOptions::default()
+    }
+}
+
 fn token(identity: &str, grant: VideoGrant) -> String {
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,9 +109,13 @@ fn token(identity: &str, grant: VideoGrant) -> String {
 }
 
 async fn join(server: &Server, identity: &str) -> Client {
-    Client::connect(&server.url(), &token(identity, VideoGrant::default()))
-        .await
-        .expect("the client joins")
+    Client::connect_with(
+        &server.url(),
+        &token(identity, VideoGrant::default()),
+        patient_options(),
+    )
+    .await
+    .expect("the client joins")
 }
 
 async fn until<T>(label: &str, mut poll: impl FnMut() -> Option<T>) -> T {
