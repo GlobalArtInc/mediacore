@@ -14,6 +14,7 @@ mediacore-client = { path = "crates/client" }
 mediacore-config = { path = "crates/config" }
 mediacore-proto = { path = "crates/proto" }
 mediacore-room = { path = "crates/room" }
+mediacore-sfu = { path = "crates/sfu" }
 mediacore-transport = { path = "crates/transport" }
 
 anyhow = "1"

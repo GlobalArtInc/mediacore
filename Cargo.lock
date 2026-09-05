@@ -1313,6 +1313,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mediacore-sfu"
+version = "0.1.0"
+dependencies = [
+ "str0m",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "mediacore-transport"
 version = "0.1.0"
 dependencies = [
