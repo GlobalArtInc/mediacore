@@ -1,0 +1,19 @@
+port: 7880
+bind_addresses:
+  - 0.0.0.0
+
+log_level: info
+
+keys:
+  devkey: devsecretdevsecretdevsecretdevsecret
+
+room:
+  auto_create: true
+  empty_timeout: 300
+  departure_timeout: 20
+  max_participants: 0
+
+rtc:
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: false
