@@ -1,0 +1,43 @@
+# Rendered by deploy/start-sfu.sh with envsubst at container start; the result
+# is what mediacore reads. Every ${...} below has to be set, and start-sfu.sh
+# refuses to start if one is empty.
+
+port: 7880
+bind_addresses:
+  - 0.0.0.0
+
+log_level: ${MEDIACORE_LOG_LEVEL}
+
+# The API key is the `iss` of every token, the secret signs it. The demo app
+# mints tokens with the same pair, from the same two variables.
+keys:
+  "${MEDIACORE_API_KEY}": "${MEDIACORE_API_SECRET}"
+
+room:
+  auto_create: true
+  empty_timeout: 300
+  departure_timeout: 20
+  max_participants: 0
+
+rtc:
+  # One UDP socket for all media. The compose file publishes this same port
+  # number on the host, unchanged.
+  udp_port: ${MEDIACORE_RTC_UDP_PORT}
+  port_range_start: 0
+  port_range_end: 0
+  bind_address: 0.0.0.0
+
+  # The address the server hands out in ICE candidates. Inside a container the
+  # socket's own address is a private bridge address no client can route to, so
+  # it is stated here and the guesses below are turned off.
+  advertise_addresses:
+    - ${MEDIACORE_ADVERTISE_IP}
+  use_socket_address: false
+  use_external_ip: false
+
+  ice_disconnected_timeout: 20
+  negotiation_timeout: 15
+
+video:
+  dynacast_pause_delay_ms: 5000
+  layer_upgrade_hold_ms: 2000

@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+deploy/
+Dockerfile
+.dockerignore
+.DS_Store
+*.log
+config.yaml

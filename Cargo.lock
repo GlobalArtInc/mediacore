@@ -1268,6 +1268,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mediacore-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "mediacore-auth",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "mediacore-proto"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,81 @@
+name: mediacore-local
+
+# A trial on the machine you are sitting at. Two containers, no Caddy, no TLS,
+# nothing to edit before it runs:
+#
+#   docker compose -f docker-compose.local.yml up --build
+#
+# then open http://127.0.0.1:8080 in two tabs.
+#
+# There is no certificate here on purpose. A browser treats http://127.0.0.1 as
+# a secure context, so it hands over the microphone without one. That holds for
+# loopback and nothing else: open this from another machine, by the host's LAN
+# address, and the browser will refuse the microphone and the page will say so.
+# For anyone other than yourself, use docker-compose.yml, which terminates TLS.
+#
+# The secret below is a fixed development value. It is in the file precisely
+# because nothing here should be reachable from outside this host.
+
+x-mediacore-image: &mediacore-image
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: mediacore:local
+
+x-credentials: &credentials
+  MEDIACORE_API_KEY: devkey
+  MEDIACORE_API_SECRET: devsecretdevsecretdevsecretdevsecret
+
+services:
+  sfu:
+    <<: *mediacore-image
+    restart: unless-stopped
+    environment:
+      <<: *credentials
+      # Refused by start-sfu.sh unless MEDIACORE_LOOPBACK says this is
+      # deliberate, because on a real deployment it is the mistake that
+      # signals perfectly and carries no audio.
+      MEDIACORE_ADVERTISE_IP: 127.0.0.1
+      MEDIACORE_LOOPBACK: "1"
+      MEDIACORE_RTC_UDP_PORT: "7882"
+      MEDIACORE_LOG_LEVEL: ${MEDIACORE_LOG_LEVEL:-info}
+    command: ["/bin/sh", "/etc/mediacore/start-sfu.sh"]
+    volumes:
+      - ./mediacore.yaml.template:/etc/mediacore/mediacore.yaml.template:ro
+      - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
+    ports:
+      # The browser talks to the SFU directly here: signalling on 7880 and
+      # media on 7882. Both are bound to loopback only.
+      - "127.0.0.1:7880:7880"
+      - "127.0.0.1:7882:7882/udp"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7880/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  demo:
+    # Same image as the sfu, built once by that service. Two services that both
+    # declare the build would race to export the same tag and one of them fails.
+    image: mediacore:local
+    depends_on:
+      sfu:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      <<: *credentials
+      # ws, not wss: the page is served over http from the same loopback host,
+      # so there is no certificate to match and no mixed-content rule to break.
+      MEDIACORE_DEMO_WS_URL: ws://127.0.0.1:7880
+      MEDIACORE_DEMO_ROOM: ${MEDIACORE_DEMO_ROOM:-demo}
+      MEDIACORE_DEMO_PORT: "8080"
+    command: ["/usr/local/bin/mediacore-demo"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

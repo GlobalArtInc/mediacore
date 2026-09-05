@@ -1,0 +1,30 @@
+[package]
+name = "mediacore-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "mediacore_demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mediacore-demo"
+path = "src/main.rs"
+
+[dependencies]
+mediacore-auth.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

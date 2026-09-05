@@ -1,0 +1,56 @@
+# One origin serves everything the browser needs: the page, the token endpoint
+# and the signalling WebSocket. That is deliberate. A certificate the visitor
+# accepted by hand covers this host only, and a WebSocket on another host or
+# port would be refused silently, with nothing in the page to show why.
+#
+# Media is not here. It goes to the host's UDP port, never through this proxy.
+{
+	admin off
+
+	# THE LINE THAT MAKES A BARE IP WORK. A browser sends no SNI when the
+	# address bar holds an IP literal, so without this Caddy has no name to
+	# look a certificate up under, falls back to the container's own bridge
+	# address, finds nothing for it and the handshake fails before the visitor
+	# sees anything at all. Naming the site here gives the SNI-less handshake
+	# the same certificate a named one would get.
+	default_sni {$MEDIACORE_PUBLIC_HOST}
+
+	# No HTTP/3: it is QUIC on 443/udp, which this compose file does not publish
+	# on purpose. Advertising it would only have browsers try a port that is
+	# closed and fall back. The one UDP port here is for media.
+	servers {
+		protocols h1 h2
+	}
+}
+
+https://{$MEDIACORE_PUBLIC_HOST} {
+	# you@mail.tld  -> a real certificate from Let's Encrypt, with that address
+	#                  for expiry notices. Needs a name that resolves here and
+	#                  port 80 reachable from the internet. With no domain of
+	#                  your own, <ip>.sslip.io is a name that resolves here:
+	#                  see "TLS without a domain" in README.md. This is the
+	#                  only setting that gives a visitor a page with no warning.
+	# internal      -> Caddy's own CA. Works for a bare IP, and every visitor
+	#                  gets a full-page certificate warning to click through.
+	# cert key      -> two paths to a certificate you brought yourself.
+	tls {$MEDIACORE_TLS:internal}
+
+	# Signalling. /rtc is the WebSocket, /rtc/validate is the token check, and
+	# /rtc/v1 is what a recent client tries first and is answered 404 so it
+	# falls back. Caddy upgrades WebSockets through reverse_proxy on its own.
+	handle /rtc* {
+		reverse_proxy sfu:7880
+	}
+
+	# Everything else is the demo app: /, /app.css, /app.js, the vendored
+	# client SDK, /api/config, /api/token, /healthz. The app sets its own
+	# content security policy; nothing here rewrites response headers.
+	handle {
+		reverse_proxy demo:8080
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -239,6 +239,7 @@ pub struct PeerHandle {
     dropped_writes: Arc<AtomicU64>,
     unroutable_writes: Arc<AtomicU64>,
     missed_keyframes: Arc<AtomicU64>,
+    keyframes_without_stream: Arc<AtomicU64>,
     tx: mpsc::Sender<PeerCommand>,
     rtp: mpsc::Sender<Box<OutgoingRtp>>,
 }
@@ -273,6 +274,10 @@ impl PeerHandle {
 
     pub fn missed_keyframe_requests(&self) -> u64 {
         self.missed_keyframes.load(Ordering::Relaxed)
+    }
+
+    pub fn keyframe_requests_without_stream(&self) -> u64 {
+        self.keyframes_without_stream.load(Ordering::Relaxed)
     }
 
     pub async fn accept_offer(&self, sdp: String) -> Result<String, TransportError> {
@@ -527,6 +532,7 @@ fn build_peer(
     let dropped_writes = Arc::new(AtomicU64::new(0));
     let unroutable_writes = Arc::new(AtomicU64::new(0));
     let missed_keyframes = Arc::new(AtomicU64::new(0));
+    let keyframes_without_stream = Arc::new(AtomicU64::new(0));
 
     let handle = PeerHandle {
         id: route.id(),
@@ -536,6 +542,7 @@ fn build_peer(
         dropped_writes,
         unroutable_writes: Arc::clone(&unroutable_writes),
         missed_keyframes: Arc::clone(&missed_keyframes),
+        keyframes_without_stream: Arc::clone(&keyframes_without_stream),
         tx,
         rtp: rtp_tx,
     };
@@ -544,7 +551,7 @@ fn build_peer(
         rtc,
         route,
         socket: udp.socket(),
-        local_addr: udp.local_addr(),
+        local_addr: receiving_addr(udp.local_addr(), &advertise),
         datagrams,
         commands,
         writes,
@@ -564,6 +571,7 @@ fn build_peer(
         probe: config.keyframe_probe.clone(),
         layer_silence: config.layer_silence,
         missed_keyframes,
+        keyframes_without_stream,
         drain_deadline: None,
         commands_closed: false,
         writes_closed: false,
@@ -577,6 +585,18 @@ fn build_peer(
     };
 
     Ok((handle, actor, events))
+}
+
+fn receiving_addr(bound: SocketAddr, advertise: &[SocketAddr]) -> SocketAddr {
+    if !bound.ip().is_unspecified() {
+        return bound;
+    }
+
+    advertise
+        .iter()
+        .find(|addr| !addr.ip().is_unspecified())
+        .copied()
+        .unwrap_or(bound)
 }
 
 fn build_rtc(
@@ -722,6 +742,7 @@ struct PeerActor {
     probe: Option<KeyframeProbe>,
     layer_silence: Duration,
     missed_keyframes: Arc<AtomicU64>,
+    keyframes_without_stream: Arc<AtomicU64>,
     drain_deadline: Option<Instant>,
     commands_closed: bool,
     writes_closed: bool,
@@ -1256,8 +1277,9 @@ impl PeerActor {
         };
 
         if !asked {
-            self.missed_keyframes.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%mid, ?rid, "no receive stream to request a keyframe on");
+            self.keyframes_without_stream
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%mid, ?rid, "no receive stream to request a keyframe on yet");
             return;
         }
 
@@ -1707,6 +1729,27 @@ mod tests {
         task.await.unwrap();
 
         assert_eq!(udp.router().session_for_ufrag(&ufrag), None);
+    }
+
+    #[test]
+    fn a_wildcard_socket_reports_the_advertised_address_to_the_session() {
+        let bound = SocketAddr::from(([0, 0, 0, 0], 7882));
+        let advertised = SocketAddr::from(([203, 0, 113, 7], 7882));
+
+        assert_eq!(
+            receiving_addr(bound, &[advertised]),
+            advertised,
+            "a packet that arrived on a wildcard socket must be attributed to the candidate we \
+             advertised, or ice never finds a pair and stays in checking for ever"
+        );
+
+        let explicit = SocketAddr::from(([127, 0, 0, 1], 7882));
+        assert_eq!(receiving_addr(explicit, &[advertised]), explicit);
+        assert_eq!(receiving_addr(bound, &[]), bound);
+        assert_eq!(
+            receiving_addr(bound, &[SocketAddr::from(([0, 0, 0, 0], 7882)), advertised]),
+            advertised
+        );
     }
 
     #[tokio::test]

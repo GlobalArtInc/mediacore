@@ -1,0 +1,123 @@
+name: mediacore
+
+# Three containers:
+#   caddy  terminates TLS, serves the demo app at / and proxies /rtc to the SFU
+#   demo   the page and the token endpoint
+#   sfu    signalling on 7880 and, crucially, media on UDP straight from the host
+#
+# Media never passes through Caddy. The UDP port is published on the host and the
+# SFU tells every client to send media to MEDIACORE_ADVERTISE_IP on that port.
+#
+# The ${VAR:?...} guards below are the whole point of deploy/.env.example
+# shipping those variables empty: a half-edited .env stops the stack here, with
+# the name of the variable and what to put in it, instead of starting a service
+# that signals fine and carries no audio.
+
+x-mediacore-image: &mediacore-image
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: mediacore:local
+
+x-api-secret: &api-secret
+  MEDIACORE_API_SECRET: ${MEDIACORE_API_SECRET:?set MEDIACORE_API_SECRET in deploy/.env; generate one with `openssl rand -hex 32`. Both the SFU and the demo app refuse to start without it, and the stack would crash-loop behind a 502 with nothing readable in the browser}
+
+services:
+  sfu:
+    <<: *mediacore-image
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      <<: *api-secret
+      # The address put into ICE candidates. Wrong value: signalling works,
+      # nobody hears anything. See deploy/.env.example.
+      MEDIACORE_ADVERTISE_IP: ${MEDIACORE_ADVERTISE_IP:?set MEDIACORE_ADVERTISE_IP in deploy/.env to the ip address clients reach this host on, e.g. 203.0.113.7}
+      MEDIACORE_RTC_UDP_PORT: ${MEDIACORE_RTC_UDP_PORT:-7882}
+      MEDIACORE_LOG_LEVEL: ${MEDIACORE_LOG_LEVEL:-info}
+    command: ["/bin/sh", "/etc/mediacore/start-sfu.sh"]
+    volumes:
+      - ./mediacore.yaml.template:/etc/mediacore/mediacore.yaml.template:ro
+      - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
+    ports:
+      # Signalling reaches the SFU over the compose network; this mapping is for
+      # the operator on the host (curl 127.0.0.1:7880/healthz), not for clients.
+      - "127.0.0.1:7880:7880"
+      # Host port and container port must be the same number: ICE replies leave
+      # the container from the port it bound, and a rewritten port breaks the
+      # candidate the client was given.
+      - "${MEDIACORE_RTC_UDP_PORT:-7882}:${MEDIACORE_RTC_UDP_PORT:-7882}/udp"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7880/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  demo:
+    # Same image as the sfu, built once by that service. Two services that both
+    # declare the build would race to export the same tag and one of them fails.
+    image: mediacore:local
+    restart: unless-stopped
+    # No depends_on: the demo app never talks to the SFU. It signs tokens the
+    # SFU verifies later, and the browser is what connects the two.
+    env_file:
+      - .env
+    environment:
+      <<: *api-secret
+      # What the browser is told to connect to. Same origin as the page, so the
+      # certificate the visitor accepted for the page also covers the WebSocket.
+      # A scheme or a slash in MEDIACORE_PUBLIC_HOST makes this an unusable url
+      # and the demo app refuses to start, naming the variable.
+      MEDIACORE_DEMO_WS_URL: wss://${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
+      MEDIACORE_DEMO_PORT: "8080"
+    command: ["/usr/local/bin/mediacore-demo"]
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # Health conditions, not bare names: without them Caddy answers 502 for the
+    # first half minute while the two upstreams are still starting, which reads
+    # exactly like a broken deployment to whoever opens the URL.
+    depends_on:
+      demo:
+        condition: service_healthy
+      sfu:
+        condition: service_healthy
+    # No env_file here on purpose. Caddy has no use for the token-signing
+    # secret, and .env would hand it the lot; it gets the two variables it
+    # actually reads and nothing else.
+    environment:
+      MEDIACORE_PUBLIC_HOST: ${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
+      MEDIACORE_TLS: ${MEDIACORE_TLS:-internal}
+    # entrypoint, not command: the caddy image's entrypoint is `caddy` itself,
+    # so a command here would be passed to it as arguments.
+    entrypoint: ["/bin/sh", "/etc/caddy/start-caddy.sh"]
+    ports:
+      # 80 is not decoration: it carries the ACME HTTP challenge for a real
+      # domain, and the redirect to https for everyone who omits the scheme.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./start-caddy.sh:/etc/caddy/start-caddy.sh:ro
+      # Certificates and, in internal mode, the local CA root live here. Losing
+      # this volume means a new root and a fresh warning for every visitor.
+      - caddy_data:/data
+      - caddy_config:/config
+      # Own certificate instead of ACME or the local CA: put cert.pem and
+      # key.pem in deploy/certs, uncomment, and set
+      # MEDIACORE_TLS="/certs/cert.pem /certs/key.pem".
+      # - ./certs:/certs:ro
+
+volumes:
+  caddy_data:
+  caddy_config:

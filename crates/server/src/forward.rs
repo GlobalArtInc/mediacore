@@ -460,12 +460,20 @@ impl TrackSource {
             layer
         };
 
-        let rid = self.layers.rid_of(layer);
+        let asked = match self.layers.rid_of(layer) {
+            Some(rid) => self
+                .peer
+                .request_keyframe(self.mid, Some(rid), keyframe_kind()),
+            None if self.layers.is_simulcast() => self
+                .peer
+                .request_keyframe_on_every_layer(self.mid, keyframe_kind()),
+            None => self.peer.request_keyframe(self.mid, None, keyframe_kind()),
+        };
 
-        if let Err(error) = self.peer.request_keyframe(self.mid, rid, keyframe_kind()) {
+        if let Err(error) = asked {
             tracing::debug!(
                 mid = %self.mid,
-                ?rid,
+                layer = %layer,
                 %error,
                 "cannot ask the publisher for a keyframe"
             );

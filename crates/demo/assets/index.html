@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mediacore demo</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main>
+      <header class="brand">
+        <span class="brand-dot" aria-hidden="true"></span>
+        <span class="brand-name">mediacore</span>
+      </header>
+
+      <section id="lobby" class="card">
+        <h1>Join the room</h1>
+        <p class="lede">
+          Everyone in <code id="lobby-room">&hellip;</code> hears everyone else.
+          Audio only &mdash; the camera is never asked for.
+        </p>
+
+        <form id="join-form" novalidate>
+          <label for="name">Your name</label>
+          <input
+            id="name"
+            name="name"
+            type="text"
+            maxlength="40"
+            placeholder="Alice"
+            autocomplete="off"
+            autocapitalize="words"
+            spellcheck="false"
+            disabled
+          />
+          <button id="join" type="submit" disabled>Join</button>
+        </form>
+
+        <p id="lobby-status" class="status" role="status">Loading the client&hellip;</p>
+        <div id="lobby-error" class="alert" role="alert" hidden></div>
+      </section>
+
+      <section id="room" class="card" hidden>
+        <div class="room-head">
+          <div>
+            <h1 id="room-name">&hellip;</h1>
+            <p id="room-count" class="lede">&hellip;</p>
+          </div>
+          <span id="room-state" class="pill">connecting</span>
+        </div>
+
+        <ul id="participants" class="participants"></ul>
+
+        <button id="enable-audio" class="secondary" type="button" hidden>
+          Enable audio playback
+        </button>
+
+        <div class="controls">
+          <button id="mute" type="button" class="secondary">Mute</button>
+          <button id="leave" type="button" class="ghost">Leave</button>
+        </div>
+
+        <div id="room-error" class="alert" role="alert" hidden></div>
+      </section>
+
+      <footer class="foot">
+        <span id="foot-url"></span>
+      </footer>
+    </main>
+
+    <div id="audio" class="sink" aria-hidden="true"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

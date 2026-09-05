@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+
+# Both binaries come out of one cargo build. Dependencies are compiled in a
+# layer of their own (cargo-chef), so editing a crate under crates/ rebuilds
+# only the workspace, not the ~200 crates underneath it.
+
+FROM rust:1-bookworm AS chef
+WORKDIR /src
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path /recipe.json
+
+FROM chef AS builder
+COPY --from=planner /recipe.json /recipe.json
+# Dependencies only: this layer is reused until Cargo.toml or Cargo.lock change.
+RUN cargo chef cook --release --recipe-path /recipe.json
+COPY . .
+# The protobufs under crates/proto/protobufs are compiled in process by protox,
+# so no protoc is installed here.
+RUN cargo build --release -p mediacore-server -p mediacore-demo \
+    && mkdir -p /out \
+    && cp target/release/mediacore target/release/mediacore-demo /out/
+
+FROM debian:bookworm-slim AS runtime
+# gettext-base is envsubst, used by deploy/start-sfu.sh to render the config;
+# curl is what the compose healthcheck calls.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gettext-base \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --create-home --uid 10001 mediacore
+COPY --from=builder /out/mediacore /out/mediacore-demo /usr/local/bin/
+USER mediacore
+WORKDIR /home/mediacore
+# 7880 signalling, 8080 demo app, 7882/udp media.
+EXPOSE 7880 8080 7882/udp
+CMD ["/usr/local/bin/mediacore"]
