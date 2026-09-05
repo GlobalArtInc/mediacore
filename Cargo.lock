@@ -1302,6 +1302,7 @@ dependencies = [
  "mediacore-config",
  "mediacore-proto",
  "mediacore-room",
+ "mediacore-sfu",
  "mediacore-transport",
  "prost",
  "serde",

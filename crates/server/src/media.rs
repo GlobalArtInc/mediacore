@@ -3,7 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use mediacore_config::RtcConfig;
 use mediacore_transport::str0m::Candidate;
 use mediacore_transport::{
-    PeerConfig, RouterConfig, SpawnedPeer, TransportCrypto, TransportError, UdpRouter, spawn_peer,
+    PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto, TransportError, UdpRouter,
+    spawn_peer,
 };
 
 const ROUTE_PROBE_TARGET: &str = "192.0.2.1:9";
@@ -14,6 +15,7 @@ pub struct MediaEngine {
     advertise: Vec<SocketAddr>,
     candidates: Vec<String>,
     ice_disconnected_grace: std::time::Duration,
+    negotiation_timeout: std::time::Duration,
 }
 
 impl MediaEngine {
@@ -44,6 +46,7 @@ impl MediaEngine {
             ?advertise,
             fingerprint = %crypto.fingerprint(),
             ice_disconnected_timeout = config.ice_disconnected_timeout,
+            negotiation_timeout = config.negotiation_timeout,
             "media transport ready"
         );
 
@@ -55,17 +58,36 @@ impl MediaEngine {
             advertise,
             candidates,
             ice_disconnected_grace: config.ice_disconnected_grace(),
+            negotiation_timeout: config.negotiation_grace(),
         })
     }
 
+    pub fn negotiation_timeout(&self) -> std::time::Duration {
+        self.negotiation_timeout
+    }
+
     pub fn spawn_publisher(&self) -> Result<SpawnedPeer, TransportError> {
+        self.spawn(PeerRole::Publisher)
+    }
+
+    pub fn spawn_subscriber(&self) -> Result<SpawnedPeer, TransportError> {
+        self.spawn(PeerRole::Subscriber)
+    }
+
+    fn spawn(&self, role: PeerRole) -> Result<SpawnedPeer, TransportError> {
+        let base = match role {
+            PeerRole::Publisher => PeerConfig::publisher(),
+            PeerRole::Subscriber => PeerConfig::subscriber(),
+        };
+
         spawn_peer(
             &self.crypto,
             &self.udp,
             PeerConfig {
                 advertise: self.advertise.clone(),
                 ice_disconnected_grace: self.ice_disconnected_grace,
-                ..PeerConfig::publisher()
+                negotiation_timeout: self.negotiation_timeout,
+                ..base
             },
         )
     }

@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpApi, SdpOffer, SdpPendingOffer};
 use str0m::format::PayloadParams;
 use str0m::media::{
-    Direction, KeyframeRequest, KeyframeRequestKind, MediaAdded, MediaData, MediaKind, Mid, Pt,
-    Rid, Simulcast,
+    Direction, KeyframeRequest, KeyframeRequestKind, MediaAdded, MediaChanged, MediaData,
+    MediaKind, Mid, Rid, Rids,
 };
 use str0m::net::{Protocol, Receive};
-use str0m::rtp::{ExtensionValues, RtpPacket, RtpWrite, SeqNo, Ssrc};
+use str0m::rtp::{RtpPacket, RtpWrite, SeqNo, Ssrc};
+use str0m::stats::MediaEgressStats;
 use str0m::{Candidate, Event, IceConnectionState, IceCreds, Input, Output, Rtc};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -19,10 +20,15 @@ use tracing::Instrument as _;
 
 use crate::crypto::TransportCrypto;
 use crate::error::TransportError;
+use crate::negotiation::{
+    LocalOffer, NEGOTIATION_BACKLOG, NEGOTIATION_TIMEOUT, Negotiation, Queued, Renegotiation,
+};
 use crate::router::{Datagram, DatagramRx, SessionId, SessionRoute, UdpRouter};
+use crate::send::{DeclaredStream, OutgoingRtp, RtxCache, SendStream};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 64;
 pub const MEDIA_QUEUE_CAPACITY: usize = 512;
+pub const WRITE_QUEUE_CAPACITY: usize = 1024;
 pub const ICE_DISCONNECTED_GRACE: Duration = Duration::from_secs(20);
 
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,7 +49,10 @@ pub struct PeerConfig {
     pub stats_interval: Option<Duration>,
     pub command_queue: usize,
     pub media_queue: usize,
+    pub write_queue: usize,
     pub ice_disconnected_grace: Duration,
+    pub negotiation_timeout: Duration,
+    pub negotiation_backlog: usize,
 }
 
 impl Default for PeerConfig {
@@ -56,7 +65,10 @@ impl Default for PeerConfig {
             stats_interval: Some(Duration::from_secs(2)),
             command_queue: COMMAND_QUEUE_CAPACITY,
             media_queue: MEDIA_QUEUE_CAPACITY,
+            write_queue: WRITE_QUEUE_CAPACITY,
             ice_disconnected_grace: ICE_DISCONNECTED_GRACE,
+            negotiation_timeout: NEGOTIATION_TIMEOUT,
+            negotiation_backlog: NEGOTIATION_BACKLOG,
         }
     }
 }
@@ -75,51 +87,6 @@ impl PeerConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct MediaSpec {
-    pub kind: MediaKind,
-    pub direction: Direction,
-    pub stream_id: Option<String>,
-    pub track_id: Option<String>,
-    pub simulcast: Option<Simulcast>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Negotiation {
-    pub add_media: Vec<MediaSpec>,
-    pub set_direction: Vec<(Mid, Direction)>,
-    pub stop_media: Vec<Mid>,
-}
-
-impl Negotiation {
-    pub fn add(spec: MediaSpec) -> Self {
-        Self {
-            add_media: vec![spec],
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalOffer {
-    pub mids: Vec<Mid>,
-    pub sdp: String,
-}
-
-#[derive(Debug)]
-pub struct OutgoingRtp {
-    pub mid: Mid,
-    pub rid: Option<Rid>,
-    pub pt: Pt,
-    pub seq_no: SeqNo,
-    pub time: u32,
-    pub wallclock: Instant,
-    pub marker: bool,
-    pub nackable: bool,
-    pub ext_vals: ExtensionValues,
-    pub payload: Arc<[u8]>,
-}
-
-#[derive(Debug)]
 pub struct MediaInfo {
     pub mid: Mid,
     pub kind: MediaKind,
@@ -137,14 +104,61 @@ pub struct IncomingRtp {
     pub packet: RtpPacket,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteIngress {
+    pub jitter: u32,
+    pub packets_lost: u64,
+    pub max_seq_no: SeqNo,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EgressReport {
+    pub mid: Mid,
+    pub rid: Option<Rid>,
+    pub rtt: Option<Duration>,
+    pub loss: Option<f32>,
+    pub packets: u64,
+    pub bytes: u64,
+    pub plis: u64,
+    pub firs: u64,
+    pub nacks: u64,
+    pub remote: Option<RemoteIngress>,
+    pub at: Instant,
+}
+
+impl From<MediaEgressStats> for EgressReport {
+    fn from(stats: MediaEgressStats) -> Self {
+        Self {
+            mid: stats.mid,
+            rid: stats.rid,
+            rtt: stats.rtt,
+            loss: stats.loss,
+            packets: stats.packets,
+            bytes: stats.bytes,
+            plis: stats.plis,
+            firs: stats.firs,
+            nacks: stats.nacks,
+            remote: stats.remote.map(|remote| RemoteIngress {
+                jitter: remote.jitter,
+                packets_lost: remote.packets_lost,
+                max_seq_no: remote.maximum_sequence_number,
+            }),
+            at: stats.timestamp,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PeerEvent {
     IceConnectionState(IceConnectionState),
     Connected,
     MediaAdded(MediaInfo),
+    MediaChanged(MediaInfo),
+    NegotiationFailed,
     Rtp(Box<IncomingRtp>),
     Media(Box<MediaData>),
     KeyframeRequested(KeyframeRequest),
+    EgressReport(EgressReport),
     Disconnected,
 }
 
@@ -171,7 +185,19 @@ enum PeerCommand {
         rid: Option<Rid>,
         kind: KeyframeRequestKind,
     },
-    WriteRtp(Box<OutgoingRtp>),
+    DeclareSendStream {
+        stream: Box<SendStream>,
+        reply: oneshot::Sender<Result<DeclaredStream, TransportError>>,
+    },
+    RemoveSendStream {
+        mid: Mid,
+        rid: Option<Rid>,
+        reply: oneshot::Sender<bool>,
+    },
+    MediaQuery {
+        mid: Mid,
+        reply: oneshot::Sender<Option<MediaInfo>>,
+    },
     Close,
 }
 
@@ -181,7 +207,10 @@ pub struct PeerHandle {
     role: PeerRole,
     ice_creds: Arc<RwLock<IceCreds>>,
     dropped_media: Arc<AtomicU64>,
+    dropped_writes: Arc<AtomicU64>,
+    unroutable_writes: Arc<AtomicU64>,
     tx: mpsc::Sender<PeerCommand>,
+    rtp: mpsc::Sender<Box<OutgoingRtp>>,
 }
 
 impl PeerHandle {
@@ -202,6 +231,14 @@ impl PeerHandle {
 
     pub fn dropped_media_events(&self) -> u64 {
         self.dropped_media.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_rtp_writes(&self) -> u64 {
+        self.dropped_writes.load(Ordering::Relaxed)
+    }
+
+    pub fn unroutable_rtp_writes(&self) -> u64 {
+        self.unroutable_writes.load(Ordering::Relaxed)
     }
 
     pub async fn accept_offer(&self, sdp: String) -> Result<String, TransportError> {
@@ -236,8 +273,41 @@ impl PeerHandle {
         self.notify(PeerCommand::RequestKeyframe { mid, rid, kind })
     }
 
+    pub async fn declare_send_stream(
+        &self,
+        stream: SendStream,
+    ) -> Result<DeclaredStream, TransportError> {
+        self.request(|reply| PeerCommand::DeclareSendStream {
+            stream: Box::new(stream),
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn remove_send_stream(
+        &self,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> Result<bool, TransportError> {
+        self.request(|reply| PeerCommand::RemoveSendStream { mid, rid, reply })
+            .await
+    }
+
+    pub async fn media(&self, mid: Mid) -> Result<MediaInfo, TransportError> {
+        self.request(|reply| PeerCommand::MediaQuery { mid, reply })
+            .await?
+            .ok_or(TransportError::UnknownMid(mid))
+    }
+
     pub fn write_rtp(&self, packet: OutgoingRtp) -> Result<(), TransportError> {
-        self.notify(PeerCommand::WriteRtp(Box::new(packet)))
+        match self.rtp.try_send(Box::new(packet)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::PeerGone),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
     }
 
     pub fn close(&self) {
@@ -358,18 +428,24 @@ fn build_peer(
     let rtc = build_rtc(crypto, &ice_creds, &config, &advertise)?;
 
     let (tx, commands) = mpsc::channel(config.command_queue.max(1));
+    let (rtp_tx, writes) = mpsc::channel(config.write_queue.max(1));
     let (control_tx, control) = mpsc::unbounded_channel();
     let (media_tx, media) = mpsc::channel(config.media_queue.max(1));
 
     let creds = Arc::new(RwLock::new(ice_creds));
     let dropped_media = Arc::new(AtomicU64::new(0));
+    let dropped_writes = Arc::new(AtomicU64::new(0));
+    let unroutable_writes = Arc::new(AtomicU64::new(0));
 
     let handle = PeerHandle {
         id: route.id(),
         role: config.role,
         ice_creds: Arc::clone(&creds),
         dropped_media: Arc::clone(&dropped_media),
+        dropped_writes,
+        unroutable_writes: Arc::clone(&unroutable_writes),
         tx,
+        rtp: rtp_tx,
     };
 
     let actor = PeerActor {
@@ -379,6 +455,8 @@ fn build_peer(
         local_addr: udp.local_addr(),
         datagrams,
         commands,
+        writes,
+        unroutable_writes,
         sink: EventSink {
             control: control_tx,
             media: media_tx,
@@ -388,9 +466,10 @@ fn build_peer(
         },
         creds,
         ice: IceWatch::new(config.ice_disconnected_grace),
-        pending_offer: None,
+        renegotiation: Renegotiation::new(config.negotiation_timeout, config.negotiation_backlog),
         drain_deadline: None,
         commands_closed: false,
+        writes_closed: false,
     };
 
     let events = PeerEvents {
@@ -535,12 +614,15 @@ struct PeerActor {
     local_addr: SocketAddr,
     datagrams: DatagramRx,
     commands: mpsc::Receiver<PeerCommand>,
+    writes: mpsc::Receiver<Box<OutgoingRtp>>,
+    unroutable_writes: Arc<AtomicU64>,
     sink: EventSink,
     creds: Arc<RwLock<IceCreds>>,
     ice: IceWatch,
-    pending_offer: Option<SdpPendingOffer>,
+    renegotiation: Renegotiation,
     drain_deadline: Option<Instant>,
     commands_closed: bool,
+    writes_closed: bool,
 }
 
 impl PeerActor {
@@ -548,6 +630,8 @@ impl PeerActor {
         tracing::debug!(ufrag = self.route.ufrag(), "peer connection started");
 
         loop {
+            self.expire_negotiation(Instant::now());
+
             let Some(deadline) = self.drive().await else {
                 break;
             };
@@ -578,6 +662,11 @@ impl PeerActor {
                 None => deadline,
             };
 
+            let deadline = match self.renegotiation.deadline() {
+                Some(offer) => deadline.min(offer),
+                None => deadline,
+            };
+
             let deadline = deadline.max(now);
             let sleep = tokio::time::sleep_until(deadline.into());
             tokio::pin!(sleep);
@@ -594,6 +683,11 @@ impl PeerActor {
                         self.commands_closed = true;
                         self.begin_close();
                     }
+                },
+
+                packet = self.writes.recv(), if !self.writes_closed => match packet {
+                    Some(packet) => self.write_rtp(*packet),
+                    None => self.writes_closed = true,
                 },
 
                 _ = &mut sleep => {
@@ -668,12 +762,15 @@ impl PeerActor {
         match command {
             PeerCommand::AcceptOffer { sdp, reply } => {
                 let _ = reply.send(self.accept_offer(&sdp));
+                self.advance_negotiation();
             }
             PeerCommand::Negotiate { request, reply } => {
-                let _ = reply.send(self.negotiate(*request));
+                self.renegotiation.submit(request, reply);
+                self.advance_negotiation();
             }
             PeerCommand::AcceptAnswer { sdp, reply } => {
                 let _ = reply.send(self.accept_answer(&sdp));
+                self.advance_negotiation();
             }
             PeerCommand::AddRemoteCandidate { candidate, reply } => {
                 let _ = reply.send(self.add_remote_candidate(&candidate));
@@ -681,7 +778,15 @@ impl PeerActor {
             PeerCommand::RequestKeyframe { mid, rid, kind } => {
                 self.request_keyframe(mid, rid, kind);
             }
-            PeerCommand::WriteRtp(packet) => self.write_rtp(*packet),
+            PeerCommand::DeclareSendStream { stream, reply } => {
+                let _ = reply.send(self.declare_send_stream(*stream));
+            }
+            PeerCommand::RemoveSendStream { mid, rid, reply } => {
+                let _ = reply.send(self.remove_send_stream(mid, rid));
+            }
+            PeerCommand::MediaQuery { mid, reply } => {
+                let _ = reply.send(self.media_by_mid(mid));
+            }
             PeerCommand::Close => self.begin_close(),
         }
     }
@@ -706,14 +811,47 @@ impl PeerActor {
 
     fn accept_offer(&mut self, sdp: &str) -> Result<String, TransportError> {
         let offer = SdpOffer::from_sdp_string(sdp).map_err(str0m::RtcError::from)?;
+
+        self.renegotiation
+            .abandon("the remote offered while our own offer was outstanding");
+
         let answer: SdpAnswer = self.rtc.sdp_api().accept_offer(offer)?;
-        self.pending_offer = None;
         self.sync_ice_credentials()?;
 
         Ok(answer.to_sdp_string())
     }
 
-    fn negotiate(&mut self, request: Negotiation) -> Result<LocalOffer, TransportError> {
+    fn advance_negotiation(&mut self) {
+        while let Some(Queued { request, reply }) = self.renegotiation.next() {
+            match self.create_offer(*request) {
+                Ok((offer, pending)) => {
+                    self.renegotiation.hold(pending, Instant::now());
+                    let _ = reply.send(Ok(offer));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }
+    }
+
+    fn expire_negotiation(&mut self, now: Instant) {
+        if self.renegotiation.has_failed() || !self.renegotiation.expired(now) {
+            return;
+        }
+
+        if self
+            .renegotiation
+            .fail("the remote never answered our offer")
+        {
+            self.sink.emit_control(PeerEvent::NegotiationFailed);
+        }
+    }
+
+    fn create_offer(
+        &mut self,
+        request: Negotiation,
+    ) -> Result<(LocalOffer, SdpPendingOffer), TransportError> {
         let mut api: SdpApi<'_> = self.rtc.sdp_api();
         let mut mids = Vec::with_capacity(request.add_media.len());
 
@@ -736,25 +874,131 @@ impl PeerActor {
         }
 
         let (offer, pending) = api.apply().ok_or(TransportError::NothingToNegotiate)?;
-        self.pending_offer = Some(pending);
 
-        Ok(LocalOffer {
-            mids,
-            sdp: offer.to_sdp_string(),
-        })
+        Ok((
+            LocalOffer {
+                mids,
+                sdp: offer.to_sdp_string(),
+            },
+            pending,
+        ))
     }
 
     fn accept_answer(&mut self, sdp: &str) -> Result<(), TransportError> {
+        if !self.renegotiation.is_pending() {
+            return Err(TransportError::NoPendingOffer);
+        }
+
+        let answer = SdpAnswer::from_sdp_string(sdp).map_err(str0m::RtcError::from)?;
         let pending = self
-            .pending_offer
+            .renegotiation
             .take()
             .ok_or(TransportError::NoPendingOffer)?;
-        let answer = SdpAnswer::from_sdp_string(sdp).map_err(str0m::RtcError::from)?;
 
         self.rtc.sdp_api().accept_answer(pending, answer)?;
         self.sync_ice_credentials()?;
 
         Ok(())
+    }
+
+    fn declare_send_stream(&mut self, spec: SendStream) -> Result<DeclaredStream, TransportError> {
+        let kind = self
+            .rtc
+            .media(spec.mid)
+            .map(|media| media.kind())
+            .ok_or(TransportError::UnknownMid(spec.mid))?;
+
+        let cache = spec.rtx_cache.unwrap_or_else(|| RtxCache::for_kind(kind));
+        let unpaced = spec.unpaced.unwrap_or(kind.is_audio());
+
+        let mut direct = self.rtc.direct_api();
+
+        let negotiated = direct
+            .stream_tx_by_mid(spec.mid, spec.rid)
+            .map(|stream| (stream.ssrc(), stream.rtx()));
+
+        let (ssrc, rtx) = match negotiated {
+            Some(pair) => pair,
+            None => {
+                let ssrc = spec.ssrc.unwrap_or_else(|| direct.new_ssrc());
+                let rtx = match spec.rtx {
+                    Some(rtx) => Some(rtx),
+                    None if kind.is_video() => Some(direct.new_ssrc()),
+                    None => None,
+                };
+
+                (ssrc, rtx)
+            }
+        };
+
+        let stream = direct.declare_stream_tx(ssrc, rtx, spec.mid, spec.rid);
+        stream.set_rtx_cache(cache.packets, cache.age, cache.ratio_cap);
+        stream.set_unpaced(unpaced);
+
+        let declared = DeclaredStream {
+            mid: spec.mid,
+            rid: spec.rid,
+            ssrc,
+            rtx,
+            negotiated: negotiated.is_some(),
+        };
+
+        tracing::debug!(
+            mid = %declared.mid,
+            rid = ?declared.rid,
+            ssrc = ?declared.ssrc,
+            rtx = ?declared.rtx,
+            negotiated = declared.negotiated,
+            unpaced,
+            "declared a send stream"
+        );
+
+        Ok(declared)
+    }
+
+    fn remove_send_stream(&mut self, mid: Mid, rid: Option<Rid>) -> bool {
+        let mut direct = self.rtc.direct_api();
+
+        let Some(ssrc) = direct
+            .stream_tx_by_mid(mid, rid)
+            .map(|stream| stream.ssrc())
+        else {
+            return false;
+        };
+
+        direct.remove_stream_tx(ssrc)
+    }
+
+    fn media_by_mid(&self, mid: Mid) -> Option<MediaInfo> {
+        let media = self.rtc.media(mid)?;
+
+        let rids = match media.rids_tx() {
+            Rids::Specific(rids) => rids.clone(),
+            _ => Vec::new(),
+        };
+
+        Some(MediaInfo {
+            mid,
+            kind: media.kind(),
+            direction: media.direction(),
+            rids,
+            params: self.negotiated_params(mid),
+        })
+    }
+
+    fn negotiated_params(&self, mid: Mid) -> Vec<PayloadParams> {
+        let Some(media) = self.rtc.media(mid) else {
+            return Vec::new();
+        };
+
+        let config = self.rtc.codec_config();
+
+        media
+            .remote_pts()
+            .iter()
+            .filter_map(|pt| config.params().iter().find(|params| params.pt() == *pt))
+            .cloned()
+            .collect()
     }
 
     fn sync_ice_credentials(&mut self) -> Result<(), TransportError> {
@@ -817,7 +1061,8 @@ impl PeerActor {
         let mut direct = self.rtc.direct_api();
 
         let Some(stream) = direct.stream_tx_by_mid(packet.mid, packet.rid) else {
-            tracing::debug!(mid = %packet.mid, rid = ?packet.rid, "no send stream declared");
+            self.unroutable_writes.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(mid = %packet.mid, rid = ?packet.rid, "no send stream declared");
             return;
         };
 
@@ -854,6 +1099,10 @@ impl PeerActor {
                 let info = self.media_info(added);
                 self.sink.emit_control(PeerEvent::MediaAdded(info))
             }
+            Event::MediaChanged(changed) => match self.media_changed(changed) {
+                Some(info) => self.sink.emit_control(PeerEvent::MediaChanged(info)),
+                None => true,
+            },
             Event::RtpPacket(packet) => {
                 let ssrc = packet.header.ssrc;
                 let carried_mid_extension = packet.header.ext_vals.mid.is_some();
@@ -876,6 +1125,9 @@ impl PeerActor {
             Event::KeyframeRequest(request) => self
                 .sink
                 .emit_control(PeerEvent::KeyframeRequested(request)),
+            Event::MediaEgressStats(stats) => self
+                .sink
+                .emit_control(PeerEvent::EgressReport(stats.into())),
             Event::StreamPaused(paused) => {
                 tracing::debug!(ssrc = ?paused.ssrc, paused = paused.paused, "stream pause changed");
                 true
@@ -900,6 +1152,13 @@ impl PeerActor {
             .map(|mid| (mid, packet.header.ext_vals.rid))
     }
 
+    fn media_changed(&self, changed: MediaChanged) -> Option<MediaInfo> {
+        let mut info = self.media_by_mid(changed.mid)?;
+        info.direction = changed.direction;
+
+        Some(info)
+    }
+
     fn media_info(&self, added: MediaAdded) -> MediaInfo {
         let rids = added
             .simulcast
@@ -907,26 +1166,12 @@ impl PeerActor {
             .map(|simulcast| simulcast.send.iter().map(|layer| layer.rid).collect())
             .unwrap_or_default();
 
-        let params = match self.rtc.media(added.mid) {
-            Some(media) => {
-                let remote_pts = media.remote_pts();
-                self.rtc
-                    .codec_config()
-                    .params()
-                    .iter()
-                    .filter(|params| remote_pts.contains(&params.pt()))
-                    .cloned()
-                    .collect()
-            }
-            None => Vec::new(),
-        };
-
         MediaInfo {
             mid: added.mid,
             kind: added.kind,
             direction: added.direction,
             rids,
-            params,
+            params: self.negotiated_params(added.mid),
         }
     }
 }
@@ -935,6 +1180,7 @@ impl PeerActor {
 mod tests {
     use super::*;
 
+    use crate::negotiation::MediaSpec;
     use crate::router::RouterConfig;
 
     fn loopback_router_config() -> RouterConfig {
@@ -1352,5 +1598,318 @@ mod tests {
         .expect("control events flow while the media queue is full");
 
         assert!(matches!(control, Some(PeerEvent::Connected)));
+    }
+
+    fn answering_client(crypto: &TransportCrypto, port: u16) -> Rtc {
+        let mut client = Rtc::builder()
+            .set_rtp_mode(true)
+            .set_dtls_cert(crypto.dtls_cert())
+            .build(Instant::now());
+
+        client.add_local_candidate(
+            Candidate::host(SocketAddr::from(([127, 0, 0, 1], port)), "udp")
+                .expect("client host candidate"),
+        );
+
+        client
+    }
+
+    fn outgoing(kind: MediaKind, track: &str) -> Negotiation {
+        Negotiation::add(MediaSpec {
+            kind,
+            direction: Direction::SendOnly,
+            stream_id: Some("stream".to_owned()),
+            track_id: Some(track.to_owned()),
+            simulcast: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn declaring_a_send_stream_for_an_unknown_mid_is_refused() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).unwrap();
+
+        let missing = Mid::from("nosuch");
+        let error = peer
+            .handle
+            .declare_send_stream(SendStream::new(missing))
+            .await
+            .expect_err("a mid the session never had cannot carry a stream");
+
+        assert!(matches!(error, TransportError::UnknownMid(mid) if mid == missing));
+
+        assert!(matches!(
+            peer.handle.media(missing).await,
+            Err(TransportError::UnknownMid(_))
+        ));
+        assert!(!peer.handle.remove_send_stream(missing, None).await.unwrap());
+
+        peer.handle
+            .add_remote_candidate(String::new())
+            .await
+            .expect("the peer survives the refusal and keeps answering commands");
+    }
+
+    #[tokio::test]
+    async fn a_declared_stream_keeps_the_ssrc_that_was_offered() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).unwrap();
+
+        let local = peer
+            .handle
+            .negotiate(outgoing(MediaKind::Video, "video"))
+            .await
+            .unwrap();
+        let mid = local.mids[0];
+
+        let mut client = answering_client(&crypto, 40100);
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&local.sdp).expect("our offer parses"))
+            .expect("the client answers");
+        peer.handle
+            .accept_answer(answer.to_sdp_string())
+            .await
+            .unwrap();
+
+        let declared = peer
+            .handle
+            .declare_send_stream(SendStream::new(mid))
+            .await
+            .expect("the negotiated mid accepts a send stream");
+
+        assert_eq!(declared.mid, mid);
+        assert!(declared.negotiated, "the sdp already allocated the ssrc");
+        assert!(declared.rtx.is_some(), "video needs an rtx ssrc to resend");
+        assert!(
+            local.sdp.contains(&format!("a=ssrc:{}", *declared.ssrc)),
+            "the declared ssrc must be the one we put in the offer"
+        );
+        assert!(
+            local
+                .sdp
+                .contains(&format!("a=ssrc:{}", *declared.rtx.unwrap()))
+        );
+
+        let media = peer.handle.media(mid).await.unwrap();
+        assert_eq!(media.kind, MediaKind::Video);
+        assert_eq!(media.direction, Direction::SendOnly);
+        assert!(
+            !media.params.is_empty(),
+            "the answer must leave us at least one payload type"
+        );
+
+        assert!(peer.handle.remove_send_stream(mid, None).await.unwrap());
+        assert!(!peer.handle.remove_send_stream(mid, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_second_negotiation_waits_for_the_answer_to_the_first() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, _events) =
+            peer_actor(&crypto, &udp, PeerConfig::subscriber()).await;
+
+        let (reply, first) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "video")),
+            reply,
+        });
+        let first = first.await.unwrap().expect("the first offer is created");
+
+        let (reply, mut second) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Audio, "audio")),
+            reply,
+        });
+
+        assert!(
+            second.try_recv().is_err(),
+            "a second offer must not be created while the first is unanswered"
+        );
+        assert_eq!(actor.renegotiation.queued(), 1);
+        assert!(actor.renegotiation.is_pending());
+
+        let mut client = answering_client(&crypto, 40101);
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&first.sdp).expect("our offer parses"))
+            .expect("the client answers the first offer");
+
+        let (reply, applied) = oneshot::channel();
+        actor.on_command(PeerCommand::AcceptAnswer {
+            sdp: answer.to_sdp_string(),
+            reply,
+        });
+        applied.await.unwrap().expect("the answer applies");
+
+        let second = second.await.unwrap().expect("the queued offer runs next");
+
+        assert_ne!(second.mids[0], first.mids[0]);
+        assert_eq!(actor.renegotiation.queued(), 0);
+        assert!(actor.renegotiation.is_pending());
+        assert!(
+            actor
+                .declare_send_stream(SendStream::new(first.mids[0]))
+                .is_ok(),
+            "the stream from the first negotiation stays declarable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_offer_is_held_rather_than_rolled_back() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, mut events) = peer_actor(
+            &crypto,
+            &udp,
+            PeerConfig {
+                negotiation_timeout: Duration::from_millis(10),
+                ..PeerConfig::subscriber()
+            },
+        )
+        .await;
+
+        let (reply, first) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "video")),
+            reply,
+        });
+        let first = first.await.unwrap().expect("the first offer is created");
+
+        let (reply, second) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Audio, "audio")),
+            reply,
+        });
+
+        actor.expire_negotiation(Instant::now() + Duration::from_millis(11));
+
+        assert!(
+            matches!(
+                second.await.unwrap(),
+                Err(TransportError::NegotiationFailed)
+            ),
+            "a queued offer must never take the place of one the remote may have applied"
+        );
+        assert!(
+            actor.renegotiation.is_pending(),
+            "the unanswered offer must stay held so str0m never releases mid {}",
+            first.mids[0]
+        );
+        assert!(actor.renegotiation.has_failed());
+        assert_eq!(
+            actor.renegotiation.deadline(),
+            None,
+            "a failed negotiation must not keep waking the peer up"
+        );
+
+        let (reply, later) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "later")),
+            reply,
+        });
+        assert!(matches!(
+            later.await.unwrap(),
+            Err(TransportError::NegotiationFailed)
+        ));
+
+        assert!(
+            matches!(
+                events.recv_control().await,
+                Some(PeerEvent::NegotiationFailed)
+            ),
+            "the session must be told its negotiation is beyond repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_puts_the_session_back_in_business() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, _events) = peer_actor(
+            &crypto,
+            &udp,
+            PeerConfig {
+                negotiation_timeout: Duration::from_millis(10),
+                ..PeerConfig::subscriber()
+            },
+        )
+        .await;
+
+        let (reply, first) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "video")),
+            reply,
+        });
+        let first = first.await.unwrap().expect("the first offer is created");
+
+        actor.expire_negotiation(Instant::now() + Duration::from_millis(11));
+        assert!(actor.renegotiation.has_failed());
+
+        let mut client = answering_client(&crypto, 40102);
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&first.sdp).expect("our offer parses"))
+            .expect("the client answers late");
+
+        let (reply, applied) = oneshot::channel();
+        actor.on_command(PeerCommand::AcceptAnswer {
+            sdp: answer.to_sdp_string(),
+            reply,
+        });
+        applied
+            .await
+            .unwrap()
+            .expect("the late answer still applies");
+
+        assert!(!actor.renegotiation.has_failed());
+        assert!(
+            actor
+                .declare_send_stream(SendStream::new(first.mids[0]))
+                .is_ok(),
+            "the media section the remote answered must be the one we offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backlog_of_renegotiations_is_refused_rather_than_queued_forever() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, _events) = peer_actor(
+            &crypto,
+            &udp,
+            PeerConfig {
+                negotiation_backlog: 1,
+                ..PeerConfig::subscriber()
+            },
+        )
+        .await;
+
+        let (reply, first) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "one")),
+            reply,
+        });
+        let _first = first.await.unwrap().expect("the first offer is created");
+
+        let (reply, _queued) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "two")),
+            reply,
+        });
+
+        let (reply, refused) = oneshot::channel();
+        actor.on_command(PeerCommand::Negotiate {
+            request: Box::new(outgoing(MediaKind::Video, "three")),
+            reply,
+        });
+
+        assert!(matches!(
+            refused.await.unwrap(),
+            Err(TransportError::NegotiationBacklog)
+        ));
     }
 }

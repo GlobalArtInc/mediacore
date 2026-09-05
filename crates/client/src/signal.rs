@@ -13,13 +13,17 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::error::ClientError;
+use crate::events::{ClientEvent, EventStream, RemoteTrack, subscription_error};
+use crate::subscriber::SubCommand;
 use crate::transport::Command;
 
 pub(crate) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Default)]
 struct State {
+    local_sid: String,
     participants: HashMap<String, livekit::ParticipantInfo>,
+    tracks: HashMap<String, RemoteTrack>,
     closed: Option<livekit::DisconnectReason>,
 }
 
@@ -31,7 +35,8 @@ pub(crate) enum Outgoing {
 #[derive(Clone)]
 pub(crate) struct SignalHandle {
     outgoing: mpsc::UnboundedSender<Outgoing>,
-    events: broadcast::Sender<signal_response::Message>,
+    responses: broadcast::Sender<signal_response::Message>,
+    events: broadcast::Sender<ClientEvent>,
     state: Arc<Mutex<State>>,
 }
 
@@ -58,8 +63,12 @@ impl SignalHandle {
 
     pub(crate) fn subscribe(&self) -> SignalStream {
         SignalStream {
-            inner: self.events.subscribe(),
+            inner: self.responses.subscribe(),
         }
+    }
+
+    pub(crate) fn events(&self) -> EventStream {
+        EventStream::new(self.events.subscribe())
     }
 
     pub(crate) fn participants(&self) -> Vec<livekit::ParticipantInfo> {
@@ -67,6 +76,13 @@ impl SignalHandle {
         let mut participants: Vec<_> = state.participants.values().cloned().collect();
         participants.sort_by(|a, b| a.identity.cmp(&b.identity));
         participants
+    }
+
+    pub(crate) fn remote_tracks(&self) -> Vec<RemoteTrack> {
+        let state = self.state.lock().expect("signal state poisoned");
+        let mut tracks: Vec<_> = state.tracks.values().cloned().collect();
+        tracks.sort_by(|a, b| a.info.sid.cmp(&b.info.sid));
+        tracks
     }
 
     pub(crate) fn disconnect_reason(&self) -> Option<livekit::DisconnectReason> {
@@ -129,26 +145,43 @@ pub(crate) struct Signalling {
     pub(crate) writer: tokio::task::JoinHandle<()>,
 }
 
-pub(crate) fn start(socket: Socket, transport: mpsc::Sender<Command>, buffer: usize) -> Signalling {
+pub(crate) fn start(
+    socket: Socket,
+    publisher: mpsc::Sender<Command>,
+    subscriber: mpsc::Sender<SubCommand>,
+    buffer: usize,
+) -> Signalling {
     let (sink, stream) = socket.split();
     let (outgoing, outbox) = mpsc::unbounded_channel();
+    let (responses, _) = broadcast::channel(buffer);
     let (events, _) = broadcast::channel(buffer);
     let state = Arc::new(Mutex::new(State::default()));
 
     let handle = SignalHandle {
         outgoing,
+        responses: responses.clone(),
         events: events.clone(),
         state: state.clone(),
     };
 
+    let routes = Routes {
+        publisher,
+        subscriber,
+    };
+
     let writer = tokio::spawn(write_loop(sink, outbox));
-    let reader = tokio::spawn(read_loop(stream, events, state, transport));
+    let reader = tokio::spawn(read_loop(stream, responses, events, state, routes));
 
     Signalling {
         handle,
         reader,
         writer,
     }
+}
+
+struct Routes {
+    publisher: mpsc::Sender<Command>,
+    subscriber: mpsc::Sender<SubCommand>,
 }
 
 async fn write_loop(
@@ -179,9 +212,10 @@ async fn write_loop(
 
 async fn read_loop(
     mut stream: SplitStream<Socket>,
-    events: broadcast::Sender<signal_response::Message>,
+    responses: broadcast::Sender<signal_response::Message>,
+    events: broadcast::Sender<ClientEvent>,
     state: Arc<Mutex<State>>,
-    transport: mpsc::Sender<Command>,
+    routes: Routes,
 ) {
     while let Some(frame) = stream.next().await {
         let data = match frame {
@@ -206,8 +240,8 @@ async fn read_loop(
             continue;
         };
 
-        let closing = dispatch(&message, &state, &transport).await;
-        let _ = events.send(message);
+        let closing = dispatch(&message, &state, &routes, &events).await;
+        let _ = responses.send(message);
 
         if closing {
             break;
@@ -223,15 +257,27 @@ async fn read_loop(
 async fn dispatch(
     message: &signal_response::Message,
     state: &Arc<Mutex<State>>,
-    transport: &mpsc::Sender<Command>,
+    routes: &Routes,
+    events: &broadcast::Sender<ClientEvent>,
 ) -> bool {
+    let mut emitted = Vec::new();
+    let mut closing = false;
+
     match message {
         signal_response::Message::Join(join) => {
             let mut state = state.lock().expect("signal state poisoned");
+            if let Some(participant) = &join.participant {
+                state.local_sid = participant.sid.clone();
+            }
             for participant in &join.other_participants {
+                emitted.push(ClientEvent::ParticipantJoined {
+                    participant_sid: participant.sid.clone(),
+                    identity: participant.identity.clone(),
+                });
                 state
                     .participants
                     .insert(participant.identity.clone(), participant.clone());
+                reconcile_tracks(&mut state, participant, &mut emitted);
             }
         }
         signal_response::Message::Update(update) => {
@@ -239,22 +285,71 @@ async fn dispatch(
             for participant in &update.participants {
                 if participant.state == livekit::participant_info::State::Disconnected as i32 {
                     state.participants.remove(&participant.identity);
+                    forget_tracks(&mut state, &participant.sid, &mut emitted);
+                    emitted.push(ClientEvent::ParticipantLeft {
+                        participant_sid: participant.sid.clone(),
+                        identity: participant.identity.clone(),
+                    });
                 } else {
                     state
                         .participants
                         .insert(participant.identity.clone(), participant.clone());
+                    reconcile_tracks(&mut state, participant, &mut emitted);
                 }
             }
         }
         signal_response::Message::Answer(answer) => {
-            let _ = transport.send(Command::Answer(answer.sdp.clone())).await;
+            let _ = routes
+                .publisher
+                .send(Command::Answer(answer.sdp.clone()))
+                .await;
+        }
+        signal_response::Message::Offer(offer) => {
+            let _ = routes
+                .subscriber
+                .send(SubCommand::Offer(Box::new(offer.clone())))
+                .await;
         }
         signal_response::Message::Trickle(trickle) => {
-            if trickle.target == livekit::SignalTarget::Publisher as i32 {
-                let _ = transport
+            if trickle.target == livekit::SignalTarget::Subscriber as i32 {
+                let _ = routes
+                    .subscriber
+                    .send(SubCommand::RemoteCandidate(trickle.candidate_init.clone()))
+                    .await;
+            } else {
+                let _ = routes
+                    .publisher
                     .send(Command::RemoteCandidate(trickle.candidate_init.clone()))
                     .await;
             }
+        }
+        signal_response::Message::SubscriptionResponse(response) => {
+            emitted.push(ClientEvent::SubscriptionResponse {
+                track_sid: response.track_sid.clone(),
+                error: subscription_error(response.err),
+            });
+        }
+        signal_response::Message::TrackSubscribed(subscribed) => {
+            emitted.push(ClientEvent::TrackSubscribed {
+                track_sid: subscribed.track_sid.clone(),
+            });
+        }
+        signal_response::Message::TrackUnpublished(unpublished) => {
+            emitted.push(ClientEvent::LocalTrackUnpublished {
+                track_sid: unpublished.track_sid.clone(),
+            });
+        }
+        signal_response::Message::StreamStateUpdate(update) => {
+            emitted.push(ClientEvent::StreamStateChanged(
+                update.stream_states.clone(),
+            ));
+        }
+        signal_response::Message::SubscriptionPermissionUpdate(update) => {
+            emitted.push(ClientEvent::SubscriptionPermissionChanged {
+                participant_sid: update.participant_sid.clone(),
+                track_sid: update.track_sid.clone(),
+                allowed: update.allowed,
+            });
         }
         signal_response::Message::Leave(leave) => {
             let mut state = state.lock().expect("signal state poisoned");
@@ -262,12 +357,81 @@ async fn dispatch(
                 livekit::DisconnectReason::try_from(leave.reason)
                     .unwrap_or(livekit::DisconnectReason::UnknownReason),
             );
-            return true;
+            closing = true;
         }
         _ => {}
     }
 
-    false
+    for event in emitted {
+        let _ = events.send(event);
+    }
+
+    closing
+}
+
+fn reconcile_tracks(
+    state: &mut State,
+    participant: &livekit::ParticipantInfo,
+    emitted: &mut Vec<ClientEvent>,
+) {
+    if participant.sid == state.local_sid {
+        return;
+    }
+
+    let announced: Vec<String> = participant
+        .tracks
+        .iter()
+        .map(|track| track.sid.clone())
+        .collect();
+
+    let gone: Vec<String> = state
+        .tracks
+        .values()
+        .filter(|track| track.participant_sid == participant.sid)
+        .map(|track| track.info.sid.clone())
+        .filter(|sid| !announced.contains(sid))
+        .collect();
+
+    for sid in gone {
+        state.tracks.remove(&sid);
+        emitted.push(ClientEvent::TrackUnpublished {
+            participant_sid: participant.sid.clone(),
+            track_sid: sid,
+        });
+    }
+
+    for info in &participant.tracks {
+        let track = RemoteTrack {
+            participant_sid: participant.sid.clone(),
+            participant_identity: participant.identity.clone(),
+            info: info.clone(),
+        };
+
+        if state
+            .tracks
+            .insert(info.sid.clone(), track.clone())
+            .is_none()
+        {
+            emitted.push(ClientEvent::TrackPublished(Box::new(track)));
+        }
+    }
+}
+
+fn forget_tracks(state: &mut State, participant_sid: &str, emitted: &mut Vec<ClientEvent>) {
+    let gone: Vec<String> = state
+        .tracks
+        .values()
+        .filter(|track| track.participant_sid == participant_sid)
+        .map(|track| track.info.sid.clone())
+        .collect();
+
+    for sid in gone {
+        state.tracks.remove(&sid);
+        emitted.push(ClientEvent::TrackUnpublished {
+            participant_sid: participant_sid.to_owned(),
+            track_sid: sid,
+        });
+    }
 }
 
 pub(crate) fn ping_loop(handle: SignalHandle, interval: Duration) -> tokio::task::JoinHandle<()> {

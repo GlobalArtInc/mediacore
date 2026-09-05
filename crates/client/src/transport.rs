@@ -3,7 +3,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use mediacore_proto::livekit::{self, signal_request};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::config::DtlsCert;
@@ -18,9 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::ClientError;
 use crate::media::{Codec, MediaProfile, SyntheticSource};
 use crate::signal::SignalHandle;
+use crate::udp::{self, Datagram};
 
-const DATAGRAM_BUFFER: usize = 2048;
-const DATAGRAM_QUEUE: usize = 256;
 const MAX_CATCH_UP_PACKETS: u32 = 4;
 
 pub(crate) enum Command {
@@ -30,6 +28,10 @@ pub(crate) enum Command {
         track_id: String,
         profile: MediaProfile,
         reply: oneshot::Sender<Result<Mid, ClientError>>,
+    },
+    Unpublish {
+        mid: Mid,
+        reply: oneshot::Sender<Result<(), ClientError>>,
     },
     Answer(String),
     RemoteCandidate(String),
@@ -49,17 +51,59 @@ pub struct TrackStats {
 
 struct Pending {
     offer: SdpPendingOffer,
-    mid: Mid,
-    profile: MediaProfile,
-    reply: oneshot::Sender<Result<Mid, ClientError>>,
+    awaiting: Awaiting,
 }
 
-struct Queued {
-    kind: MediaKind,
-    stream_id: String,
-    track_id: String,
-    profile: MediaProfile,
-    reply: oneshot::Sender<Result<Mid, ClientError>>,
+enum Awaiting {
+    Publish {
+        mid: Mid,
+        profile: MediaProfile,
+        reply: oneshot::Sender<Result<Mid, ClientError>>,
+    },
+    Unpublish {
+        mid: Mid,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+}
+
+impl Awaiting {
+    fn fail(self, error: ClientError) {
+        match self {
+            Self::Publish { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Unpublish { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
+enum Queued {
+    Publish {
+        kind: MediaKind,
+        stream_id: String,
+        track_id: String,
+        profile: MediaProfile,
+        reply: oneshot::Sender<Result<Mid, ClientError>>,
+    },
+    Unpublish {
+        mid: Mid,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+}
+
+impl Queued {
+    fn fail(self, error: ClientError) {
+        match self {
+            Self::Publish { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Unpublish { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
 }
 
 struct TrackSender {
@@ -82,7 +126,7 @@ pub(crate) struct Transport {
     candidate: Candidate,
     signal: SignalHandle,
     commands: mpsc::Receiver<Command>,
-    datagrams: mpsc::Receiver<(Instant, SocketAddr, Bytes)>,
+    datagrams: mpsc::Receiver<Datagram>,
     senders: Vec<TrackSender>,
     pending: Option<Pending>,
     queue: VecDeque<Queued>,
@@ -95,8 +139,8 @@ pub(crate) async fn start(
     commands: mpsc::Receiver<Command>,
     signal: SignalHandle,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ClientError> {
-    let socket = Arc::new(UdpSocket::bind(SocketAddr::new(bind, 0)).await?);
-    let local = socket.local_addr()?;
+    let endpoint = udp::bind(bind).await?;
+    let local = endpoint.local;
 
     let mut rtc = publisher_rtc()?;
 
@@ -107,32 +151,14 @@ pub(crate) async fn start(
         tracing::warn!(%local, "str0m rejected our host candidate");
     }
 
-    let (datagram_tx, datagrams) = mpsc::channel(DATAGRAM_QUEUE);
-    let reader = socket.clone();
-
-    tokio::spawn(async move {
-        let mut buffer = vec![0_u8; DATAGRAM_BUFFER];
-
-        loop {
-            let Ok((size, source)) = reader.recv_from(&mut buffer).await else {
-                break;
-            };
-            let at = Instant::now();
-            let data = Bytes::copy_from_slice(&buffer[..size]);
-            if datagram_tx.send((at, source, data)).await.is_err() {
-                break;
-            }
-        }
-    });
-
     let transport = Transport {
         rtc,
-        socket,
+        socket: endpoint.socket,
         local,
         candidate,
         signal,
         commands,
-        datagrams,
+        datagrams: endpoint.datagrams,
         senders: Vec::new(),
         pending: None,
         queue: VecDeque::new(),
@@ -154,7 +180,7 @@ pub(crate) fn publisher_rtc() -> Result<Rtc, ClientError> {
         .build(Instant::now()))
 }
 
-fn dtls_cert() -> Result<DtlsCert, ClientError> {
+pub(crate) fn dtls_cert() -> Result<DtlsCert, ClientError> {
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
     INSTALLED.get_or_init(|| {
@@ -321,13 +347,17 @@ impl Transport {
                 profile,
                 reply,
             } => {
-                self.queue.push_back(Queued {
+                self.queue.push_back(Queued::Publish {
                     kind,
                     stream_id,
                     track_id,
                     profile,
                     reply,
                 });
+                self.negotiate();
+            }
+            Command::Unpublish { mid, reply } => {
+                self.queue.push_back(Queued::Unpublish { mid, reply });
                 self.negotiate();
             }
             Command::Answer(sdp) => self.on_answer(&sdp),
@@ -387,16 +417,38 @@ impl Transport {
         };
 
         let mut api = self.rtc.sdp_api();
-        let mid = api.add_media(
-            queued.kind,
-            Direction::SendOnly,
-            Some(queued.stream_id),
-            Some(queued.track_id),
-            None,
-        );
+
+        let awaiting = match queued {
+            Queued::Publish {
+                kind,
+                stream_id,
+                track_id,
+                profile,
+                reply,
+            } => {
+                let mid = api.add_media(
+                    kind,
+                    Direction::SendOnly,
+                    Some(stream_id),
+                    Some(track_id),
+                    None,
+                );
+
+                Awaiting::Publish {
+                    mid,
+                    profile,
+                    reply,
+                }
+            }
+            Queued::Unpublish { mid, reply } => {
+                api.set_direction(mid, Direction::Inactive);
+
+                Awaiting::Unpublish { mid, reply }
+            }
+        };
 
         let Some((offer, pending)) = api.apply() else {
-            let _ = queued.reply.send(Err(ClientError::NothingToNegotiate));
+            awaiting.fail(ClientError::NothingToNegotiate);
             return;
         };
 
@@ -407,7 +459,7 @@ impl Transport {
         });
 
         if let Err(error) = self.signal.send(request) {
-            let _ = queued.reply.send(Err(error));
+            awaiting.fail(error);
             return;
         }
 
@@ -415,9 +467,7 @@ impl Transport {
 
         self.pending = Some(Pending {
             offer: pending,
-            mid,
-            profile: queued.profile,
-            reply: queued.reply,
+            awaiting,
         });
     }
 
@@ -459,25 +509,35 @@ impl Transport {
         let answer = match SdpAnswer::from_sdp_string(sdp) {
             Ok(answer) => answer,
             Err(error) => {
-                let _ = pending
-                    .reply
-                    .send(Err(ClientError::Rtc(str0m::RtcError::Sdp(error))));
+                pending
+                    .awaiting
+                    .fail(ClientError::Rtc(str0m::RtcError::Sdp(error)));
                 self.negotiate();
                 return;
             }
         };
 
         if let Err(error) = self.rtc.sdp_api().accept_answer(pending.offer, answer) {
-            let _ = pending.reply.send(Err(ClientError::Rtc(error)));
+            pending.awaiting.fail(ClientError::Rtc(error));
             self.negotiate();
             return;
         }
 
-        let outcome = self
-            .add_sender(pending.mid, pending.profile)
-            .map(|()| pending.mid);
+        match pending.awaiting {
+            Awaiting::Publish {
+                mid,
+                profile,
+                reply,
+            } => {
+                let outcome = self.add_sender(mid, profile).map(|()| mid);
+                let _ = reply.send(outcome);
+            }
+            Awaiting::Unpublish { mid, reply } => {
+                self.senders.retain(|sender| sender.mid != mid);
+                let _ = reply.send(Ok(()));
+            }
+        }
 
-        let _ = pending.reply.send(outcome);
         self.negotiate();
     }
 
@@ -574,11 +634,11 @@ impl Transport {
         self.connect_waiters.clear();
 
         if let Some(pending) = self.pending.take() {
-            let _ = pending.reply.send(Err(ClientError::TransportGone));
+            pending.awaiting.fail(ClientError::TransportGone);
         }
 
         while let Some(queued) = self.queue.pop_front() {
-            let _ = queued.reply.send(Err(ClientError::TransportGone));
+            queued.fail(ClientError::TransportGone);
         }
     }
 }

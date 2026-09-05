@@ -8,6 +8,7 @@ use mediacore_transport::str0m::media::MediaKind;
 use mediacore_transport::{MediaInfo, PeerEvent, PeerEvents, PeerHandle};
 use tokio::task::JoinHandle;
 
+use crate::forward::TrackSource;
 use crate::publisher::PublisherStats;
 use crate::state::AppState;
 
@@ -75,7 +76,7 @@ impl PublisherSession {
         ));
 
         self.send_local_candidates(state, joined, &bundle);
-        self.bind_offered_tracks(joined, &offer);
+        self.bind_offered_tracks(state, joined, &offer);
     }
 
     pub async fn on_trickle(&mut self, joined: &Joined, request: livekit::TrickleRequest) {
@@ -110,7 +111,7 @@ impl PublisherSession {
         }
     }
 
-    pub fn on_event(&mut self, joined: &Joined, event: PeerEvent) -> bool {
+    pub fn on_event(&mut self, state: &AppState, joined: &Joined, event: PeerEvent) -> bool {
         match event {
             PeerEvent::Connected => {
                 self.stats.mark_connected();
@@ -126,13 +127,32 @@ impl PublisherSession {
                     "publisher ice state"
                 );
             }
-            PeerEvent::MediaAdded(info) => self.on_media_added(joined, info),
+            PeerEvent::MediaAdded(info) => self.on_media_added(state, joined, info),
+            PeerEvent::MediaChanged(info) => self.on_media_changed(state, joined, &info),
+            PeerEvent::NegotiationFailed => {
+                tracing::warn!(
+                    identity = %joined.participant.identity,
+                    "the publisher never answered a local offer"
+                );
+            }
             PeerEvent::Rtp(rtp) => {
-                let track_sid = self.sid_by_mid.get(&*rtp.mid).map(String::as_str);
+                let track_sid = self.sid_by_mid.get(&*rtp.mid).cloned();
                 self.stats.count_rtp(
-                    track_sid,
+                    track_sid.as_deref(),
                     rtp.packet.payload.len(),
                     rtp.carried_mid_extension,
+                );
+
+                if let Some(track_sid) = track_sid {
+                    state.router.forward(&track_sid, &rtp);
+                }
+            }
+            PeerEvent::EgressReport(report) => {
+                tracing::trace!(
+                    identity = %joined.participant.identity,
+                    mid = %report.mid,
+                    rtt = ?report.rtt,
+                    "publisher egress report"
                 );
             }
             PeerEvent::Media(_) | PeerEvent::KeyframeRequested(_) => {}
@@ -153,6 +173,11 @@ impl PublisherSession {
         if let Some(handle) = self.handle.take() {
             handle.close();
         }
+
+        for track_sid in self.sid_by_mid.values() {
+            state.router.remove_source(track_sid);
+        }
+
         self.events = None;
         self.task = None;
         state.publishers.remove(participant_sid);
@@ -222,10 +247,24 @@ impl PublisherSession {
             .send(trickle(candidate_init(last, bundle_mid), true));
     }
 
-    fn bind_offered_tracks(&mut self, joined: &Joined, offer: &livekit::SessionDescription) {
+    fn bind_offered_tracks(
+        &mut self,
+        state: &AppState,
+        joined: &Joined,
+        offer: &livekit::SessionDescription,
+    ) {
         let mut bound = false;
+        let sending = sending_sections(&offer.sdp);
+
+        for mid in self.silenced_mids(&sending) {
+            self.unpublish_mid(state, joined, &mid);
+        }
 
         for (mid, cid) in offered_tracks(offer) {
+            if !sending.get(&mid).copied().unwrap_or(true) {
+                continue;
+            }
+
             self.cid_by_mid.insert(mid.clone(), cid.clone());
 
             let Some(track) = joined.participant.track_by_cid(&cid) else {
@@ -261,7 +300,45 @@ impl PublisherSession {
         }
     }
 
-    fn on_media_added(&mut self, joined: &Joined, info: MediaInfo) {
+    fn silenced_mids(&self, sending: &HashMap<String, bool>) -> Vec<String> {
+        self.sid_by_mid
+            .keys()
+            .filter(|mid| !sending.get(*mid).copied().unwrap_or(true))
+            .cloned()
+            .collect()
+    }
+
+    fn on_media_changed(&mut self, state: &AppState, joined: &Joined, info: &MediaInfo) {
+        if info.direction.is_receiving() {
+            return;
+        }
+
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            mid = %info.mid,
+            direction = %info.direction,
+            "the publisher stopped sending on a media section"
+        );
+        self.unpublish_mid(state, joined, &info.mid.to_string());
+    }
+
+    fn unpublish_mid(&mut self, state: &AppState, joined: &Joined, mid: &str) {
+        self.cid_by_mid.remove(mid);
+
+        let Some(track_sid) = self.sid_by_mid.remove(mid) else {
+            return;
+        };
+
+        tracing::info!(
+            identity = %joined.participant.identity,
+            track = %track_sid,
+            %mid,
+            "publisher unpublished a track"
+        );
+        unpublish(state, joined, &track_sid);
+    }
+
+    fn on_media_added(&mut self, state: &AppState, joined: &Joined, info: MediaInfo) {
         let mid = info.mid.to_string();
 
         let Some(cid) = self.cid_by_mid.get(&mid) else {
@@ -297,6 +374,13 @@ impl PublisherSession {
             .set_track_mime_type(&track.sid, &mime_type);
         self.sid_by_mid.insert(mid.clone(), track.sid.clone());
 
+        if let Some(handle) = self.handle.clone() {
+            state.router.register_source(
+                &track.sid,
+                TrackSource::new(handle, info.mid, track.kind, &mime_type),
+            );
+        }
+
         tracing::info!(
             identity = %joined.participant.identity,
             track = %track.sid,
@@ -308,6 +392,71 @@ impl PublisherSession {
 
         announce(joined);
     }
+}
+
+fn unpublish(state: &AppState, joined: &Joined, track_sid: &str) {
+    if joined
+        .room
+        .unpublish_track(&joined.participant.sid, track_sid)
+        .is_none()
+    {
+        return;
+    }
+
+    let subscribers = state.router.drop_track(track_sid);
+
+    tracing::debug!(
+        identity = %joined.participant.identity,
+        track = %track_sid,
+        subscribers,
+        "tore down every forwarder of an unpublished track"
+    );
+
+    joined
+        .participant
+        .send(signal_response::Message::TrackUnpublished(
+            livekit::TrackUnpublishedResponse {
+                track_sid: track_sid.to_owned(),
+            },
+        ));
+}
+
+fn sending_sections(sdp: &str) -> HashMap<String, bool> {
+    let mut sections = HashMap::new();
+    let mut mid: Option<String> = None;
+    let mut sending = true;
+    let mut rejected = false;
+    let mut bundle_only = false;
+
+    for line in sdp.lines() {
+        let line = line.trim();
+
+        if let Some(media) = line.strip_prefix("m=") {
+            if let Some(mid) = mid.take() {
+                sections.insert(mid, sending && (!rejected || bundle_only));
+            }
+            sending = true;
+            bundle_only = false;
+            rejected = media
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|port| port == "0");
+        } else if let Some(value) = line.strip_prefix("a=mid:") {
+            mid = Some(value.trim().to_owned());
+        } else if line == "a=bundle-only" {
+            bundle_only = true;
+        } else if matches!(line, "a=inactive" | "a=recvonly") {
+            sending = false;
+        } else if matches!(line, "a=sendonly" | "a=sendrecv") {
+            sending = true;
+        }
+    }
+
+    if let Some(mid) = mid {
+        sections.insert(mid, sending && (!rejected || bundle_only));
+    }
+
+    sections
 }
 
 fn announce(joined: &Joined) {
@@ -333,7 +482,7 @@ fn trickle(candidate_init: String, final_candidate: bool) -> signal_response::Me
     })
 }
 
-fn candidate_init(candidate: &str, mid: &str) -> String {
+pub(crate) fn candidate_init(candidate: &str, mid: &str) -> String {
     serde_json::json!({
         "candidate": candidate,
         "sdpMid": mid,
@@ -349,7 +498,7 @@ pub fn bundle_mid(sdp: &str) -> String {
         .unwrap_or_else(|| "0".to_owned())
 }
 
-fn candidate_from_init(candidate_init: &str) -> Option<String> {
+pub(crate) fn candidate_from_init(candidate_init: &str) -> Option<String> {
     if candidate_init.trim().is_empty() {
         return None;
     }
@@ -442,6 +591,35 @@ fn mime_type(kind: MediaKind, params: &[PayloadParams]) -> Option<String> {
 mod tests {
     use super::*;
 
+    const BUNDLED_OFFER: &str = "v=0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+a=bundle-only\r\n\
+a=sendonly\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:2\r\n\
+a=sendonly\r\n";
+
+    #[test]
+    fn a_bundle_only_section_is_still_sending() {
+        let sections = sending_sections(BUNDLED_OFFER);
+
+        assert_eq!(sections.get("0"), Some(&true));
+        assert_eq!(
+            sections.get("1"),
+            Some(&true),
+            "a bundle-only section carries media even though its port is zero"
+        );
+        assert_eq!(
+            sections.get("2"),
+            Some(&false),
+            "a section with a zero port and no bundle-only is rejected"
+        );
+    }
+
     use mediacore_transport::str0m::format::{CodecSpec, FormatParams};
     use mediacore_transport::str0m::media::Frequency;
 
@@ -496,6 +674,36 @@ a=ssrc:42 msid:stream-1 cid-video\r\n";
         let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n";
 
         assert!(offered_tracks(&offer(sdp)).is_empty());
+    }
+
+    #[test]
+    fn a_media_section_the_publisher_stopped_sending_on_is_read_as_such() {
+        let sending = sending_sections(OFFER);
+
+        assert_eq!(sending.get("aBc"), Some(&true));
+        assert_eq!(sending.get("dEf"), Some(&true));
+
+        let stopped = OFFER.replace("a=mid:aBc\r\na=sendonly", "a=mid:aBc\r\na=inactive");
+        let sending = sending_sections(&stopped);
+        assert_eq!(sending.get("aBc"), Some(&false));
+        assert_eq!(
+            sending.get("dEf"),
+            Some(&true),
+            "one silenced section must not silence the next one"
+        );
+
+        let rejected = OFFER.replace(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "m=video 0 UDP/TLS/RTP/SAVPF 96",
+        );
+        assert_eq!(sending_sections(&rejected).get("dEf"), Some(&false));
+
+        let bare = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n";
+        assert_eq!(
+            sending_sections(bare).get("0"),
+            Some(&true),
+            "a section without a direction is sendrecv by default"
+        );
     }
 
     #[test]

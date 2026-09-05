@@ -675,6 +675,12 @@ impl Registry {
                 "displacing an earlier session with the same identity"
             );
             displaced.disconnect(livekit::DisconnectReason::DuplicateIdentity);
+            depart(
+                &room,
+                &displaced,
+                livekit::DisconnectReason::DuplicateIdentity,
+                Some(&participant.sid),
+            );
         }
 
         let others = room
@@ -730,26 +736,48 @@ impl Registry {
         };
 
         let Some(departed) = departed else {
+            tracing::debug!(
+                room = %room_name,
+                %sid,
+                "nothing to leave, the session was already replaced or removed"
+            );
             return;
         };
 
-        let orphaned: Vec<String> = departed
-            .tracks()
-            .into_iter()
-            .map(|track| track.sid)
-            .collect();
-        if !orphaned.is_empty() {
-            for participant in room.participants() {
-                participant.remove_desired_subscriptions(orphaned.iter().cloned());
-            }
-        }
+        depart(
+            &room,
+            &departed,
+            livekit::DisconnectReason::ClientInitiated,
+            None,
+        );
+    }
+}
 
-        if !departed.permission.hidden {
-            let mut info = departed.to_proto(livekit::participant_info::State::Disconnected);
-            info.disconnect_reason = livekit::DisconnectReason::ClientInitiated as i32;
-            room.broadcast(participant_update(vec![info]), None);
+fn depart(
+    room: &Room,
+    departed: &Participant,
+    reason: livekit::DisconnectReason,
+    except: Option<&str>,
+) {
+    let orphaned: Vec<String> = departed
+        .tracks()
+        .into_iter()
+        .map(|track| track.sid)
+        .collect();
+
+    if !orphaned.is_empty() {
+        for participant in room.participants() {
+            participant.remove_desired_subscriptions(orphaned.iter().cloned());
         }
     }
+
+    if departed.permission.hidden {
+        return;
+    }
+
+    let mut info = departed.to_proto(livekit::participant_info::State::Disconnected);
+    info.disconnect_reason = reason as i32;
+    room.broadcast(participant_update(vec![info]), except);
 }
 
 pub fn participant_update(
@@ -801,6 +829,15 @@ pub fn leave(reason: livekit::DisconnectReason) -> livekit::signal_response::Mes
         can_reconnect: false,
         reason: reason as i32,
         action: livekit::leave_request::Action::Disconnect as i32,
+        regions: None,
+    })
+}
+
+pub fn reconnect(reason: livekit::DisconnectReason) -> livekit::signal_response::Message {
+    livekit::signal_response::Message::Leave(livekit::LeaveRequest {
+        can_reconnect: true,
+        reason: reason as i32,
+        action: livekit::leave_request::Action::Reconnect as i32,
         regions: None,
     })
 }
@@ -925,6 +962,120 @@ mod tests {
             }
             other => panic!("expected a leave request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn displacing_a_session_never_tells_the_successor_it_disconnected() {
+        let registry = Registry::new(RoomDefaults::default());
+        let (first_tx, _first_rx) = signal_channel();
+        let (second_tx, mut second_rx) = signal_channel();
+
+        registry.join("demo", spec("alice"), first_tx).unwrap();
+        let second = registry.join("demo", spec("alice"), second_tx).unwrap();
+
+        while let Ok(response) = second_rx.try_recv() {
+            let Some(livekit::signal_response::Message::Update(update)) = response.message else {
+                continue;
+            };
+
+            for info in update.participants {
+                assert!(
+                    info.state != livekit::participant_info::State::Disconnected as i32
+                        || info.sid != second.participant.sid,
+                    "the new session was told that it had disconnected"
+                );
+                assert_ne!(
+                    info.disconnect_reason,
+                    livekit::DisconnectReason::DuplicateIdentity as i32,
+                    "the new session was handed the displacement notice meant for the room"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn displacing_a_session_tears_its_tracks_out_of_every_subscription() {
+        let registry = Registry::new(RoomDefaults::default());
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, mut bob_rx) = signal_channel();
+        let (again_tx, _again_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+
+        let published = alice
+            .room
+            .publish_track(&alice.participant.sid, &camera("cid-1"))
+            .expect("alice may publish");
+        bob.participant
+            .add_desired_subscriptions([published.sid.clone()]);
+        bob.participant.mark_subscription_active(&published.sid);
+        drain(&mut bob_rx);
+
+        let again = registry.join("demo", spec("alice"), again_tx).unwrap();
+        assert_ne!(again.participant.sid, alice.participant.sid);
+
+        assert!(
+            !bob.participant
+                .desired_subscriptions()
+                .contains(&published.sid),
+            "the subscription to a displaced session's track was left behind"
+        );
+        assert_eq!(
+            bob.participant.subscription_diff().to_unsubscribe,
+            vec![published.sid.clone()],
+            "bob was never asked to tear the subscription down"
+        );
+
+        let update = expect_update(&mut bob_rx);
+        assert_eq!(update.participants[0].sid, alice.participant.sid);
+        assert_eq!(
+            update.participants[0].state,
+            livekit::participant_info::State::Disconnected as i32
+        );
+        assert_eq!(
+            update.participants[0].disconnect_reason,
+            livekit::DisconnectReason::DuplicateIdentity as i32
+        );
+    }
+
+    #[test]
+    fn a_displaced_session_leaving_late_changes_nothing() {
+        let registry = Registry::new(RoomDefaults::default());
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, mut bob_rx) = signal_channel();
+        let (again_tx, _again_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let again = registry.join("demo", spec("alice"), again_tx).unwrap();
+
+        let published = again
+            .room
+            .publish_track(&again.participant.sid, &camera("cid-2"))
+            .expect("the new session may publish");
+        bob.participant
+            .add_desired_subscriptions([published.sid.clone()]);
+        drain(&mut bob_rx);
+
+        registry.leave("demo", &alice.participant.sid);
+
+        assert_eq!(
+            bob.participant.desired_subscriptions(),
+            vec![published.sid],
+            "the stale session took its successor's tracks down with it"
+        );
+        assert!(
+            bob_rx.try_recv().is_err(),
+            "a stale leave must not announce anything"
+        );
+        assert_eq!(
+            registry
+                .room("demo")
+                .expect("the room is still open")
+                .participant_count(),
+            2
+        );
     }
 
     #[test]

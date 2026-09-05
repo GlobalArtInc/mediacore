@@ -16,9 +16,11 @@ use tokio::time::Instant;
 
 use crate::peer::PublisherSession;
 use crate::state::AppState;
+use crate::subscriber::SubscriberSession;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 const PING_TIMEOUT_SECONDS: i32 = 60;
 const PING_INTERVAL_SECONDS: i32 = 15;
 
@@ -33,6 +35,20 @@ pub struct SignalQuery {
     pub version: Option<String>,
     #[serde(default)]
     pub reconnect: Option<String>,
+    #[serde(default)]
+    pub auto_subscribe: Option<String>,
+}
+
+impl SignalQuery {
+    pub fn auto_subscribe(&self) -> bool {
+        match self.auto_subscribe.as_deref() {
+            None => true,
+            Some(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+        }
+    }
 }
 
 pub async fn handler(
@@ -103,16 +119,33 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
     }
 
     let mut publisher = PublisherSession::new(&state, &sid);
+    let mut subscriber = SubscriberSession::new(query.auto_subscribe());
     let mut last_seen = Instant::now();
     let mut timeouts = tokio::time::interval(TIMEOUT_INTERVAL);
     timeouts.tick().await;
+    let mut reconciles = tokio::time::interval(RECONCILE_INTERVAL);
+    reconciles.tick().await;
+
+    subscriber.on_room_changed(&state, &joined).await;
 
     loop {
         tokio::select! {
             event = publisher.next_event() => {
                 let Some(event) = event else { break };
 
-                if !publisher.on_event(&joined, event) {
+                if !publisher.on_event(&state, &joined, event) {
+                    let _ = send(
+                        &mut sink,
+                        mediacore_room::leave(livekit::DisconnectReason::MediaFailure),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            event = subscriber.next_event() => {
+                let Some(event) = event else { break };
+
+                if !subscriber.on_event(&state, &joined, event) {
                     let _ = send(
                         &mut sink,
                         mediacore_room::leave(livekit::DisconnectReason::MediaFailure),
@@ -125,12 +158,16 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                 let Some(response) = outgoing else { break };
                 let Some(message) = response.message else { continue };
                 let closing = matches!(message, signal_response::Message::Leave(_));
+                let room_changed = matches!(message, signal_response::Message::Update(_));
 
                 if send(&mut sink, message).await.is_err() {
                     break;
                 }
                 if closing {
                     break;
+                }
+                if room_changed {
+                    subscriber.on_room_changed(&state, &joined).await;
                 }
             }
             incoming = stream.next() => {
@@ -140,7 +177,16 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     Some(Ok(Message::Binary(data))) => {
                         match livekit::SignalRequest::decode(data.as_ref()) {
                             Ok(request) => {
-                                if !handle_request(&state, &joined, &mut publisher, request).await {
+                                let alive = handle_request(
+                                    &state,
+                                    &joined,
+                                    &mut publisher,
+                                    &mut subscriber,
+                                    request,
+                                )
+                                .await;
+
+                                if !alive {
                                     break;
                                 }
                             }
@@ -160,6 +206,9 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     }
                 }
             }
+            _ = reconciles.tick() => {
+                subscriber.on_room_changed(&state, &joined).await;
+            }
             _ = timeouts.tick() => {
                 if last_seen.elapsed() >= CLIENT_TIMEOUT {
                     tracing::info!(%identity, %sid, "no signal traffic, closing the session");
@@ -174,6 +223,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
         }
     }
 
+    subscriber.close(&state, &joined);
     publisher.close(&state, &sid);
     state.registry.leave(&room_name, &sid);
     tracing::info!(room = %room_name, %identity, %sid, "participant left");
@@ -183,6 +233,7 @@ async fn handle_request(
     state: &AppState,
     joined: &Joined,
     publisher: &mut PublisherSession,
+    subscriber: &mut SubscriberSession,
     request: livekit::SignalRequest,
 ) -> bool {
     let Some(message) = request.message else {
@@ -198,12 +249,28 @@ async fn handle_request(
             publisher.on_offer(state, joined, offer).await;
             true
         }
+        signal_request::Message::Answer(answer) => {
+            subscriber.on_answer(state, joined, answer).await;
+            true
+        }
         signal_request::Message::Trickle(trickle) => {
-            publisher.on_trickle(joined, trickle).await;
+            if trickle.target == livekit::SignalTarget::Subscriber as i32 {
+                subscriber.on_trickle(joined, trickle).await;
+            } else {
+                publisher.on_trickle(joined, trickle).await;
+            }
+            true
+        }
+        signal_request::Message::Subscription(update) => {
+            subscription_request(state, joined, subscriber, update).await;
+            true
+        }
+        signal_request::Message::TrackSetting(settings) => {
+            subscriber.on_track_settings(joined, &settings);
             true
         }
         signal_request::Message::Mute(mute) => {
-            mute_request(joined, mute);
+            mute_request(state, joined, mute);
             true
         }
         signal_request::Message::PingReq(ping) => {
@@ -275,7 +342,7 @@ fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
     }
 }
 
-fn mute_request(joined: &Joined, request: livekit::MuteTrackRequest) {
+fn mute_request(state: &AppState, joined: &Joined, request: livekit::MuteTrackRequest) {
     if joined
         .room
         .set_track_muted(&joined.participant.sid, &request.sid, request.muted)
@@ -286,14 +353,52 @@ fn mute_request(joined: &Joined, request: livekit::MuteTrackRequest) {
             track = %request.sid,
             "cannot mute a track that is not published"
         );
+        return;
     }
+
+    state
+        .router
+        .set_publisher_muted(&request.sid, request.muted);
+}
+
+async fn subscription_request(
+    state: &AppState,
+    joined: &Joined,
+    subscriber: &mut SubscriberSession,
+    update: livekit::UpdateSubscription,
+) {
+    let refused = joined
+        .room
+        .update_subscriptions(&joined.participant.sid, &update);
+
+    for track_sid in refused {
+        let error = match joined.room.track(&track_sid) {
+            Some(_) => livekit::SubscriptionError::SeUnknown,
+            None => livekit::SubscriptionError::SeTrackNotfound,
+        };
+
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            track = %track_sid,
+            ?error,
+            "refusing a subscription request"
+        );
+
+        joined
+            .participant
+            .send(signal_response::Message::SubscriptionResponse(
+                livekit::SubscriptionResponse {
+                    track_sid,
+                    err: error as i32,
+                },
+            ));
+    }
+
+    subscriber.reconcile(state, joined).await;
 }
 
 fn request_name(message: &signal_request::Message) -> &'static str {
     match message {
-        signal_request::Message::Answer(_) => "answer",
-        signal_request::Message::Subscription(_) => "subscription",
-        signal_request::Message::TrackSetting(_) => "track_setting",
         signal_request::Message::SyncState(_) => "sync_state",
         signal_request::Message::UpdateMetadata(_) => "update_metadata",
         _ => "other",

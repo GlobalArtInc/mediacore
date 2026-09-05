@@ -1,8 +1,13 @@
 mod error;
+mod events;
 mod media;
+mod receiver;
 mod signal;
+mod subscriber;
+mod subscription;
 mod track;
 mod transport;
+mod udp;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -13,16 +18,21 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub use crate::error::ClientError;
+pub use crate::events::{ClientEvent, EventStream, RemoteTrack};
 pub use crate::media::{Codec, MediaProfile};
+pub use crate::receiver::{DEFAULT_PAYLOAD_WINDOW, ReceivedPacket, Span, TrackReport};
 pub use crate::signal::SignalStream;
+pub use crate::subscription::{SubscriptionRequest, TrackSettings};
 pub use crate::track::{TrackKind, TrackSpec};
 pub use crate::transport::TrackStats;
 pub use mediacore_proto::livekit as proto;
 
 use crate::signal::SignalHandle;
+use crate::subscriber::SubCommand;
 use crate::transport::Command;
 
 const COMMAND_QUEUE: usize = 64;
+const REPORT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
@@ -33,6 +43,7 @@ pub struct ClientOptions {
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
     pub event_buffer: usize,
+    pub payload_window: usize,
 }
 
 impl Default for ClientOptions {
@@ -45,6 +56,7 @@ impl Default for ClientOptions {
             connect_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(10),
             event_buffer: 256,
+            payload_window: DEFAULT_PAYLOAD_WINDOW,
         }
     }
 }
@@ -52,9 +64,11 @@ impl Default for ClientOptions {
 pub struct Client {
     signal: SignalHandle,
     commands: mpsc::Sender<Command>,
+    subscriber: mpsc::Sender<SubCommand>,
     join: livekit::JoinResponse,
     options: ClientOptions,
     local_addr: SocketAddr,
+    subscriber_addr: SocketAddr,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -77,7 +91,13 @@ impl Client {
             .map_err(|_| ClientError::Timeout("the signalling handshake"))??;
 
         let (commands, inbox) = mpsc::channel(COMMAND_QUEUE);
-        let signalling = signal::start(socket, commands.clone(), options.event_buffer);
+        let (subscriber, subscriber_inbox) = mpsc::channel(COMMAND_QUEUE);
+        let signalling = signal::start(
+            socket,
+            commands.clone(),
+            subscriber.clone(),
+            options.event_buffer,
+        );
         let mut responses = signalling.handle.subscribe();
 
         let join = responses
@@ -90,6 +110,14 @@ impl Client {
         let (local_addr, transport) =
             transport::start(options.bind, inbox, signalling.handle.clone()).await?;
 
+        let (subscriber_addr, subscriber_task) = subscriber::start(
+            options.bind,
+            options.payload_window,
+            subscriber_inbox,
+            signalling.handle.clone(),
+        )
+        .await?;
+
         let ping_interval = match join.ping_interval {
             interval if interval > 0 => Duration::from_secs(interval as u64),
             _ => Duration::from_secs(15),
@@ -99,10 +127,18 @@ impl Client {
         Ok(Self {
             signal: signalling.handle,
             commands,
+            subscriber,
             join,
             options,
             local_addr,
-            tasks: vec![signalling.reader, signalling.writer, transport, ping],
+            subscriber_addr,
+            tasks: vec![
+                signalling.reader,
+                signalling.writer,
+                transport,
+                subscriber_task,
+                ping,
+            ],
         })
     }
 
@@ -138,8 +174,20 @@ impl Client {
         self.local_addr
     }
 
+    pub fn subscriber_addr(&self) -> SocketAddr {
+        self.subscriber_addr
+    }
+
     pub fn responses(&self) -> SignalStream {
         self.signal.subscribe()
+    }
+
+    pub fn events(&self) -> EventStream {
+        self.signal.events()
+    }
+
+    pub fn remote_tracks(&self) -> Vec<RemoteTrack> {
+        self.signal.remote_tracks()
     }
 
     pub fn send(&self, message: signal_request::Message) -> Result<(), ClientError> {
@@ -185,6 +233,20 @@ impl Client {
         })
     }
 
+    pub async fn unpublish(&self, track: &PublishedTrack) -> Result<(), ClientError> {
+        let (reply, done) = oneshot::channel();
+        self.command(Command::Unpublish {
+            mid: track.mid,
+            reply,
+        })
+        .await?;
+
+        tokio::time::timeout(self.options.response_timeout, done)
+            .await
+            .map_err(|_| ClientError::Timeout("the unpublish answer"))?
+            .map_err(|_| ClientError::TransportGone)?
+    }
+
     pub async fn wait_connected(&self, timeout: Duration) -> Result<(), ClientError> {
         let (reply, connected) = oneshot::channel();
         self.command(Command::Connected(reply)).await?;
@@ -193,6 +255,85 @@ impl Client {
             .await
             .map_err(|_| ClientError::Timeout("the publisher transport to connect"))?
             .map_err(|_| ClientError::TransportGone)
+    }
+
+    pub async fn wait_subscribed(&self, timeout: Duration) -> Result<(), ClientError> {
+        let (reply, connected) = oneshot::channel();
+        self.subscriber_command(SubCommand::Connected(reply))
+            .await?;
+
+        tokio::time::timeout(timeout, connected)
+            .await
+            .map_err(|_| ClientError::Timeout("the subscriber transport to connect"))?
+            .map_err(|_| ClientError::TransportGone)
+    }
+
+    pub fn update_subscription(&self, request: &SubscriptionRequest) -> Result<(), ClientError> {
+        self.signal.send(request.to_message())
+    }
+
+    pub fn subscribe<I, S>(&self, track_sids: I) -> Result<(), ClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.update_subscription(&SubscriptionRequest::subscribe(track_sids))
+    }
+
+    pub fn unsubscribe<I, S>(&self, track_sids: I) -> Result<(), ClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.update_subscription(&SubscriptionRequest::unsubscribe(track_sids))
+    }
+
+    pub fn update_track_settings(&self, settings: &TrackSettings) -> Result<(), ClientError> {
+        self.signal.send(settings.to_message())
+    }
+
+    pub async fn received(&self) -> Result<Vec<TrackReport>, ClientError> {
+        let (reply, reports) = oneshot::channel();
+        self.subscriber_command(SubCommand::Reports(reply)).await?;
+
+        tokio::time::timeout(self.options.response_timeout, reports)
+            .await
+            .map_err(|_| ClientError::Timeout("the received track reports"))?
+            .map_err(|_| ClientError::TransportGone)
+    }
+
+    pub async fn received_track(
+        &self,
+        track_sid: &str,
+    ) -> Result<Option<TrackReport>, ClientError> {
+        Ok(self
+            .received()
+            .await?
+            .into_iter()
+            .find(|report| report.track_sid == track_sid))
+    }
+
+    pub async fn wait_for_packets(
+        &self,
+        track_sid: &str,
+        packets: u64,
+        timeout: Duration,
+    ) -> Result<TrackReport, ClientError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            if let Some(report) = self.received_track(track_sid).await?
+                && report.packets >= packets
+            {
+                return Ok(report);
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClientError::Timeout("media on a subscribed track"));
+            }
+
+            tokio::time::sleep(REPORT_POLL_INTERVAL).await;
+        }
     }
 
     pub async fn leave(mut self) -> Result<(), ClientError> {
@@ -209,12 +350,28 @@ impl Client {
             let _ = tokio::time::timeout(Duration::from_secs(1), closed).await;
         }
 
+        let (reply, closed) = oneshot::channel();
+        if self
+            .subscriber_command(SubCommand::Close(reply))
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(1), closed).await;
+        }
+
         self.stop();
         sent.and(flushed)
     }
 
     async fn command(&self, command: Command) -> Result<(), ClientError> {
         self.commands
+            .send(command)
+            .await
+            .map_err(|_| ClientError::TransportGone)
+    }
+
+    async fn subscriber_command(&self, command: SubCommand) -> Result<(), ClientError> {
+        self.subscriber
             .send(command)
             .await
             .map_err(|_| ClientError::TransportGone)

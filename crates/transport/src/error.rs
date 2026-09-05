@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 
+use str0m::media::Mid;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("binding udp socket on {addr}")]
@@ -26,6 +28,12 @@ pub enum TransportError {
     NothingToNegotiate,
     #[error("no local offer is awaiting an answer")]
     NoPendingOffer,
+    #[error("too many renegotiations are already queued")]
+    NegotiationBacklog,
+    #[error("a local offer was never answered, this session can no longer renegotiate")]
+    NegotiationFailed,
+    #[error("this session has no media with mid `{0}`")]
+    UnknownMid(Mid),
     #[error("{0} is not implemented in this milestone")]
     NotImplemented(&'static str),
     #[error("webrtc error")]

@@ -7,6 +7,7 @@ use anyhow::Context as _;
 use serde::Deserialize;
 
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
+pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -42,6 +43,7 @@ pub struct RtcConfig {
     pub use_external_ip: bool,
     pub node_ip: String,
     pub ice_disconnected_timeout: u32,
+    pub negotiation_timeout: u32,
 }
 
 impl Default for Config {
@@ -82,6 +84,7 @@ impl Default for RtcConfig {
             use_external_ip: false,
             node_ip: String::new(),
             ice_disconnected_timeout: DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS,
+            negotiation_timeout: DEFAULT_NEGOTIATION_TIMEOUT_SECONDS,
         }
     }
 }
@@ -156,6 +159,10 @@ impl RtcConfig {
 
     pub fn ice_disconnected_grace(&self) -> Duration {
         Duration::from_secs(self.ice_disconnected_timeout.into())
+    }
+
+    pub fn negotiation_grace(&self) -> Duration {
+        Duration::from_secs(self.negotiation_timeout.into())
     }
 
     pub fn advertise(&self, port: u16) -> Vec<SocketAddr> {
@@ -256,6 +263,19 @@ mod tests {
         let config =
             Config::parse("keys:\n  key1: secret1\nrtc:\n  ice_disconnected_timeout: 3\n").unwrap();
         assert_eq!(config.rtc.ice_disconnected_grace(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn the_negotiation_timeout_is_configurable() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+        assert_eq!(
+            config.rtc.negotiation_grace(),
+            Duration::from_secs(DEFAULT_NEGOTIATION_TIMEOUT_SECONDS.into())
+        );
+
+        let config =
+            Config::parse("keys:\n  key1: secret1\nrtc:\n  negotiation_timeout: 2\n").unwrap();
+        assert_eq!(config.rtc.negotiation_grace(), Duration::from_secs(2));
     }
 
     #[test]

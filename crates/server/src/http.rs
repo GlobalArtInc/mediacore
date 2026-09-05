@@ -23,13 +23,19 @@ async fn healthz(State(state): State<AppState>) -> String {
     let rooms = state.registry.rooms();
     let participants: usize = rooms.iter().map(|room| room.participant_count()).sum();
     let media = state.publishers.totals();
+    let forwarding = state.router.totals();
 
     format!(
-        "rooms={} participants={participants} publishers={} rtp_packets={} rtp_bytes={} ice={}",
+        "rooms={} participants={participants} publishers={} rtp_packets={} rtp_bytes={} \
+         tracks={} subscriptions={} forwarded_packets={} forwarded_bytes={} ice={}",
         rooms.len(),
         state.publishers.count(),
         media.rtp_packets,
         media.rtp_bytes,
+        forwarding.tracks,
+        forwarding.subscriptions,
+        forwarding.packets,
+        forwarding.bytes,
         state.media.local_addr()
     )
 }

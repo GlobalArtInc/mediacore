@@ -3,6 +3,7 @@ use std::sync::Arc;
 use mediacore_config::Config;
 use mediacore_room::{Registry, RoomDefaults};
 
+use crate::forward::MediaRouter;
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
 
@@ -12,6 +13,7 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub media: Arc<MediaEngine>,
     pub publishers: Arc<Publishers>,
+    pub router: Arc<MediaRouter>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
             registry: Arc::new(registry),
             media: Arc::new(media),
             publishers: Arc::new(Publishers::default()),
+            router: Arc::new(MediaRouter::default()),
         }
     }
 }

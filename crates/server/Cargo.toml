@@ -18,6 +18,7 @@ mediacore-auth.workspace = true
 mediacore-config.workspace = true
 mediacore-proto.workspace = true
 mediacore-room.workspace = true
+mediacore-sfu.workspace = true
 mediacore-transport.workspace = true
 
 anyhow.workspace = true
