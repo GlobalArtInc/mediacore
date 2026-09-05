@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::routing::get;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::signal::{self, SignalQuery};
 use crate::state::AppState;
@@ -12,7 +15,24 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/rtc", get(signal::handler))
         .route("/rtc/validate", get(validate))
+        .layer(cors())
         .with_state(state)
+}
+
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_headers(Any)
+        .expose_headers(Any)
+        .allow_methods([
+            Method::OPTIONS,
+            Method::HEAD,
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .max_age(Duration::from_secs(86_400))
 }
 
 async fn index() -> &'static str {

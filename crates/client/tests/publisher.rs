@@ -184,11 +184,13 @@ async fn on_request(
             send(sink, published).await;
         }
         signal_request::Message::Offer(offer) => {
+            let offer_id = offer.id;
             let offer = SdpOffer::from_sdp_string(&offer.sdp).expect("a parseable offer");
             let answer = rtc.sdp_api().accept_offer(offer).expect("an answer");
             let answer = signal_response::Message::Answer(livekit::SessionDescription {
                 r#type: "answer".to_owned(),
                 sdp: answer.to_sdp_string(),
+                id: offer_id,
                 ..livekit::SessionDescription::default()
             });
             send(sink, answer).await;

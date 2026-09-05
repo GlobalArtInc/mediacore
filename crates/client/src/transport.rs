@@ -33,7 +33,7 @@ pub(crate) enum Command {
         mid: Mid,
         reply: oneshot::Sender<Result<(), ClientError>>,
     },
-    Answer(String),
+    Answer(u32, String),
     RemoteCandidate(String),
     Start(Mid),
     Stop(Mid),
@@ -52,6 +52,7 @@ pub struct TrackStats {
 struct Pending {
     offer: SdpPendingOffer,
     awaiting: Awaiting,
+    id: u32,
 }
 
 enum Awaiting {
@@ -132,6 +133,7 @@ pub(crate) struct Transport {
     queue: VecDeque<Queued>,
     connected: bool,
     connect_waiters: Vec<oneshot::Sender<()>>,
+    next_offer_id: u32,
 }
 
 pub(crate) async fn start(
@@ -164,6 +166,7 @@ pub(crate) async fn start(
         queue: VecDeque::new(),
         connected: false,
         connect_waiters: Vec::new(),
+        next_offer_id: 0,
     };
 
     Ok((local, tokio::spawn(transport.run())))
@@ -360,7 +363,7 @@ impl Transport {
                 self.queue.push_back(Queued::Unpublish { mid, reply });
                 self.negotiate();
             }
-            Command::Answer(sdp) => self.on_answer(&sdp),
+            Command::Answer(id, sdp) => self.on_answer(id, &sdp),
             Command::RemoteCandidate(init) => self.on_remote_candidate(&init),
             Command::Start(mid) => {
                 let now = Instant::now();
@@ -452,9 +455,13 @@ impl Transport {
             return;
         };
 
+        self.next_offer_id = self.next_offer_id.wrapping_add(1);
+        let offer_id = self.next_offer_id;
+
         let request = signal_request::Message::Offer(livekit::SessionDescription {
             r#type: "offer".to_owned(),
             sdp: offer.to_sdp_string(),
+            id: offer_id,
             ..livekit::SessionDescription::default()
         });
 
@@ -468,6 +475,7 @@ impl Transport {
         self.pending = Some(Pending {
             offer: pending,
             awaiting,
+            id: offer_id,
         });
     }
 
@@ -500,11 +508,21 @@ impl Transport {
         }
     }
 
-    fn on_answer(&mut self, sdp: &str) {
+    fn on_answer(&mut self, id: u32, sdp: &str) {
         let Some(pending) = self.pending.take() else {
             tracing::debug!("an answer arrived with no offer outstanding");
             return;
         };
+
+        if pending.id != id {
+            tracing::warn!(
+                offered = pending.id,
+                answered = id,
+                "the answer does not belong to the outstanding offer, ignoring it"
+            );
+            self.pending = Some(pending);
+            return;
+        }
 
         let answer = match SdpAnswer::from_sdp_string(sdp) {
             Ok(answer) => answer,

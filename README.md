@@ -57,8 +57,13 @@ subscriber never renegotiates on codec changes; and `UpdateTrackSettings` acts o
 with size, framerate and priority logged and ignored until M4 and M5. Known gaps in M2: no simulcast
 layer selection (the client-declared layers are carried in `TrackInfo` but nothing acts on them), no
 ICE restart, no bandwidth estimation, and `rtc.use_external_ip` is accepted but not implemented.
-Known gaps in M1: session resume (`reconnect=1`) falls back to a full join, and requests outside the
-implemented subset are logged and ignored.
+Known gaps: session resume (`reconnect=1`) falls back to a full join, the `/rtc/v1` signalling path a
+recent client tries first is not implemented so the client falls back to `/rtc`, and requests outside
+the implemented subset are logged and ignored.
+
+Verified against an unmodified `livekit-client` 2.22.2 in a real browser: two participants join,
+one publishes audio and video, the other subscribes, and media arrives. Audio forwarded one packet
+for one, with nothing lost.
 
 ## Protocol profile
 

@@ -305,7 +305,7 @@ async fn dispatch(
         signal_response::Message::Answer(answer) => {
             let _ = routes
                 .publisher
-                .send(Command::Answer(answer.sdp.clone()))
+                .send(Command::Answer(answer.id, answer.sdp.clone()))
                 .await;
         }
         signal_response::Message::Offer(offer) => {

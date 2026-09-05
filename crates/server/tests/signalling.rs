@@ -189,6 +189,64 @@ async fn validate_endpoint_reports_identity() {
     assert_eq!(body, "alice");
 }
 
+async fn http_request(addr: SocketAddr, request: &str) -> String {
+    let exchange = async {
+        let mut socket = TcpStream::connect(addr).await.expect("connect");
+        socket.write_all(request.as_bytes()).await.expect("request");
+
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).await.expect("response");
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("http response did not arrive in time")
+}
+
+#[tokio::test]
+async fn a_browser_is_allowed_to_reach_the_signalling_endpoints() {
+    let addr = spawn_server().await;
+
+    let preflight = http_request(
+        addr,
+        &format!(
+            "OPTIONS /rtc/validate HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://example.test\r\n\
+Access-Control-Request-Method: GET\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await
+    .to_lowercase();
+
+    assert!(
+        preflight.starts_with("http/1.1 200"),
+        "a preflight must be answered, got: {preflight}"
+    );
+    assert!(
+        preflight.contains("access-control-allow-origin: *"),
+        "the preflight carries no allow-origin header: {preflight}"
+    );
+    assert!(
+        preflight.contains("get"),
+        "the preflight does not allow GET: {preflight}"
+    );
+
+    let validate = http_request(
+        addr,
+        &format!(
+            "GET /rtc/validate?access_token=nonsense HTTP/1.1\r\nHost: {addr}\r\n\
+Origin: http://example.test\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await
+    .to_lowercase();
+
+    assert!(
+        validate.contains("access-control-allow-origin: *"),
+        "a rejected token must still answer with cors headers, got: {validate}"
+    );
+}
+
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     let exchange = async {
         let mut socket = TcpStream::connect(addr).await.expect("connect");

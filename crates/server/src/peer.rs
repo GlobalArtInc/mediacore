@@ -71,6 +71,7 @@ impl PublisherSession {
             livekit::SessionDescription {
                 r#type: "answer".to_owned(),
                 sdp: answer,
+                id: offer.id,
                 ..Default::default()
             },
         ));
