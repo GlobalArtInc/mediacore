@@ -7,7 +7,7 @@ use mediacore_proto::livekit::{self, signal_request};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::config::DtlsCert;
 use str0m::crypto::CryptoProvider;
-use str0m::media::{Direction, MediaKind, Mid, Pt};
+use str0m::media::{Direction, MediaKind, Mid, Pt, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpWrite, SeqNo};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
@@ -26,7 +26,7 @@ pub(crate) enum Command {
         kind: MediaKind,
         stream_id: String,
         track_id: String,
-        profile: MediaProfile,
+        sources: Vec<PublishSource>,
         reply: oneshot::Sender<Result<Mid, ClientError>>,
     },
     Unpublish {
@@ -35,11 +35,17 @@ pub(crate) enum Command {
     },
     Answer(u32, String),
     RemoteCandidate(String),
-    Start(Mid),
-    Stop(Mid),
+    Start(Mid, Option<Rid>),
+    Stop(Mid, Option<Rid>),
     Connected(oneshot::Sender<()>),
-    Stats(Mid, oneshot::Sender<Option<TrackStats>>),
+    Stats(Mid, oneshot::Sender<Vec<LayerStats>>),
     Close(oneshot::Sender<()>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublishSource {
+    pub(crate) rid: Option<Rid>,
+    pub(crate) profile: MediaProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +53,20 @@ pub struct TrackStats {
     pub packets: u64,
     pub payload_bytes: u64,
     pub sending: bool,
+}
+
+impl TrackStats {
+    pub(crate) fn merge(&mut self, other: &TrackStats) {
+        self.packets += other.packets;
+        self.payload_bytes += other.payload_bytes;
+        self.sending |= other.sending;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerStats {
+    pub rid: Option<String>,
+    pub stats: TrackStats,
 }
 
 struct Pending {
@@ -58,7 +78,7 @@ struct Pending {
 enum Awaiting {
     Publish {
         mid: Mid,
-        profile: MediaProfile,
+        sources: Vec<PublishSource>,
         reply: oneshot::Sender<Result<Mid, ClientError>>,
     },
     Unpublish {
@@ -85,7 +105,7 @@ enum Queued {
         kind: MediaKind,
         stream_id: String,
         track_id: String,
-        profile: MediaProfile,
+        sources: Vec<PublishSource>,
         reply: oneshot::Sender<Result<Mid, ClientError>>,
     },
     Unpublish {
@@ -109,6 +129,7 @@ impl Queued {
 
 struct TrackSender {
     mid: Mid,
+    rid: Option<Rid>,
     pt: Pt,
     source: SyntheticSource,
     interval: Duration,
@@ -195,6 +216,25 @@ pub(crate) fn dtls_cert() -> Result<DtlsCert, ClientError> {
     CryptoProvider::get_default()
         .and_then(|provider| provider.dtls_provider.generate_certificate())
         .ok_or(ClientError::NoDtlsCertificate)
+}
+
+pub(crate) fn simulcast_of(sources: &[PublishSource]) -> Option<Simulcast> {
+    let layers: Vec<SimulcastLayer> = sources
+        .iter()
+        .filter_map(|source| source.rid)
+        .map(|rid| SimulcastLayer::new(&rid.to_string()))
+        .collect();
+
+    if layers.is_empty() {
+        return None;
+    }
+
+    let mut simulcast = Simulcast::new();
+    for layer in layers {
+        simulcast.add_send_layer(layer);
+    }
+
+    Some(simulcast)
 }
 
 pub(crate) fn negotiated_pt(rtc: &Rtc, mid: Mid, profile: MediaProfile) -> Result<Pt, ClientError> {
@@ -347,14 +387,14 @@ impl Transport {
                 kind,
                 stream_id,
                 track_id,
-                profile,
+                sources,
                 reply,
             } => {
                 self.queue.push_back(Queued::Publish {
                     kind,
                     stream_id,
                     track_id,
-                    profile,
+                    sources,
                     reply,
                 });
                 self.negotiate();
@@ -365,15 +405,15 @@ impl Transport {
             }
             Command::Answer(id, sdp) => self.on_answer(id, &sdp),
             Command::RemoteCandidate(init) => self.on_remote_candidate(&init),
-            Command::Start(mid) => {
+            Command::Start(mid, rid) => {
                 let now = Instant::now();
-                if let Some(sender) = self.sender_mut(mid) {
+                for sender in self.senders_mut(mid, rid) {
                     sender.active = true;
                     sender.next = now;
                 }
             }
-            Command::Stop(mid) => {
-                if let Some(sender) = self.sender_mut(mid) {
+            Command::Stop(mid, rid) => {
+                for sender in self.senders_mut(mid, rid) {
                     sender.active = false;
                 }
             }
@@ -388,12 +428,16 @@ impl Transport {
                 let stats = self
                     .senders
                     .iter()
-                    .find(|s| s.mid == mid)
-                    .map(|sender| TrackStats {
-                        packets: sender.packets,
-                        payload_bytes: sender.payload_bytes,
-                        sending: sender.active,
-                    });
+                    .filter(|sender| sender.mid == mid)
+                    .map(|sender| LayerStats {
+                        rid: sender.rid.map(|rid| rid.to_string()),
+                        stats: TrackStats {
+                            packets: sender.packets,
+                            payload_bytes: sender.payload_bytes,
+                            sending: sender.active,
+                        },
+                    })
+                    .collect();
                 let _ = reply.send(stats);
             }
             Command::Close(reply) => {
@@ -406,8 +450,14 @@ impl Transport {
         true
     }
 
-    fn sender_mut(&mut self, mid: Mid) -> Option<&mut TrackSender> {
-        self.senders.iter_mut().find(|sender| sender.mid == mid)
+    fn senders_mut(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> impl Iterator<Item = &mut TrackSender> {
+        self.senders
+            .iter_mut()
+            .filter(move |sender| sender.mid == mid && (rid.is_none() || sender.rid == rid))
     }
 
     fn negotiate(&mut self) {
@@ -426,7 +476,7 @@ impl Transport {
                 kind,
                 stream_id,
                 track_id,
-                profile,
+                sources,
                 reply,
             } => {
                 let mid = api.add_media(
@@ -434,12 +484,12 @@ impl Transport {
                     Direction::SendOnly,
                     Some(stream_id),
                     Some(track_id),
-                    None,
+                    simulcast_of(&sources),
                 );
 
                 Awaiting::Publish {
                     mid,
-                    profile,
+                    sources,
                     reply,
                 }
             }
@@ -544,10 +594,10 @@ impl Transport {
         match pending.awaiting {
             Awaiting::Publish {
                 mid,
-                profile,
+                sources,
                 reply,
             } => {
-                let outcome = self.add_sender(mid, profile).map(|()| mid);
+                let outcome = self.add_senders(mid, &sources).map(|()| mid);
                 let _ = reply.send(outcome);
             }
             Awaiting::Unpublish { mid, reply } => {
@@ -559,28 +609,37 @@ impl Transport {
         self.negotiate();
     }
 
-    fn add_sender(&mut self, mid: Mid, profile: MediaProfile) -> Result<(), ClientError> {
-        let pt = negotiated_pt(&self.rtc, mid, profile)?;
+    fn add_senders(&mut self, mid: Mid, sources: &[PublishSource]) -> Result<(), ClientError> {
+        for source in sources {
+            let profile = source.profile;
+            let pt = negotiated_pt(&self.rtc, mid, profile)?;
 
-        if profile.codec == Codec::Opus {
             let mut direct = self.rtc.direct_api();
-            if let Some(stream) = direct.stream_tx_by_mid(mid, None) {
+            let Some(stream) = direct.stream_tx_by_mid(mid, source.rid) else {
+                return Err(ClientError::LayerNotNegotiated {
+                    mid: mid.to_string(),
+                    rid: source.rid.map(|rid| rid.to_string()).unwrap_or_default(),
+                });
+            };
+
+            if profile.codec == Codec::Opus {
                 stream.set_unpaced(true);
             }
-        }
 
-        self.senders.push(TrackSender {
-            mid,
-            pt,
-            source: SyntheticSource::new(profile),
-            interval: profile.packet_interval,
-            next: Instant::now(),
-            seq: 0,
-            ticks: 0,
-            packets: 0,
-            payload_bytes: 0,
-            active: false,
-        });
+            self.senders.push(TrackSender {
+                mid,
+                rid: source.rid,
+                pt,
+                source: SyntheticSource::new(profile),
+                interval: profile.packet_interval,
+                next: Instant::now(),
+                seq: 0,
+                ticks: 0,
+                packets: 0,
+                payload_bytes: 0,
+                active: false,
+            });
+        }
 
         Ok(())
     }
@@ -619,8 +678,9 @@ impl Transport {
                     break;
                 }
 
-                let packet = sender.source.next();
+                let packet = sender.source.next_packet();
                 let mid = sender.mid;
+                let rid = sender.rid;
                 let pt = sender.pt;
                 let seq: SeqNo = sender.seq.into();
                 let time = sender.ticks;
@@ -638,7 +698,7 @@ impl Transport {
                 }
 
                 let mut direct = self.rtc.direct_api();
-                let Some(stream) = direct.stream_tx_by_mid(mid, None) else {
+                let Some(stream) = direct.stream_tx_by_mid(mid, rid) else {
                     tracing::debug!(%mid, "no send stream for a published track");
                     break;
                 };
@@ -772,6 +832,94 @@ mod tests {
         );
 
         assert!(ours.direct_api().stream_tx_by_mid(mid, None).is_some());
+    }
+
+    fn sources(rids: &[&str]) -> Vec<PublishSource> {
+        rids.iter()
+            .map(|rid| PublishSource {
+                rid: Some(Rid::from(*rid)),
+                profile: MediaProfile::vp8(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_track_without_layers_offers_no_simulcast() {
+        let plain = vec![PublishSource {
+            rid: None,
+            profile: MediaProfile::vp8(),
+        }];
+
+        assert!(simulcast_of(&plain).is_none());
+        assert!(simulcast_of(&[]).is_none());
+
+        let simulcast = simulcast_of(&sources(&["q", "h", "f"])).expect("a simulcast config");
+        assert_eq!(simulcast.send.len(), 3);
+        assert!(simulcast.recv.is_empty());
+        assert_eq!(simulcast.send[0].rid, Rid::from("q"));
+    }
+
+    #[test]
+    fn a_simulcast_offer_names_every_rid_the_browser_way() {
+        let mut rtc = offering_rtc(40007);
+        let sources = sources(&["q", "h", "f"]);
+
+        let mut api = rtc.sdp_api();
+        api.add_media(
+            MediaKind::Video,
+            Direction::SendOnly,
+            Some("stream".to_owned()),
+            Some("TR_cam".to_owned()),
+            simulcast_of(&sources),
+        );
+        let (offer, _pending) = api.apply().expect("an offer");
+        let sdp = offer.to_sdp_string();
+
+        assert!(sdp.contains("a=rid:q send"), "{sdp}");
+        assert!(sdp.contains("a=rid:h send"), "{sdp}");
+        assert!(sdp.contains("a=rid:f send"), "{sdp}");
+        assert!(sdp.contains("a=simulcast:send q;h;f"), "{sdp}");
+        assert!(sdp.to_lowercase().contains("rtp-stream-id"), "{sdp}");
+    }
+
+    #[test]
+    fn a_simulcast_answer_leaves_us_one_send_stream_per_rid() {
+        let mut ours = offering_rtc(40009);
+        let mut theirs = answering_rtc(40010);
+        let sources = sources(&["q", "h", "f"]);
+
+        let mut api = ours.sdp_api();
+        let mid = api.add_media(
+            MediaKind::Video,
+            Direction::SendOnly,
+            Some("stream".to_owned()),
+            Some("TR_cam".to_owned()),
+            simulcast_of(&sources),
+        );
+        let (offer, pending) = api.apply().expect("an offer");
+
+        let offer = SdpOffer::from_sdp_string(&offer.to_sdp_string()).expect("a parseable offer");
+        let answer = theirs.sdp_api().accept_offer(offer).expect("an answer");
+        let answer =
+            SdpAnswer::from_sdp_string(&answer.to_sdp_string()).expect("a parseable answer");
+        ours.sdp_api()
+            .accept_answer(pending, answer)
+            .expect("the answer applies");
+
+        let mut ssrcs = Vec::new();
+        for rid in ["q", "h", "f"] {
+            let mut direct = ours.direct_api();
+            let stream = direct
+                .stream_tx_by_mid(mid, Some(Rid::from(rid)))
+                .unwrap_or_else(|| panic!("a send stream for rid {rid}"));
+
+            assert_eq!(stream.rid(), Some(Rid::from(rid)));
+            ssrcs.push(stream.ssrc());
+        }
+
+        ssrcs.sort();
+        ssrcs.dedup();
+        assert_eq!(ssrcs.len(), 3, "every layer needs its own ssrc");
     }
 
     #[test]

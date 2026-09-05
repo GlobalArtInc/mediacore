@@ -9,8 +9,9 @@ use mediacore_transport::str0m::media::{Direction, MediaKind, Mid, Pt};
 use mediacore_transport::{MediaSpec, Negotiation, PeerEvent, PeerEvents, PeerHandle, SendStream};
 use tokio::task::JoinHandle;
 
-use crate::forward::{TrackSink, forwarder_config, stream_start};
+use crate::forward::{SinkConfig, TrackEffects, TrackSink, forwarder_config, stream_start};
 use crate::peer::{bundle_mid, candidate_from_init, candidate_init};
+use crate::simulcast::{apply_quality_update, preference_of};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ struct Subscription {
     mid: Mid,
     kind: TrackKind,
     liveness: Liveness,
+    paused: bool,
     sink: Arc<TrackSink>,
 }
 
@@ -51,6 +53,7 @@ pub struct SubscriberSession {
     task: Option<JoinHandle<()>>,
     queued_candidates: Vec<String>,
     subscriptions: HashMap<String, Subscription>,
+    settings: HashMap<String, livekit::UpdateTrackSettings>,
     tracks_by_mid: HashMap<Mid, String>,
     pending: Option<Pending>,
     auto_subscribe: bool,
@@ -68,6 +71,7 @@ impl SubscriberSession {
             task: None,
             queued_candidates: Vec::new(),
             subscriptions: HashMap::new(),
+            settings: HashMap::new(),
             tracks_by_mid: HashMap::new(),
             pending: None,
             auto_subscribe,
@@ -111,7 +115,9 @@ impl SubscriberSession {
                     kind = ?request.kind,
                     "subscriber asked for a keyframe"
                 );
-                state.router.request_keyframe(track_sid, false);
+                state
+                    .router
+                    .request_keyframe_for(track_sid, &joined.participant.sid, false);
             }
             PeerEvent::EgressReport(report) => {
                 if let Some(track_sid) = self.tracks_by_mid.get(&report.mid) {
@@ -139,7 +145,9 @@ impl SubscriberSession {
             PeerEvent::MediaAdded(_)
             | PeerEvent::MediaChanged(_)
             | PeerEvent::Rtp(_)
-            | PeerEvent::Media(_) => {}
+            | PeerEvent::Media(_)
+            | PeerEvent::IngressReport(_)
+            | PeerEvent::LayerActivity(_) => {}
             PeerEvent::Disconnected => {
                 tracing::info!(
                     identity = %joined.participant.identity,
@@ -227,24 +235,90 @@ impl SubscriberSession {
         }
     }
 
-    pub fn on_track_settings(&mut self, joined: &Joined, settings: &livekit::UpdateTrackSettings) {
+    pub async fn on_track_settings(
+        &mut self,
+        state: &AppState,
+        joined: &Joined,
+        settings: &livekit::UpdateTrackSettings,
+    ) {
         for track_sid in &settings.track_sids {
-            let Some(subscription) = self.subscriptions.get(track_sid) else {
+            if joined.room.track(track_sid).is_none() {
                 tracing::debug!(
                     identity = %joined.participant.identity,
                     track = %track_sid,
-                    "settings for a track this participant is not subscribed to"
+                    "settings for a track nobody publishes"
                 );
                 continue;
-            };
+            }
 
-            subscription.sink.set_paused(settings.disabled);
-            stream_state(
-                joined,
-                &subscription.publisher_sid,
-                track_sid,
-                settings.disabled,
+            self.settings.insert(track_sid.clone(), settings.clone());
+            self.apply_settings(state, joined, track_sid).await;
+        }
+    }
+
+    async fn apply_settings(&mut self, state: &AppState, joined: &Joined, track_sid: &str) {
+        let Some(settings) = self.settings.get(track_sid).cloned() else {
+            return;
+        };
+        let subscriber_sid = &joined.participant.sid;
+
+        let Some(subscription) = self.subscriptions.get_mut(track_sid) else {
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                track = %track_sid,
+                "holding settings for a track this participant is not subscribed to yet"
             );
+            return;
+        };
+
+        let publisher_sid = subscription.publisher_sid.clone();
+        let kind = subscription.kind;
+        let toggled = subscription.paused != settings.disabled;
+        subscription.paused = settings.disabled;
+
+        let mut effects = state
+            .router
+            .set_paused(track_sid, subscriber_sid, settings.disabled);
+
+        if kind == TrackKind::Video && !settings.disabled {
+            let preference = preference_of(&settings);
+
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                track = %track_sid,
+                %preference,
+                "subscriber asked for another layer"
+            );
+            effects.merge(
+                state
+                    .router
+                    .set_preference(track_sid, subscriber_sid, preference),
+            );
+        }
+
+        if toggled {
+            stream_state(joined, &publisher_sid, track_sid, settings.disabled);
+        }
+
+        self.flush(state, joined, track_sid, effects).await;
+    }
+
+    async fn flush(
+        &self,
+        state: &AppState,
+        joined: &Joined,
+        track_sid: &str,
+        effects: TrackEffects,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+
+        if let Some(update) = state
+            .router
+            .pending_quality_update(track_sid, Instant::now())
+        {
+            apply_quality_update(state, &joined.room, &update).await;
         }
     }
 
@@ -260,7 +334,7 @@ impl SubscriberSession {
         let diff = joined.participant.subscription_diff();
 
         for track_sid in diff.to_unsubscribe {
-            self.teardown(state, joined, &track_sid);
+            self.teardown(state, joined, &track_sid).await;
         }
 
         if self.pending.is_some() {
@@ -284,6 +358,7 @@ impl SubscriberSession {
         self.events = None;
         self.task = None;
         self.subscriptions.clear();
+        self.settings.clear();
         self.tracks_by_mid.clear();
         self.auto_subscribed.clear();
         self.pending = None;
@@ -387,6 +462,7 @@ impl SubscriberSession {
             .participant
             .remove_desired_subscriptions([track_sid.to_owned()]);
         self.auto_subscribed.remove(track_sid);
+        self.settings.remove(track_sid);
 
         let Some(subscription) = self.subscriptions.remove(track_sid) else {
             return;
@@ -456,7 +532,7 @@ impl SubscriberSession {
                 return Step::Bound;
             }
 
-            return self.resume(state, joined, track_sid);
+            return self.resume(state, joined, track_sid).await;
         }
 
         let Some(source) = state.router.source(track_sid) else {
@@ -530,21 +606,23 @@ impl SubscriberSession {
         Step::Negotiating
     }
 
-    fn resume(&mut self, state: &AppState, joined: &Joined, track_sid: &str) -> Step {
+    async fn resume(&mut self, state: &AppState, joined: &Joined, track_sid: &str) -> Step {
         let Some(subscription) = self.subscriptions.get_mut(track_sid) else {
             return Step::Waiting;
         };
 
         subscription.liveness = Liveness::Live;
+        subscription.paused = false;
         subscription.sink.set_paused(false);
 
         let sink = Arc::clone(&subscription.sink);
         let publisher_sid = subscription.publisher_sid.clone();
-        let kind = subscription.kind;
 
-        let subscribers = state.router.add_sink(sink);
+        state.router.add_sink(sink);
         joined.participant.mark_subscription_active(track_sid);
-        state.router.request_keyframe(track_sid, true);
+        state
+            .router
+            .request_keyframe_for(track_sid, &joined.participant.sid, true);
 
         tracing::info!(
             identity = %joined.participant.identity,
@@ -552,7 +630,14 @@ impl SubscriberSession {
             "resuming a subscription on the media section it already owns"
         );
 
-        self.announce(state, joined, track_sid, &publisher_sid, kind, subscribers);
+        self.announce(state, joined, track_sid, &publisher_sid);
+
+        if self.settings.contains_key(track_sid) {
+            self.apply_settings(state, joined, track_sid).await;
+        }
+
+        self.flush(state, joined, track_sid, TrackEffects::demand())
+            .await;
 
         Step::Bound
     }
@@ -620,8 +705,11 @@ impl SubscriberSession {
             handle,
             pending.mid,
             pt,
-            forwarder_config(pending.kind, clock_rate),
-            start,
+            SinkConfig {
+                forwarder: forwarder_config(pending.kind, clock_rate),
+                selector: state.selector_config(),
+                start,
+            },
         ));
 
         if let Some((_, track)) = joined.room.track(&pending.track_sid) {
@@ -636,6 +724,7 @@ impl SubscriberSession {
                 mid: pending.mid,
                 kind: pending.kind,
                 liveness: Liveness::Live,
+                paused: false,
                 sink,
             },
         );
@@ -643,7 +732,9 @@ impl SubscriberSession {
         joined
             .participant
             .mark_subscription_active(&pending.track_sid);
-        state.router.request_keyframe(&pending.track_sid, true);
+        state
+            .router
+            .request_keyframe_for(&pending.track_sid, &joined.participant.sid, true);
 
         tracing::info!(
             identity = %joined.participant.identity,
@@ -653,17 +744,24 @@ impl SubscriberSession {
             "subscription is live"
         );
 
-        self.announce(
-            state,
-            joined,
-            &pending.track_sid,
-            &pending.publisher_sid,
-            pending.kind,
+        self.announce(state, joined, &pending.track_sid, &pending.publisher_sid);
+
+        if self.settings.contains_key(&pending.track_sid) {
+            self.apply_settings(state, joined, &pending.track_sid).await;
+        }
+
+        self.flush(state, joined, &pending.track_sid, TrackEffects::demand())
+            .await;
+
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            track = %pending.track_sid,
             subscribers,
+            "the track has a new subscriber"
         );
     }
 
-    fn teardown(&mut self, state: &AppState, joined: &Joined, track_sid: &str) {
+    async fn teardown(&mut self, state: &AppState, joined: &Joined, track_sid: &str) {
         joined.participant.mark_subscription_inactive(track_sid);
 
         let Some(subscription) = self.subscriptions.get_mut(track_sid) else {
@@ -677,8 +775,6 @@ impl SubscriberSession {
         subscription.liveness = Liveness::Idle;
         subscription.sink.set_paused(true);
 
-        let publisher_sid = subscription.publisher_sid.clone();
-        let kind = subscription.kind;
         let mid = subscription.mid;
         let remaining = state.router.remove_sink(track_sid, &joined.participant.sid);
 
@@ -686,23 +782,15 @@ impl SubscriberSession {
             identity = %joined.participant.identity,
             track = %track_sid,
             %mid,
+            remaining,
             "subscription torn down"
         );
 
-        if kind == TrackKind::Video && remaining == 0 {
-            quality_update(joined, &publisher_sid, track_sid, false);
-        }
+        self.flush(state, joined, track_sid, TrackEffects::demand())
+            .await;
     }
 
-    fn announce(
-        &self,
-        state: &AppState,
-        joined: &Joined,
-        track_sid: &str,
-        publisher_sid: &str,
-        kind: TrackKind,
-        subscribers: usize,
-    ) {
+    fn announce(&self, state: &AppState, joined: &Joined, track_sid: &str, publisher_sid: &str) {
         stream_state(joined, publisher_sid, track_sid, false);
 
         if !joined.participant.permission.hidden && state.router.mark_subscribed(track_sid) {
@@ -715,10 +803,6 @@ impl SubscriberSession {
                     track_sid: track_sid.to_owned(),
                 },
             ));
-        }
-
-        if kind == TrackKind::Video && subscribers == 1 {
-            quality_update(joined, publisher_sid, track_sid, true);
         }
     }
 
@@ -845,59 +929,6 @@ fn stream_state(joined: &Joined, publisher_sid: &str, track_sid: &str, paused: b
         ));
 }
 
-#[allow(deprecated)]
-fn quality_update(joined: &Joined, publisher_sid: &str, track_sid: &str, enabled: bool) {
-    let Some(publisher) = joined.room.participant_by_sid(publisher_sid) else {
-        return;
-    };
-    let Some(track) = publisher.track(track_sid) else {
-        return;
-    };
-
-    let qualities: Vec<livekit::SubscribedQuality> = subscribed_qualities(&track.layers, enabled);
-    let codec = track
-        .mime_type
-        .as_deref()
-        .map(codec_name)
-        .unwrap_or_default();
-
-    publisher.send(signal_response::Message::SubscribedQualityUpdate(
-        livekit::SubscribedQualityUpdate {
-            track_sid: track_sid.to_owned(),
-            subscribed_qualities: qualities.clone(),
-            subscribed_codecs: vec![livekit::SubscribedCodec { codec, qualities }],
-        },
-    ));
-}
-
-fn subscribed_qualities(
-    layers: &[livekit::VideoLayer],
-    enabled: bool,
-) -> Vec<livekit::SubscribedQuality> {
-    if layers.is_empty() {
-        return vec![livekit::SubscribedQuality {
-            quality: livekit::VideoQuality::High as i32,
-            enabled,
-        }];
-    }
-
-    layers
-        .iter()
-        .map(|layer| livekit::SubscribedQuality {
-            quality: layer.quality,
-            enabled,
-        })
-        .collect()
-}
-
-fn codec_name(mime_type: &str) -> String {
-    mime_type
-        .rsplit('/')
-        .next()
-        .unwrap_or(mime_type)
-        .to_lowercase()
-}
-
 fn media_kind(kind: TrackKind) -> MediaKind {
     match kind {
         TrackKind::Audio => MediaKind::Audio,
@@ -928,6 +959,7 @@ mod tests {
     use mediacore_transport::str0m::media::Frequency;
 
     use crate::forward::TrackSource;
+    use crate::simulcast::LayerMap;
 
     const ROOM: &str = "demo";
 
@@ -1018,37 +1050,6 @@ mod tests {
         assert_eq!(payload_type(&[], "audio/opus"), None);
     }
 
-    #[test]
-    fn the_quality_update_names_the_codec_the_way_a_client_expects() {
-        assert_eq!(codec_name("video/VP8"), "vp8");
-        assert_eq!(codec_name("video/H264"), "h264");
-        assert_eq!(codec_name("opus"), "opus");
-    }
-
-    #[test]
-    fn a_track_without_declared_layers_still_reports_one_quality() {
-        let enabled = subscribed_qualities(&[], true);
-
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].quality, livekit::VideoQuality::High as i32);
-        assert!(enabled[0].enabled);
-
-        let layers = [
-            livekit::VideoLayer {
-                quality: livekit::VideoQuality::Low as i32,
-                ..Default::default()
-            },
-            livekit::VideoLayer {
-                quality: livekit::VideoQuality::High as i32,
-                ..Default::default()
-            },
-        ];
-        let disabled = subscribed_qualities(&layers, false);
-
-        assert_eq!(disabled.len(), 2);
-        assert!(disabled.iter().all(|quality| !quality.enabled));
-    }
-
     #[tokio::test]
     async fn an_unanswered_subscriber_offer_never_moves_the_track_to_another_mid() {
         let state = app_state(0).await;
@@ -1079,6 +1080,9 @@ mod tests {
                 Mid::from("0"),
                 TrackKind::Video,
                 "video/VP8",
+                &alice.participant.sid,
+                LayerMap::build(&track.layers, &[]),
+                state.source_config(track.source),
             ),
         );
 

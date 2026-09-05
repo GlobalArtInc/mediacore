@@ -23,3 +23,7 @@ rtc:
   use_external_ip: false
   node_ip: ""
   ice_disconnected_timeout: 20
+
+video:
+  dynacast_pause_delay_ms: 5000
+  layer_upgrade_hold_ms: 2000

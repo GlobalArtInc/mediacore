@@ -4,13 +4,16 @@ use str0m::media::MediaKind;
 use str0m::rtp::SeqNo;
 
 use crate::history::{DeltaHistory, SeqWindow, Slot};
-use crate::layer::{LayerDecision, LayerSelector, SpatialLayer};
+use crate::ladder::LayerLadder;
+use crate::layer::{LayerDecision, LayerLatch, LayerSet, SpatialLayer};
 use crate::packet::{
     DropReason, ForwardedPacket, Forwarding, InboundPacket, subscriber_extensions,
 };
+use crate::selector::{LayerPreference, LayerSelector, SelectorConfig};
 use crate::seq::{SeqUnwrapper, TimeUnwrapper};
 
 const DEFAULT_KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_KEYFRAME_ATTEMPTS: u32 = 20;
 const MAX_RESUME_ADVANCE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +21,7 @@ pub struct ForwarderConfig {
     pub kind: MediaKind,
     pub clock_rate: u32,
     pub keyframe_interval: Duration,
+    pub keyframe_attempts: u32,
 }
 
 impl ForwarderConfig {
@@ -26,6 +30,7 @@ impl ForwarderConfig {
             kind: MediaKind::Audio,
             clock_rate: 48_000,
             keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
+            keyframe_attempts: DEFAULT_KEYFRAME_ATTEMPTS,
         }
     }
 
@@ -34,6 +39,7 @@ impl ForwarderConfig {
             kind: MediaKind::Video,
             clock_rate: 90_000,
             keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
+            keyframe_attempts: DEFAULT_KEYFRAME_ATTEMPTS,
         }
     }
 
@@ -83,6 +89,7 @@ pub struct ForwarderStats {
     pub paused: u64,
     pub source_starts: u64,
     pub layer_switches: u64,
+    pub truncated_frames: u64,
 }
 
 #[derive(Debug)]
@@ -166,20 +173,31 @@ struct OutgoingState {
 pub struct TrackForwarder {
     config: ForwarderConfig,
     start: StreamStart,
-    layers: LayerSelector,
+    latch: LayerLatch,
+    selector: LayerSelector,
     source: Option<SourceState>,
     out: OutgoingState,
     publisher_muted: bool,
     subscriber_paused: bool,
     keyframe_needed: bool,
     keyframe_asked: Option<Instant>,
+    keyframe_attempts: u32,
     stats: ForwarderStats,
 }
 
 impl TrackForwarder {
     pub fn new(config: ForwarderConfig, start: StreamStart) -> Self {
+        Self::with_selector(config, start, SelectorConfig::default())
+    }
+
+    pub fn with_selector(
+        config: ForwarderConfig,
+        start: StreamStart,
+        selector: SelectorConfig,
+    ) -> Self {
         Self {
-            layers: LayerSelector::new(config.gated()),
+            latch: LayerLatch::new(config.gated()),
+            selector: LayerSelector::new(selector),
             config,
             start,
             source: None,
@@ -194,6 +212,7 @@ impl TrackForwarder {
             subscriber_paused: false,
             keyframe_needed: config.gated(),
             keyframe_asked: None,
+            keyframe_attempts: 0,
             stats: ForwarderStats::default(),
         }
     }
@@ -207,28 +226,99 @@ impl TrackForwarder {
     }
 
     pub fn current_layer(&self) -> Option<SpatialLayer> {
-        self.layers.current()
+        self.latch.current()
     }
 
     pub fn target_layer(&self) -> SpatialLayer {
-        self.layers.target()
+        self.latch.target()
+    }
+
+    pub fn is_switching(&self) -> bool {
+        self.latch.is_switching()
     }
 
     pub fn request_layer(&mut self, layer: SpatialLayer) -> bool {
-        if !self.layers.request(layer) {
+        if !self.latch.request(layer) {
             return false;
         }
 
-        self.keyframe_needed = self.config.gated();
+        tracing::debug!(
+            target = %layer,
+            current = ?self.latch.current(),
+            "subscriber asked for another layer"
+        );
+
+        self.keyframe_needed = self.config.gated() && self.latch.current() != Some(layer);
+        self.keyframe_asked = None;
+        self.keyframe_attempts = 0;
+
         true
+    }
+
+    pub fn selector(&self) -> &LayerSelector {
+        &self.selector
+    }
+
+    pub fn preference(&self) -> LayerPreference {
+        self.selector.preference()
+    }
+
+    pub fn set_preference(&mut self, preference: LayerPreference, now: Instant) -> bool {
+        let target = self.selector.set_preference(preference, now);
+        self.take_target(target)
+    }
+
+    pub fn set_ladder(&mut self, ladder: LayerLadder, now: Instant) -> bool {
+        let target = self.selector.set_ladder(ladder, now);
+        self.take_target(target)
+    }
+
+    pub fn observe_layers(&mut self, available: LayerSet, now: Instant) -> bool {
+        let target = self.selector.update(available, now);
+        self.take_target(target)
+    }
+
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let target = self.selector.tick(now);
+        self.take_target(target)
+    }
+
+    pub fn wanted_layer(&self) -> Option<SpatialLayer> {
+        if self.subscriber_paused {
+            return None;
+        }
+
+        self.selector.ceiling()
+    }
+
+    fn take_target(&mut self, target: Option<SpatialLayer>) -> bool {
+        match target {
+            Some(layer) => self.request_layer(layer),
+            None => false,
+        }
     }
 
     pub fn needs_keyframe(&self) -> bool {
         self.keyframe_needed
     }
 
+    pub fn keyframe_layer(&self) -> Option<SpatialLayer> {
+        self.wants_keyframe().then(|| self.latch.target())
+    }
+
+    pub fn keyframe_attempts(&self) -> u32 {
+        self.keyframe_attempts
+    }
+
+    fn wants_keyframe(&self) -> bool {
+        self.keyframe_needed
+            && !self.publisher_muted
+            && !self.subscriber_paused
+            && self.keyframe_attempts < self.config.keyframe_attempts
+    }
+
     pub fn poll_keyframe_request(&mut self, now: Instant) -> bool {
-        if !self.keyframe_needed {
+        if !self.wants_keyframe() {
             return false;
         }
 
@@ -239,6 +329,7 @@ impl TrackForwarder {
         }
 
         self.keyframe_asked = Some(now);
+        self.keyframe_attempts += 1;
         true
     }
 
@@ -283,10 +374,11 @@ impl TrackForwarder {
     }
 
     pub fn resync(&mut self) {
-        self.layers.reset();
+        self.latch.reset();
         self.source = None;
         self.keyframe_needed = self.config.gated();
         self.keyframe_asked = None;
+        self.keyframe_attempts = 0;
     }
 
     pub fn forward(&mut self, packet: &InboundPacket) -> Forwarding {
@@ -300,7 +392,11 @@ impl TrackForwarder {
             return Forwarding::Drop(DropReason::SubscriberPaused);
         }
 
-        let mut switching = match self.layers.select(packet.layer, packet.keyframe) {
+        if self.keyframe_needed {
+            self.keyframe_attempts = 0;
+        }
+
+        let mut switching = match self.latch.select(packet.layer, packet.keyframe) {
             LayerDecision::Forward => false,
             LayerDecision::Switch => true,
             LayerDecision::AwaitKeyframe => {
@@ -325,8 +421,9 @@ impl TrackForwarder {
                     ssrc = packet.ssrc,
                     "publisher restarted the stream, holding until a keyframe"
                 );
-                self.layers.reset();
+                self.latch.reset();
                 self.keyframe_needed = true;
+                self.keyframe_attempts = 0;
                 self.stats.gated += 1;
                 return Forwarding::Drop(DropReason::AwaitingKeyframe);
             }
@@ -336,10 +433,22 @@ impl TrackForwarder {
 
         if switching {
             let source = self.begin_source(packet);
-            self.source = Some(source);
+            let previous = self.source.replace(source);
             self.stats.source_starts += 1;
+
             if self.out.started {
                 self.stats.layer_switches += 1;
+
+                if !self.out.marker {
+                    self.stats.truncated_frames += 1;
+                }
+
+                tracing::debug!(
+                    layer = %packet.layer,
+                    from = previous.map(|source| source.ssrc),
+                    to = packet.ssrc,
+                    "switching the subscriber onto another source"
+                );
             }
         }
 
@@ -382,9 +491,13 @@ impl TrackForwarder {
         self.out.arrival = Some(packet.arrival);
 
         if packet.keyframe {
-            self.keyframe_needed = false;
-            self.keyframe_asked = None;
             self.stats.keyframes += 1;
+
+            if !self.latch.is_switching() {
+                self.keyframe_needed = false;
+                self.keyframe_asked = None;
+                self.keyframe_attempts = 0;
+            }
         }
 
         self.stats.forwarded += 1;
@@ -881,6 +994,254 @@ mod tests {
 
         assert!(!forwarder.request_layer(SpatialLayer::BASE));
         assert_eq!(forwarder.stats().layer_switches, 0);
+    }
+
+    #[test]
+    fn a_layer_request_asks_the_publisher_for_a_keyframe_at_once() {
+        let now = base();
+        let mut forwarder = video(13);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        assert!(!forwarder.needs_keyframe());
+        assert_eq!(forwarder.keyframe_layer(), None);
+
+        assert!(forwarder.request_layer(SpatialLayer::new(1)));
+        assert!(forwarder.needs_keyframe());
+        assert_eq!(forwarder.keyframe_layer(), Some(SpatialLayer::new(1)));
+        assert!(
+            forwarder.poll_keyframe_request(now + TICK),
+            "a switch must not wait out the keyframe interval of the previous request"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_of_the_layer_being_left_does_not_satisfy_the_switch() {
+        let now = base();
+        let mut forwarder = video(18);
+        let target = SpatialLayer::new(1);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        assert!(forwarder.request_layer(target));
+        assert!(forwarder.poll_keyframe_request(now));
+
+        let old_layer = forwarder.forward(&keyframe(PUBLISHER, 2, 1000 + STEP, now + TICK));
+        assert!(sent(&old_layer).keyframe);
+        assert!(!sent(&old_layer).switched);
+        assert!(
+            forwarder.needs_keyframe(),
+            "a keyframe of the layer being left says nothing about the target"
+        );
+        assert_eq!(forwarder.keyframe_layer(), Some(target));
+        assert!(forwarder.poll_keyframe_request(now + Duration::from_secs(1)));
+
+        let switch =
+            forwarder.forward(&keyframe(RESTARTED, 700, 50_000, now + TICK * 2).with_layer(target));
+        assert!(sent(&switch).switched);
+        assert!(!forwarder.needs_keyframe());
+    }
+
+    #[test]
+    fn going_back_to_the_layer_already_being_forwarded_needs_no_keyframe() {
+        let now = base();
+        let mut forwarder = video(14);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(SpatialLayer::new(1));
+        assert!(forwarder.needs_keyframe());
+
+        forwarder.request_layer(SpatialLayer::BASE);
+
+        assert!(!forwarder.needs_keyframe());
+        assert_eq!(forwarder.keyframe_layer(), None);
+        assert!(!forwarder.is_switching());
+        assert!(!forwarder.poll_keyframe_request(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_switch_in_the_middle_of_a_frame_is_counted() {
+        let now = base();
+        let mut forwarder = video(15);
+        let other = SpatialLayer::new(1);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(other);
+        forwarder.forward(&keyframe(RESTARTED, 500, 60_000, now + TICK).with_layer(other));
+
+        assert_eq!(forwarder.stats().truncated_frames, 1);
+        assert_eq!(forwarder.current_layer(), Some(other));
+
+        forwarder.forward(
+            &packet(RESTARTED, 501, 60_000, now + TICK * 2)
+                .with_layer(other)
+                .with_marker(true),
+        );
+        forwarder.request_layer(SpatialLayer::BASE);
+        forwarder.forward(&keyframe(PUBLISHER, 40, 5000, now + TICK * 3));
+
+        assert_eq!(
+            forwarder.stats().truncated_frames,
+            1,
+            "a switch taken on a frame boundary breaks no frame"
+        );
+        assert_eq!(forwarder.stats().layer_switches, 2);
+    }
+
+    #[test]
+    fn a_paused_subscriber_wants_no_layer_at_all() {
+        let now = base();
+        let mut forwarder = video(16);
+
+        assert_eq!(forwarder.wanted_layer(), Some(SpatialLayer::MAX));
+
+        forwarder.set_subscriber_paused(true);
+        assert_eq!(forwarder.wanted_layer(), None);
+
+        forwarder.set_subscriber_paused(false);
+        assert_eq!(forwarder.wanted_layer(), Some(SpatialLayer::MAX));
+
+        forwarder.set_preference(
+            crate::selector::LayerPreference::Quality(crate::ladder::VideoQuality::Low),
+            now,
+        );
+        assert_eq!(forwarder.wanted_layer(), Some(SpatialLayer::BASE));
+    }
+
+    #[test]
+    fn a_muted_publisher_is_never_asked_for_a_keyframe() {
+        let mut now = base();
+        let mut forwarder = video(19);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(SpatialLayer::new(1));
+        forwarder.set_publisher_muted(true);
+
+        assert_eq!(forwarder.keyframe_layer(), None);
+
+        for _ in 0..10 {
+            now += Duration::from_secs(1);
+            assert!(
+                !forwarder.poll_keyframe_request(now),
+                "a muted publisher was poked for a keyframe it cannot answer"
+            );
+        }
+
+        assert_eq!(forwarder.keyframe_attempts(), 0);
+
+        forwarder.set_publisher_muted(false);
+        assert_eq!(forwarder.keyframe_layer(), Some(SpatialLayer::new(1)));
+        assert!(forwarder.poll_keyframe_request(now));
+    }
+
+    #[test]
+    fn a_paused_subscriber_asks_for_no_keyframe() {
+        let now = base();
+        let mut forwarder = video(20);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(SpatialLayer::new(1));
+        forwarder.set_subscriber_paused(true);
+
+        assert_eq!(forwarder.keyframe_layer(), None);
+        assert!(!forwarder.poll_keyframe_request(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_publisher_that_wakes_up_is_asked_again() {
+        let mut now = base();
+        let mut forwarder = video(22);
+        let budget = forwarder.config().keyframe_attempts;
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(SpatialLayer::new(1));
+
+        for _ in 0..(budget * 2) {
+            forwarder.poll_keyframe_request(now);
+            now += Duration::from_secs(1);
+        }
+
+        assert!(
+            !forwarder.poll_keyframe_request(now),
+            "the budget for a quiet publisher is spent"
+        );
+        assert!(forwarder.needs_keyframe());
+
+        now += Duration::from_secs(1);
+        forwarder.forward(&packet(PUBLISHER, 2, 2000, now));
+
+        assert!(
+            forwarder.poll_keyframe_request(now),
+            "a subscriber that has never seen a frame must ask again once the publisher proves it is alive"
+        );
+    }
+
+    #[test]
+    fn a_publisher_that_never_answers_is_asked_a_bounded_number_of_times() {
+        let mut now = base();
+        let mut forwarder = video(21);
+        let budget = forwarder.config().keyframe_attempts;
+        let mut asked = 0;
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(SpatialLayer::new(1));
+
+        for _ in 0..(budget * 4) {
+            if forwarder.poll_keyframe_request(now) {
+                asked += 1;
+            }
+            now += Duration::from_secs(1);
+        }
+
+        assert_eq!(
+            asked, budget,
+            "a publisher that has gone quiet is asked for a keyframe for ever"
+        );
+        assert_eq!(forwarder.keyframe_layer(), None);
+        assert!(
+            forwarder.needs_keyframe(),
+            "the subscriber still needs one, it just stopped asking"
+        );
+
+        assert!(forwarder.request_layer(SpatialLayer::MAX));
+        assert!(
+            forwarder.poll_keyframe_request(now),
+            "a fresh decision starts a fresh budget"
+        );
+    }
+
+    #[test]
+    fn a_publisher_that_comes_back_starts_a_fresh_budget() {
+        let mut now = base();
+        let mut forwarder = video(22);
+        let budget = forwarder.config().keyframe_attempts;
+        let target = SpatialLayer::new(1);
+
+        forwarder.forward(&keyframe(PUBLISHER, 1, 1000, now));
+        forwarder.request_layer(target);
+
+        for _ in 0..budget {
+            forwarder.poll_keyframe_request(now);
+            now += Duration::from_secs(1);
+        }
+
+        assert!(!forwarder.poll_keyframe_request(now));
+
+        forwarder.forward(&keyframe(RESTARTED, 700, 50_000, now).with_layer(target));
+
+        assert!(!forwarder.needs_keyframe());
+        assert_eq!(forwarder.current_layer(), Some(target));
+        assert_eq!(forwarder.keyframe_attempts(), 0);
+    }
+
+    #[test]
+    fn an_audio_forwarder_never_asks_for_a_keyframe_of_a_layer() {
+        let now = base();
+        let mut forwarder = audio(17);
+
+        forwarder.forward(&packet(PUBLISHER, 1, 480, now));
+        assert!(!forwarder.request_layer(SpatialLayer::BASE));
+        assert!(forwarder.request_layer(SpatialLayer::new(1)));
+        assert!(!forwarder.needs_keyframe());
+        assert_eq!(forwarder.keyframe_layer(), None);
     }
 
     #[test]

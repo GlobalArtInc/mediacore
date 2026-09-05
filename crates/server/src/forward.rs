@@ -3,13 +3,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use mediacore_proto::livekit::{self, signal_response};
 use mediacore_room::TrackKind;
 use mediacore_sfu::{
-    DropReason, ForwardedPacket, ForwarderConfig, Forwarding, InboundPacket, StreamStart,
-    TrackForwarder, VideoCodec, is_keyframe,
+    DropReason, ForwardedPacket, ForwarderConfig, Forwarding, InboundPacket, LAYER_COUNT,
+    LayerLadder, LayerPreference, LayerSet, LayerTracker, SelectorConfig, SpatialLayer,
+    StreamStart, TrackDemand, TrackForwarder, TrackerConfig, VideoCodec, is_keyframe,
 };
-use mediacore_transport::str0m::media::{KeyframeRequestKind, Mid, Pt};
-use mediacore_transport::{IncomingRtp, OutgoingRtp, PeerHandle};
+use mediacore_transport::str0m::media::{Mid, Pt, Rid};
+use mediacore_transport::{IncomingRtp, LayerStats, OutgoingRtp, PeerHandle};
+
+use crate::simulcast::{LayerMap, QualityUpdate, keyframe_kind, quality_message};
 
 pub const PLI_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -23,6 +27,9 @@ pub struct SubscriptionSnapshot {
     pub first_sequence: Option<u64>,
     pub last_sequence: Option<u64>,
     pub paused: bool,
+    pub layer: Option<u8>,
+    pub target_layer: u8,
+    pub switches: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,13 +40,132 @@ pub struct RouterTotals {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackEffects {
+    pub layers_changed: bool,
+    pub demand_changed: bool,
+}
+
+impl TrackEffects {
+    pub fn demand() -> Self {
+        Self {
+            layers_changed: false,
+            demand_changed: true,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.layers_changed && !self.demand_changed
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.layers_changed |= other.layers_changed;
+        self.demand_changed |= other.demand_changed;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SourceConfig {
+    pub pause_delay: Duration,
+    pub tracker: TrackerConfig,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            pause_delay: Duration::from_secs(5),
+            tracker: TrackerConfig::video(),
+        }
+    }
+}
+
+pub fn tracker_config(source: livekit::TrackSource) -> TrackerConfig {
+    match source {
+        livekit::TrackSource::ScreenShare | livekit::TrackSource::ScreenShareAudio => {
+            TrackerConfig::screenshare()
+        }
+        livekit::TrackSource::Camera
+        | livekit::TrackSource::Microphone
+        | livekit::TrackSource::Unknown => TrackerConfig::video(),
+    }
+}
+
+struct Dynacast {
+    committed: Option<LayerSet>,
+    applied: Option<LayerSet>,
+    deadline: Option<Instant>,
+    pause_delay: Duration,
+}
+
+impl Dynacast {
+    fn poll(&mut self, desired: LayerSet, now: Instant) -> Option<LayerSet> {
+        if let Some(decided) = self.decide(desired, now) {
+            self.committed = Some(decided);
+            return Some(decided);
+        }
+
+        self.unannounced()
+    }
+
+    fn unannounced(&self) -> Option<LayerSet> {
+        let committed = self.committed?;
+
+        (self.applied != Some(committed)).then_some(committed)
+    }
+
+    fn decide(&mut self, desired: LayerSet, now: Instant) -> Option<LayerSet> {
+        let committed = self.committed.map(|set| set.highest());
+        let wanted = desired.highest();
+
+        match committed {
+            Some(committed) if committed == wanted => {
+                self.deadline = None;
+                None
+            }
+            Some(committed) if wanted > committed => {
+                self.deadline = None;
+                Some(desired)
+            }
+            _ if wanted.is_some() && self.committed.is_none() => {
+                self.deadline = None;
+                Some(desired)
+            }
+            _ => match self.deadline {
+                Some(deadline) if now >= deadline => {
+                    self.deadline = None;
+                    Some(desired)
+                }
+                Some(_) => None,
+                None => {
+                    self.deadline = Some(now + self.pause_delay);
+                    None
+                }
+            },
+        }
+    }
+}
+
+struct SourceState {
+    tracker: LayerTracker,
+    active: LayerSet,
+    dirty: bool,
+    ssrcs: [Option<u32>; LAYER_COUNT],
+    pli: [Option<Instant>; LAYER_COUNT],
+    demand: TrackDemand<String>,
+    dynacast: Dynacast,
+    reported: Option<Vec<livekit::VideoLayer>>,
+}
+
 pub struct TrackSource {
     peer: PeerHandle,
     mid: Mid,
     kind: TrackKind,
     codec: Option<VideoCodec>,
     mime_type: String,
-    pli: Mutex<Option<Instant>>,
+    publisher_sid: String,
+    layers: LayerMap,
+    state: Mutex<SourceState>,
+    updates: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for TrackSource {
@@ -48,12 +174,21 @@ impl std::fmt::Debug for TrackSource {
             .field("mid", &self.mid)
             .field("kind", &self.kind)
             .field("mime_type", &self.mime_type)
+            .field("layers", &self.layers.len())
             .finish()
     }
 }
 
 impl TrackSource {
-    pub fn new(peer: PeerHandle, mid: Mid, kind: TrackKind, mime_type: &str) -> Self {
+    pub fn new(
+        peer: PeerHandle,
+        mid: Mid,
+        kind: TrackKind,
+        mime_type: &str,
+        publisher_sid: &str,
+        layers: LayerMap,
+        config: SourceConfig,
+    ) -> Self {
         let codec = match kind {
             TrackKind::Audio => None,
             TrackKind::Video => match VideoCodec::from_mime(mime_type) {
@@ -75,12 +210,49 @@ impl TrackSource {
             kind,
             codec,
             mime_type: mime_type.to_owned(),
-            pli: Mutex::new(None),
+            publisher_sid: publisher_sid.to_owned(),
+            layers,
+            state: Mutex::new(SourceState {
+                tracker: LayerTracker::new(config.tracker),
+                active: LayerSet::EMPTY,
+                dirty: false,
+                ssrcs: [None; LAYER_COUNT],
+                pli: [None; LAYER_COUNT],
+                demand: TrackDemand::new(),
+                dynacast: Dynacast {
+                    committed: None,
+                    applied: None,
+                    deadline: None,
+                    pause_delay: config.pause_delay,
+                },
+                reported: None,
+            }),
+            updates: tokio::sync::Mutex::new(()),
         }
     }
 
     pub fn mime_type(&self) -> &str {
         &self.mime_type
+    }
+
+    pub fn codec_name(&self) -> String {
+        self.mime_type
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.mime_type)
+            .to_lowercase()
+    }
+
+    pub fn active_layers(&self) -> LayerSet {
+        self.state().active
+    }
+
+    pub fn ladder(&self) -> LayerLadder {
+        self.layers.ladder()
+    }
+
+    fn state(&self) -> MutexGuard<'_, SourceState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     fn is_keyframe(&self, payload: &[u8]) -> bool {
@@ -91,15 +263,191 @@ impl TrackSource {
         }
     }
 
-    fn request_keyframe(&self, force: bool) -> bool {
+    fn observe(&self, layer: SpatialLayer, ssrc: u32, payload_len: usize, now: Instant) -> bool {
+        let mut state = self.state();
+        let changes = state.tracker.observe(layer, payload_len, now);
+        let slot = layer.slot();
+
+        if state.ssrcs[slot] != Some(ssrc) {
+            state.ssrcs[slot] = Some(ssrc);
+            state.active = state.tracker.active();
+            return true;
+        }
+
+        if changes.is_empty() {
+            return false;
+        }
+
+        state.active = state.tracker.active();
+        true
+    }
+
+    fn tick(&self, now: Instant) -> bool {
+        let mut state = self.state();
+        let moved = !state.tracker.tick(now).is_empty();
+        let dirty = std::mem::take(&mut state.dirty);
+
+        if !moved && !dirty {
+            return false;
+        }
+
+        state.active = state.tracker.active();
+        true
+    }
+
+    fn set_demand(&self, subscriber_sid: &str, wanted: Option<SpatialLayer>) -> bool {
+        self.state().demand.set(subscriber_sid.to_owned(), wanted)
+    }
+
+    fn forget_demand(&self, subscriber_sid: &str) -> bool {
+        self.state().demand.remove(&subscriber_sid.to_owned())
+    }
+
+    fn reported_layers(&self) -> Option<Vec<livekit::VideoLayer>> {
+        let mut state = self.state();
+        let layers = self.layers.video_layers(state.active, &state.ssrcs);
+
+        if state.reported.as_ref() == Some(&layers) {
+            return None;
+        }
+
+        state.reported = Some(layers.clone());
+        Some(layers)
+    }
+
+    fn pending_quality_update(&self, track_sid: &str, now: Instant) -> Option<QualityUpdate> {
+        if self.kind != TrackKind::Video {
+            return None;
+        }
+
+        let mut state = self.state();
+        let desired = state.demand.enabled();
+        let enabled = state.dynacast.poll(desired, now)?;
+
+        Some(QualityUpdate {
+            track_sid: track_sid.to_owned(),
+            publisher_sid: self.publisher_sid.clone(),
+            enabled,
+        })
+    }
+
+    pub fn committed_layers(&self) -> Option<LayerSet> {
+        self.state().dynacast.committed
+    }
+
+    pub fn announced_layers(&self) -> Option<LayerSet> {
+        self.state().dynacast.applied
+    }
+
+    fn adopt_committed(&self, enabled: LayerSet) {
+        let mut state = self.state();
+        let previous = state
+            .dynacast
+            .applied
+            .replace(enabled)
+            .unwrap_or_else(|| self.layers.all());
+        let mut moved = false;
+
+        for layer in self.layers.all().iter() {
+            if enabled.contains(layer)
+                && !previous.contains(layer)
+                && !state.tracker.reset_layer(layer).is_empty()
+            {
+                moved = true;
+            }
+        }
+
+        if moved {
+            state.active = state.tracker.active();
+            state.dirty = true;
+        }
+    }
+
+    pub async fn reconcile<F>(&self, track_sid: &str, announce: F) -> bool
+    where
+        F: FnOnce(signal_response::Message, LayerSet) -> bool,
+    {
+        let _guard = self.updates.lock().await;
+
+        let Some(enabled) = self.committed_layers() else {
+            return true;
+        };
+
+        let message = quality_message(
+            track_sid,
+            &self.codec_name(),
+            self.layers.subscribed_qualities(enabled.highest()),
+        );
+
+        for (layer, rid) in self.layers.rids() {
+            if !enabled.contains(layer) {
+                self.set_layer_wanted(rid, false).await;
+            }
+        }
+
+        for rid in self.layers.surplus() {
+            self.set_layer_wanted(*rid, false).await;
+        }
+
+        let delivered = announce(message, enabled);
+
+        if delivered {
+            self.adopt_committed(enabled);
+        } else {
+            tracing::debug!(
+                track = %track_sid,
+                %enabled,
+                "the publisher was not told which layers are subscribed, trying again later"
+            );
+        }
+
+        for (layer, rid) in self.layers.rids() {
+            if enabled.contains(layer) {
+                self.set_layer_wanted(rid, true).await;
+            }
+        }
+
+        delivered
+    }
+
+    async fn set_layer_wanted(&self, rid: Rid, wanted: bool) {
+        let outcome = if wanted {
+            self.peer.resume_layer(self.mid, Some(rid)).await
+        } else {
+            self.peer.pause_layer(self.mid, Some(rid)).await
+        };
+
+        if let Err(error) = outcome {
+            tracing::debug!(
+                mid = %self.mid,
+                %rid,
+                wanted,
+                %error,
+                "cannot tell the publisher whether to send a layer"
+            );
+        }
+    }
+
+    fn request_keyframe(&self, wanted: SpatialLayer, force: bool) -> bool {
         if self.kind != TrackKind::Video {
             return false;
         }
 
         let now = Instant::now();
 
-        {
-            let mut asked = self.pli.lock().unwrap_or_else(|error| error.into_inner());
+        let layer = {
+            let mut state = self.state();
+            let Some(layer) =
+                arriving(state.active, wanted).or_else(|| arriving(started(&state.ssrcs), wanted))
+            else {
+                tracing::trace!(
+                    mid = %self.mid,
+                    layer = %wanted,
+                    "the publisher has not opened a stream to ask a keyframe on"
+                );
+                return false;
+            };
+            let asked = &mut state.pli[layer.slot()];
 
             if !force
                 && let Some(at) = *asked
@@ -109,17 +457,30 @@ impl TrackSource {
             }
 
             *asked = Some(now);
-        }
+            layer
+        };
 
-        if let Err(error) = self
-            .peer
-            .request_keyframe(self.mid, None, KeyframeRequestKind::Pli)
-        {
-            tracing::debug!(mid = %self.mid, %error, "cannot ask the publisher for a keyframe");
+        let rid = self.layers.rid_of(layer);
+
+        if let Err(error) = self.peer.request_keyframe(self.mid, rid, keyframe_kind()) {
+            tracing::debug!(
+                mid = %self.mid,
+                ?rid,
+                %error,
+                "cannot ask the publisher for a keyframe"
+            );
             return false;
         }
 
         true
+    }
+
+    pub fn missed_keyframe_requests(&self) -> u64 {
+        self.peer.missed_keyframe_requests()
+    }
+
+    pub async fn layer_stats(&self) -> Vec<LayerStats> {
+        self.peer.layers(self.mid).await.unwrap_or_default()
     }
 }
 
@@ -131,8 +492,15 @@ struct SinkState {
 
 enum SinkOutcome {
     Send(Box<ForwardedPacket>),
-    Keyframe,
+    Keyframe(SpatialLayer),
     Drop,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SinkConfig {
+    pub forwarder: ForwarderConfig,
+    pub selector: SelectorConfig,
+    pub start: StreamStart,
 }
 
 pub struct TrackSink {
@@ -161,8 +529,7 @@ impl TrackSink {
         peer: PeerHandle,
         mid: Mid,
         pt: Pt,
-        config: ForwarderConfig,
-        start: StreamStart,
+        config: SinkConfig,
     ) -> Self {
         Self {
             track_sid: track_sid.to_owned(),
@@ -171,7 +538,11 @@ impl TrackSink {
             mid,
             pt,
             state: Mutex::new(SinkState {
-                forwarder: TrackForwarder::new(config, start),
+                forwarder: TrackForwarder::with_selector(
+                    config.forwarder,
+                    config.start,
+                    config.selector,
+                ),
                 counters: SubscriptionSnapshot::default(),
             }),
         }
@@ -187,6 +558,51 @@ impl TrackSink {
         self.state().forwarder.set_publisher_muted(muted);
     }
 
+    pub fn is_publisher_muted(&self) -> bool {
+        self.state().forwarder.is_publisher_muted()
+    }
+
+    pub fn set_ladder(&self, ladder: LayerLadder, now: Instant) {
+        self.state().forwarder.set_ladder(ladder, now);
+    }
+
+    pub fn set_preference(&self, preference: LayerPreference, now: Instant) {
+        let mut state = self.state();
+        state.forwarder.set_preference(preference, now);
+        state.counters.target_layer = state.forwarder.target_layer().index();
+    }
+
+    pub fn observe_layers(&self, available: LayerSet, now: Instant) -> bool {
+        let mut state = self.state();
+        let moved = state.forwarder.observe_layers(available, now);
+        state.counters.target_layer = state.forwarder.target_layer().index();
+
+        moved
+    }
+
+    pub fn tick(&self, now: Instant) -> bool {
+        let mut state = self.state();
+        let moved = state.forwarder.tick(now);
+        state.counters.target_layer = state.forwarder.target_layer().index();
+
+        moved
+    }
+
+    pub fn wanted_layer(&self) -> Option<SpatialLayer> {
+        self.state().forwarder.wanted_layer()
+    }
+
+    fn keyframe_layer(&self, now: Instant) -> Option<SpatialLayer> {
+        let mut state = self.state();
+        let layer = state.forwarder.keyframe_layer()?;
+
+        state.forwarder.poll_keyframe_request(now).then_some(layer)
+    }
+
+    fn target_layer(&self) -> SpatialLayer {
+        self.state().forwarder.target_layer()
+    }
+
     pub fn snapshot(&self) -> SubscriptionSnapshot {
         self.state().counters
     }
@@ -200,6 +616,8 @@ impl TrackSink {
 
         match state.forwarder.forward(packet) {
             Forwarding::Send(forwarded) => {
+                let switched = forwarded.switched;
+                let current = state.forwarder.current_layer();
                 let counters = &mut state.counters;
                 counters.packets += 1;
                 counters.bytes += forwarded.payload.len() as u64;
@@ -209,18 +627,24 @@ impl TrackSink {
                 if counters.first_sequence.is_none() {
                     counters.first_sequence = Some(*forwarded.seq);
                     counters.source_sequence = Some(u64::from(packet.seq));
+                } else if switched {
+                    counters.switches += 1;
                 }
                 counters.last_sequence = Some(*forwarded.seq);
+                counters.layer = current.map(SpatialLayer::index);
 
                 SinkOutcome::Send(forwarded)
             }
             Forwarding::Drop(reason) => {
                 state.counters.dropped += 1;
 
-                if reason == DropReason::AwaitingKeyframe
-                    && state.forwarder.poll_keyframe_request(packet.arrival)
-                {
-                    return SinkOutcome::Keyframe;
+                if reason == DropReason::AwaitingKeyframe {
+                    let layer = state.forwarder.keyframe_layer();
+                    if let Some(layer) = layer
+                        && state.forwarder.poll_keyframe_request(packet.arrival)
+                    {
+                        return SinkOutcome::Keyframe(layer);
+                    }
                 }
 
                 SinkOutcome::Drop
@@ -264,6 +688,10 @@ impl TrackRoute {
     fn is_idle(&self) -> bool {
         self.source.is_none() && self.sinks.is_empty()
     }
+
+    fn sinks(&self) -> Vec<Arc<TrackSink>> {
+        self.sinks.values().cloned().collect()
+    }
 }
 
 #[derive(Default)]
@@ -276,10 +704,16 @@ pub struct MediaRouter {
 impl MediaRouter {
     pub fn register_source(&self, track_sid: &str, source: TrackSource) -> Arc<TrackSource> {
         let source = Arc::new(source);
-        self.routes()
-            .entry(track_sid.to_owned())
-            .or_default()
-            .source = Some(Arc::clone(&source));
+        let ladder = source.ladder();
+        let now = Instant::now();
+
+        let mut routes = self.routes();
+        let route = routes.entry(track_sid.to_owned()).or_default();
+        route.source = Some(Arc::clone(&source));
+
+        for sink in route.sinks.values() {
+            sink.set_ladder(ladder, now);
+        }
 
         source
     }
@@ -303,26 +737,46 @@ impl MediaRouter {
     }
 
     pub fn add_sink(&self, sink: Arc<TrackSink>) -> usize {
-        let mut routes = self.routes();
-        let route = routes.entry(sink.track_sid.clone()).or_default();
-        route
-            .sinks
-            .insert(sink.subscriber_sid.clone(), Arc::clone(&sink));
+        let (source, count) = {
+            let mut routes = self.routes();
+            let route = routes.entry(sink.track_sid.clone()).or_default();
+            route
+                .sinks
+                .insert(sink.subscriber_sid.clone(), Arc::clone(&sink));
 
-        route.sinks.len()
+            (route.source.clone(), route.sinks.len())
+        };
+
+        if let Some(source) = source {
+            let now = Instant::now();
+            sink.set_ladder(source.ladder(), now);
+            sink.observe_layers(source.active_layers(), now);
+            source.set_demand(&sink.subscriber_sid, sink.wanted_layer());
+        }
+
+        count
     }
 
     pub fn remove_sink(&self, track_sid: &str, subscriber_sid: &str) -> usize {
-        let mut routes = self.routes();
-        let Some(route) = routes.get_mut(track_sid) else {
-            return 0;
+        let (source, remaining) = {
+            let mut routes = self.routes();
+            let Some(route) = routes.get_mut(track_sid) else {
+                return 0;
+            };
+
+            route.sinks.remove(subscriber_sid);
+            let remaining = route.sinks.len();
+            let source = route.source.clone();
+
+            if route.is_idle() {
+                routes.remove(track_sid);
+            }
+
+            (source, remaining)
         };
 
-        route.sinks.remove(subscriber_sid);
-        let remaining = route.sinks.len();
-
-        if route.is_idle() {
-            routes.remove(track_sid);
+        if let Some(source) = source {
+            source.forget_demand(subscriber_sid);
         }
 
         remaining
@@ -344,7 +798,12 @@ impl MediaRouter {
         let mut routes = self.routes();
 
         routes.retain(|_, route| {
-            route.sinks.remove(subscriber_sid);
+            if route.sinks.remove(subscriber_sid).is_some()
+                && let Some(source) = &route.source
+            {
+                source.forget_demand(subscriber_sid);
+            }
+
             !route.is_idle()
         });
     }
@@ -381,70 +840,180 @@ impl MediaRouter {
     }
 
     pub fn set_publisher_muted(&self, track_sid: &str, muted: bool) {
-        let sinks = self.sinks_of(track_sid);
-
-        for sink in sinks {
+        for sink in self.sinks_of(track_sid) {
             sink.set_publisher_muted(muted);
         }
     }
 
-    pub fn request_keyframe(&self, track_sid: &str, force: bool) -> bool {
-        match self.source(track_sid) {
-            Some(source) => source.request_keyframe(force),
-            None => false,
+    pub fn set_paused(&self, track_sid: &str, subscriber_sid: &str, paused: bool) -> TrackEffects {
+        let (source, sink) = self.pair(track_sid, subscriber_sid);
+        let Some(sink) = sink else {
+            return TrackEffects::default();
+        };
+
+        sink.set_paused(paused);
+
+        let Some(source) = source else {
+            return TrackEffects::default();
+        };
+
+        TrackEffects {
+            layers_changed: false,
+            demand_changed: source.set_demand(subscriber_sid, sink.wanted_layer()),
         }
     }
 
-    pub fn forward(&self, track_sid: &str, rtp: &IncomingRtp) {
-        let (source, sinks) = {
-            let routes = self.routes();
-            let Some(route) = routes.get(track_sid) else {
-                return;
-            };
-            if route.sinks.is_empty() {
-                return;
+    pub fn set_preference(
+        &self,
+        track_sid: &str,
+        subscriber_sid: &str,
+        preference: LayerPreference,
+    ) -> TrackEffects {
+        let (source, sink) = self.pair(track_sid, subscriber_sid);
+        let (Some(source), Some(sink)) = (source, sink) else {
+            return TrackEffects::default();
+        };
+
+        let now = Instant::now();
+        sink.set_preference(preference, now);
+
+        let demand_changed = source.set_demand(subscriber_sid, sink.wanted_layer());
+        self.serve_keyframes(&source, std::slice::from_ref(&sink), now);
+
+        TrackEffects {
+            layers_changed: false,
+            demand_changed,
+        }
+    }
+
+    pub fn tick_track(&self, track_sid: &str, now: Instant) -> TrackEffects {
+        let (source, sinks) = self.route(track_sid);
+        let Some(source) = source else {
+            return TrackEffects::default();
+        };
+
+        let mut effects = TrackEffects {
+            layers_changed: source.tick(now),
+            demand_changed: false,
+        };
+
+        let active = source.active_layers();
+
+        for sink in &sinks {
+            if effects.layers_changed {
+                sink.observe_layers(active, now);
+            } else {
+                sink.tick(now);
             }
 
-            (
-                route.source.clone(),
-                route.sinks.values().cloned().collect::<Vec<_>>(),
-            )
+            effects.demand_changed |= source.set_demand(&sink.subscriber_sid, sink.wanted_layer());
+        }
+
+        self.serve_keyframes(&source, &sinks, now);
+
+        effects
+    }
+
+    pub fn live_layers(&self, track_sid: &str) -> Option<Vec<livekit::VideoLayer>> {
+        self.source(track_sid)?.reported_layers()
+    }
+
+    pub fn pending_quality_update(&self, track_sid: &str, now: Instant) -> Option<QualityUpdate> {
+        self.source(track_sid)?
+            .pending_quality_update(track_sid, now)
+    }
+
+    pub fn request_keyframe_for(&self, track_sid: &str, subscriber_sid: &str, force: bool) -> bool {
+        let (source, sink) = self.pair(track_sid, subscriber_sid);
+        let Some(source) = source else {
+            return false;
         };
+        if let Some(sink) = &sink
+            && sink.is_publisher_muted()
+        {
+            return false;
+        }
+
+        let layer = sink
+            .map(|sink| sink.target_layer())
+            .unwrap_or(SpatialLayer::BASE);
+
+        source.request_keyframe(layer, force)
+    }
+
+    pub fn forward(&self, track_sid: &str, rtp: &IncomingRtp) -> TrackEffects {
+        let (source, sinks) = self.route(track_sid);
 
         let Some(source) = source else {
-            return;
+            return TrackEffects::default();
         };
+        if sinks.is_empty() {
+            return TrackEffects::default();
+        }
 
         let header = &rtp.packet.header;
+        let Some(layer) = source.layers.layer_of(rtp.rid) else {
+            tracing::trace!(
+                track = %track_sid,
+                rid = ?rtp.rid,
+                "dropping a packet from a layer this ladder does not carry"
+            );
+            return TrackEffects::default();
+        };
+        let arrival = rtp.packet.timestamp;
+        let mut effects = TrackEffects {
+            layers_changed: source.observe(layer, *header.ssrc, rtp.packet.payload.len(), arrival),
+            demand_changed: false,
+        };
+
         let packet = InboundPacket::new(
             *header.ssrc,
             header.sequence_number,
             header.timestamp,
             Arc::clone(&rtp.packet.payload),
-            rtp.packet.timestamp,
+            arrival,
         )
+        .with_layer(layer)
         .with_marker(header.marker)
         .with_keyframe(source.is_keyframe(&rtp.packet.payload))
         .with_ext(header.ext_vals.clone());
 
-        let mut wanted_keyframe = false;
+        if effects.layers_changed {
+            let active = source.active_layers();
 
-        for sink in sinks {
+            for sink in &sinks {
+                let moved = sink.observe_layers(active, arrival);
+                effects.demand_changed |=
+                    source.set_demand(&sink.subscriber_sid, sink.wanted_layer());
+
+                if moved {
+                    self.serve_keyframes(&source, std::slice::from_ref(sink), arrival);
+                }
+            }
+        }
+
+        let mut wanted = LayerSet::EMPTY;
+
+        for sink in &sinks {
             match sink.accept(&packet) {
                 SinkOutcome::Send(forwarded) => {
                     self.packets.fetch_add(1, Ordering::Relaxed);
                     self.bytes
                         .fetch_add(forwarded.payload.len() as u64, Ordering::Relaxed);
-                    sink.write(*forwarded, packet.arrival);
+                    sink.write(*forwarded, arrival);
                 }
-                SinkOutcome::Keyframe => wanted_keyframe = true,
+                SinkOutcome::Keyframe(layer) => {
+                    wanted.insert(layer);
+                }
                 SinkOutcome::Drop => {}
             }
         }
 
-        if wanted_keyframe {
-            source.request_keyframe(false);
+        for layer in wanted.iter() {
+            source.request_keyframe(layer, false);
         }
+
+        effects
     }
 
     pub fn totals(&self) -> RouterTotals {
@@ -458,10 +1027,43 @@ impl MediaRouter {
         }
     }
 
+    fn serve_keyframes(&self, source: &TrackSource, sinks: &[Arc<TrackSink>], now: Instant) {
+        for sink in sinks {
+            if let Some(layer) = sink.keyframe_layer(now) {
+                source.request_keyframe(layer, false);
+            }
+        }
+    }
+
+    fn route(&self, track_sid: &str) -> (Option<Arc<TrackSource>>, Vec<Arc<TrackSink>>) {
+        let routes = self.routes();
+        let Some(route) = routes.get(track_sid) else {
+            return (None, Vec::new());
+        };
+
+        (route.source.clone(), route.sinks())
+    }
+
+    fn pair(
+        &self,
+        track_sid: &str,
+        subscriber_sid: &str,
+    ) -> (Option<Arc<TrackSource>>, Option<Arc<TrackSink>>) {
+        let routes = self.routes();
+        let Some(route) = routes.get(track_sid) else {
+            return (None, None);
+        };
+
+        (
+            route.source.clone(),
+            route.sinks.get(subscriber_sid).cloned(),
+        )
+    }
+
     fn sinks_of(&self, track_sid: &str) -> Vec<Arc<TrackSink>> {
         self.routes()
             .get(track_sid)
-            .map(|route| route.sinks.values().cloned().collect())
+            .map(TrackRoute::sinks)
             .unwrap_or_default()
     }
 
@@ -470,6 +1072,21 @@ impl MediaRouter {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
+}
+
+fn started(ssrcs: &[Option<u32>; LAYER_COUNT]) -> LayerSet {
+    (0..LAYER_COUNT as u8)
+        .map(SpatialLayer::new)
+        .filter(|layer| ssrcs[layer.slot()].is_some())
+        .collect()
+}
+
+fn arriving(active: LayerSet, wanted: SpatialLayer) -> Option<SpatialLayer> {
+    if active.contains(wanted) {
+        return Some(wanted);
+    }
+
+    active.highest_at_most(wanted).or_else(|| active.lowest())
 }
 
 pub fn forwarder_config(kind: TrackKind, clock_rate: u32) -> ForwarderConfig {
@@ -501,6 +1118,309 @@ pub fn stream_start(subscriber_sid: &str, track_sid: &str, nonce: u64) -> Stream
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use mediacore_config::Config;
+    use mediacore_transport::SpawnedPeer;
+
+    use crate::state::AppState;
+
+    const TRACK: &str = "TR_cam";
+    const PUBLISHER: &str = "PA_alice";
+    const SUBSCRIBER: &str = "PA_bob";
+
+    async fn app_state() -> AppState {
+        let mut config =
+            Config::parse("keys:\n  devkey: devsecretdevsecretdevsecretdevsecret\n").unwrap();
+        config.port = 0;
+        config.rtc.udp_port = 0;
+        config.rtc.port_range_start = 0;
+        config.rtc.port_range_end = 0;
+        config.rtc.bind_address = "127.0.0.1".to_owned();
+
+        AppState::start(config)
+            .await
+            .expect("the media engine starts")
+    }
+
+    fn ladder() -> LayerMap {
+        LayerMap::build(&[], &[Rid::from("q"), Rid::from("h"), Rid::from("f")])
+    }
+
+    async fn simulcast_source() -> (AppState, SpawnedPeer, Arc<TrackSource>) {
+        let state = app_state().await;
+        let peer = state
+            .media
+            .spawn_publisher()
+            .expect("a publisher transport");
+
+        let source = state.router.register_source(
+            TRACK,
+            TrackSource::new(
+                peer.handle.clone(),
+                Mid::from("0"),
+                TrackKind::Video,
+                "video/VP8",
+                PUBLISHER,
+                ladder(),
+                SourceConfig::default(),
+            ),
+        );
+
+        (state, peer, source)
+    }
+
+    async fn subscriber_sink(state: &AppState) -> (SpawnedPeer, Arc<TrackSink>) {
+        let peer = state
+            .media
+            .spawn_subscriber()
+            .expect("a subscriber transport");
+        let sink = Arc::new(TrackSink::new(
+            TRACK,
+            SUBSCRIBER,
+            peer.handle.clone(),
+            Mid::from("1"),
+            Pt::from(96),
+            SinkConfig {
+                forwarder: forwarder_config(TrackKind::Video, 90_000),
+                selector: SelectorConfig::default(),
+                start: stream_start(SUBSCRIBER, TRACK, 1),
+            },
+        ));
+
+        (peer, sink)
+    }
+
+    fn enabled_qualities(message: &signal_response::Message) -> Vec<bool> {
+        match message {
+            signal_response::Message::SubscribedQualityUpdate(update) => update
+                .subscribed_codecs
+                .first()
+                .map(|codec| {
+                    codec
+                        .qualities
+                        .iter()
+                        .map(|quality| quality.enabled)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => panic!("the publisher was not told about its qualities"),
+        }
+    }
+
+    async fn settle(source: &TrackSource) -> signal_response::Message {
+        let mut sent = None;
+
+        let delivered = source
+            .reconcile(TRACK, |message, _| {
+                sent = Some(message);
+                true
+            })
+            .await;
+
+        assert!(delivered, "the announcement was refused");
+
+        sent.expect("the publisher is always told what the server committed to")
+    }
+
+    #[tokio::test]
+    async fn a_layer_the_publisher_resumes_is_trusted_by_its_first_packet_again() {
+        let (_state, _peer, source) = simulcast_source().await;
+        let top = SpatialLayer::MAX;
+        let now = Instant::now();
+
+        source.observe(top, 7, 900, now);
+        assert!(source.active_layers().contains(top));
+
+        source.tick(now + Duration::from_secs(10));
+        assert!(
+            !source.active_layers().contains(top),
+            "the top layer must look gone before dynacast decides anything"
+        );
+
+        source.set_demand(SUBSCRIBER, Some(SpatialLayer::BASE));
+        let update = source
+            .pending_quality_update(TRACK, now)
+            .expect("the top layers are dropped");
+        assert_eq!(update.enabled, LayerSet::of(SpatialLayer::BASE));
+        settle(&source).await;
+
+        source.set_demand(SUBSCRIBER, Some(top));
+        let update = source
+            .pending_quality_update(TRACK, now)
+            .expect("the top layer is asked for again");
+        assert_eq!(update.enabled, LayerSet::all());
+        settle(&source).await;
+
+        assert!(
+            source.observe(top, 7, 900, now + Duration::from_secs(11)),
+            "the first packet of a resumed layer left the subscriber on the small picture"
+        );
+        assert!(source.active_layers().contains(top));
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_of_an_idle_publisher_can_still_ask_for_a_keyframe() {
+        let (state, _peer, source) = simulcast_source().await;
+        let now = Instant::now();
+
+        source.observe(SpatialLayer::BASE, 5, 400, now);
+        source.tick(now + Duration::from_secs(10));
+
+        assert!(
+            source.active_layers().is_empty(),
+            "the publisher must look idle for this to prove anything"
+        );
+
+        assert!(
+            state.router.request_keyframe_for(TRACK, SUBSCRIBER, false),
+            "the only thing that wakes an idle publisher was thrown away"
+        );
+        assert!(
+            !state.router.request_keyframe_for(TRACK, SUBSCRIBER, false),
+            "the rate limiter still holds between requests"
+        );
+        assert!(
+            state.router.request_keyframe_for(TRACK, SUBSCRIBER, true),
+            "a forced request goes out anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_muted_publisher_is_not_asked_for_a_keyframe() {
+        let (state, _peer, source) = simulcast_source().await;
+        let now = Instant::now();
+
+        source.observe(SpatialLayer::BASE, 5, 400, now);
+
+        let (_subscriber, sink) = subscriber_sink(&state).await;
+        state.router.add_sink(sink);
+
+        assert!(
+            state.router.request_keyframe_for(TRACK, SUBSCRIBER, true),
+            "a publisher that is sending answers a forced request"
+        );
+
+        state.router.set_publisher_muted(TRACK, true);
+
+        assert!(
+            !state.router.request_keyframe_for(TRACK, SUBSCRIBER, true),
+            "a muted publisher was poked for a keyframe it cannot answer"
+        );
+
+        state.router.set_publisher_muted(TRACK, false);
+
+        assert!(
+            state.router.request_keyframe_for(TRACK, SUBSCRIBER, true),
+            "the publisher stayed unpokeable after it came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciling_twice_leaves_the_publisher_on_the_committed_state() {
+        let (_state, _peer, source) = simulcast_source().await;
+        let now = Instant::now();
+
+        source.set_demand(SUBSCRIBER, Some(SpatialLayer::BASE));
+        let first = source
+            .pending_quality_update(TRACK, now)
+            .expect("the narrow decision");
+        assert_eq!(first.enabled, LayerSet::of(SpatialLayer::BASE));
+
+        source.set_demand("PA_carol", Some(SpatialLayer::MAX));
+        let second = source
+            .pending_quality_update(TRACK, now)
+            .expect("the wide decision");
+        assert_eq!(second.enabled, LayerSet::all());
+
+        let (narrow, wide) = tokio::join!(settle(&source), settle(&source));
+
+        assert_eq!(
+            enabled_qualities(&narrow),
+            vec![true, true, true],
+            "the announcement of the narrow decision reached the publisher after the server had \
+             already moved on, and it carried the state nobody wants any more"
+        );
+        assert_eq!(enabled_qualities(&wide), vec![true, true, true]);
+        assert_eq!(
+            source.announced_layers(),
+            source.committed_layers(),
+            "the publisher was left on a state the server had already moved off"
+        );
+        assert_eq!(source.announced_layers(), Some(LayerSet::all()));
+    }
+
+    #[tokio::test]
+    async fn a_decision_the_publisher_never_heard_is_announced_again() {
+        let (_state, _peer, source) = simulcast_source().await;
+        let now = Instant::now();
+
+        source.set_demand(SUBSCRIBER, Some(SpatialLayer::BASE));
+        let decision = source
+            .pending_quality_update(TRACK, now)
+            .expect("the first decision");
+        assert_eq!(decision.enabled, LayerSet::of(SpatialLayer::BASE));
+
+        assert!(
+            !source.reconcile(TRACK, |_, _| false).await,
+            "reconcile claimed the publisher was told"
+        );
+        assert_eq!(
+            source.announced_layers(),
+            None,
+            "an announcement that never went out must not count as applied"
+        );
+
+        let retry = source
+            .pending_quality_update(TRACK, now)
+            .expect("a decision the publisher never heard is announced again");
+        assert_eq!(retry.enabled, LayerSet::of(SpatialLayer::BASE));
+
+        settle(&source).await;
+
+        assert_eq!(
+            source.announced_layers(),
+            Some(LayerSet::of(SpatialLayer::BASE))
+        );
+        assert!(
+            source.pending_quality_update(TRACK, now).is_none(),
+            "a decision the publisher already heard is not repeated"
+        );
+    }
+
+    #[tokio::test]
+    async fn pausing_a_layer_that_is_still_arriving_does_not_declare_it_gone() {
+        let (_state, _peer, source) = simulcast_source().await;
+        let top = SpatialLayer::MAX;
+        let now = Instant::now();
+
+        source.observe(SpatialLayer::BASE, 5, 400, now);
+        source.observe(top, 7, 900, now);
+        assert!(source.active_layers().contains(top));
+
+        source.set_demand(SUBSCRIBER, Some(top));
+        source
+            .pending_quality_update(TRACK, now)
+            .expect("every layer is asked for");
+        settle(&source).await;
+        assert!(source.active_layers().contains(top));
+
+        source.set_demand(SUBSCRIBER, Some(SpatialLayer::BASE));
+        assert!(
+            source.pending_quality_update(TRACK, now).is_none(),
+            "the layer is held open for the pause delay first"
+        );
+
+        let update = source
+            .pending_quality_update(TRACK, now + Duration::from_secs(6))
+            .expect("the top layers are dropped");
+        assert_eq!(update.enabled, LayerSet::of(SpatialLayer::BASE));
+        settle(&source).await;
+
+        assert!(
+            source.active_layers().contains(top),
+            "a layer that is still arriving was declared gone by the decision to pause it"
+        );
+    }
 
     #[test]
     fn two_subscribers_of_one_track_get_different_stream_starts() {
@@ -539,8 +1459,34 @@ mod tests {
         assert_eq!(router.totals(), RouterTotals::default());
         assert_eq!(router.subscriber_count("TR_missing"), 0);
         assert!(router.source("TR_missing").is_none());
-        assert!(!router.request_keyframe("TR_missing", true));
+        assert!(!router.request_keyframe_for("TR_missing", "PA_bob", true));
         assert_eq!(router.remove_sink("TR_missing", "PA_bob"), 0);
+        assert!(router.live_layers("TR_missing").is_none());
+        assert!(
+            router
+                .pending_quality_update("TR_missing", Instant::now())
+                .is_none()
+        );
+        assert!(router.tick_track("TR_missing", Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn a_keyframe_is_never_asked_for_on_a_layer_that_is_not_arriving() {
+        let low = SpatialLayer::BASE;
+        let high = SpatialLayer::MAX;
+
+        assert_eq!(arriving(LayerSet::EMPTY, low), None);
+        assert_eq!(arriving(LayerSet::all(), high), Some(high));
+        assert_eq!(
+            arriving(LayerSet::of(low), high),
+            Some(low),
+            "a subscriber waiting for a layer nobody sends is answered by the one that is arriving"
+        );
+        assert_eq!(
+            arriving(LayerSet::of(high), low),
+            Some(high),
+            "the same overshoot the selector makes"
+        );
     }
 
     #[test]
@@ -565,5 +1511,108 @@ mod tests {
         assert!(router.mark_subscribed("TR_cam"));
         assert!(!router.mark_subscribed("TR_cam"));
         assert!(router.mark_subscribed("TR_mic"));
+    }
+
+    fn dynacast(pause_delay: Duration) -> Dynacast {
+        Dynacast {
+            committed: None,
+            applied: None,
+            deadline: None,
+            pause_delay,
+        }
+    }
+
+    #[test]
+    fn a_layer_a_subscriber_needs_is_enabled_at_once() {
+        let mut dynacast = dynacast(Duration::from_secs(5));
+        let now = Instant::now();
+
+        assert_eq!(
+            dynacast.poll(LayerSet::upto(SpatialLayer::BASE), now),
+            Some(LayerSet::of(SpatialLayer::BASE)),
+            "the first subscriber is answered without waiting"
+        );
+        dynacast.applied = dynacast.committed;
+
+        assert_eq!(
+            dynacast.poll(LayerSet::all(), now),
+            Some(LayerSet::all()),
+            "a subscriber that needs a higher layer never waits for it"
+        );
+    }
+
+    #[test]
+    fn a_layer_nobody_wants_is_held_open_for_the_pause_delay() {
+        let mut dynacast = dynacast(Duration::from_millis(200));
+        let now = Instant::now();
+
+        dynacast.committed = Some(LayerSet::all());
+        dynacast.applied = Some(LayerSet::all());
+
+        assert_eq!(dynacast.poll(LayerSet::EMPTY, now), None);
+        assert_eq!(
+            dynacast.poll(LayerSet::EMPTY, now + Duration::from_millis(100)),
+            None,
+            "the publisher is not stopped on the first quiet moment"
+        );
+        assert_eq!(
+            dynacast.poll(LayerSet::EMPTY, now + Duration::from_millis(250)),
+            Some(LayerSet::EMPTY)
+        );
+    }
+
+    #[test]
+    fn demand_that_comes_back_before_the_delay_cancels_the_pause() {
+        let mut dynacast = dynacast(Duration::from_millis(200));
+        let now = Instant::now();
+
+        dynacast.committed = Some(LayerSet::all());
+        dynacast.applied = Some(LayerSet::all());
+
+        assert_eq!(dynacast.poll(LayerSet::EMPTY, now), None);
+        assert_eq!(
+            dynacast.poll(LayerSet::all(), now + Duration::from_millis(50)),
+            None,
+            "nothing is sent, the publisher was never told to stop"
+        );
+        assert_eq!(
+            dynacast.poll(LayerSet::EMPTY, now + Duration::from_millis(250)),
+            None,
+            "the clock restarts, it is not still running from the first drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_screen_share_is_not_judged_by_camera_thresholds() {
+        assert_eq!(
+            tracker_config(livekit::TrackSource::ScreenShare),
+            TrackerConfig::screenshare(),
+            "a still screen share stops sending by design and would be declared gone"
+        );
+        assert_eq!(
+            tracker_config(livekit::TrackSource::ScreenShareAudio),
+            TrackerConfig::screenshare()
+        );
+        assert_eq!(
+            tracker_config(livekit::TrackSource::Camera),
+            TrackerConfig::video()
+        );
+        assert_eq!(
+            tracker_config(livekit::TrackSource::Unknown),
+            TrackerConfig::video()
+        );
+
+        let state = app_state().await;
+
+        assert_eq!(
+            state
+                .source_config(livekit::TrackSource::ScreenShare)
+                .tracker,
+            TrackerConfig::screenshare()
+        );
+        assert_eq!(
+            state.source_config(livekit::TrackSource::Camera).tracker,
+            TrackerConfig::video()
+        );
     }
 }

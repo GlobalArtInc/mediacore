@@ -52,6 +52,11 @@ pub enum ClientEvent {
         track_sid: String,
     },
     StreamStateChanged(Vec<livekit::StreamStateInfo>),
+    SubscribedQualityChanged {
+        track_sid: String,
+        codecs: Vec<livekit::SubscribedCodec>,
+        qualities: Vec<livekit::SubscribedQuality>,
+    },
     SubscriptionPermissionChanged {
         participant_sid: String,
         track_sid: String,

@@ -1,10 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use mediacore_config::RtcConfig;
+use mediacore_sfu::{VideoCodec, is_keyframe};
 use mediacore_transport::str0m::Candidate;
+use mediacore_transport::str0m::format::Codec;
 use mediacore_transport::{
-    PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto, TransportError, UdpRouter,
-    spawn_peer,
+    KeyframeProbe, PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto,
+    TransportError, UdpRouter, spawn_peer,
 };
 
 const ROUTE_PROBE_TARGET: &str = "192.0.2.1:9";
@@ -16,6 +18,7 @@ pub struct MediaEngine {
     candidates: Vec<String>,
     ice_disconnected_grace: std::time::Duration,
     negotiation_timeout: std::time::Duration,
+    keyframe_probe: KeyframeProbe,
 }
 
 impl MediaEngine {
@@ -59,6 +62,7 @@ impl MediaEngine {
             candidates,
             ice_disconnected_grace: config.ice_disconnected_grace(),
             negotiation_timeout: config.negotiation_grace(),
+            keyframe_probe: keyframe_probe(),
         })
     }
 
@@ -80,6 +84,11 @@ impl MediaEngine {
             PeerRole::Subscriber => PeerConfig::subscriber(),
         };
 
+        let keyframe_probe = match role {
+            PeerRole::Publisher => Some(self.keyframe_probe.clone()),
+            PeerRole::Subscriber => None,
+        };
+
         spawn_peer(
             &self.crypto,
             &self.udp,
@@ -87,6 +96,7 @@ impl MediaEngine {
                 advertise: self.advertise.clone(),
                 ice_disconnected_grace: self.ice_disconnected_grace,
                 negotiation_timeout: self.negotiation_timeout,
+                keyframe_probe,
                 ..base
             },
         )
@@ -103,6 +113,15 @@ impl MediaEngine {
     pub fn candidates(&self) -> &[String] {
         &self.candidates
     }
+}
+
+fn keyframe_probe() -> KeyframeProbe {
+    KeyframeProbe::new(|codec: Codec, payload: &[u8]| {
+        match VideoCodec::from_mime(&codec.to_string()) {
+            Ok(codec) => is_keyframe(codec, payload).unwrap_or(false),
+            Err(_) => false,
+        }
+    })
 }
 
 async fn bind_ice_socket(config: &RtcConfig, bind: IpAddr) -> anyhow::Result<UdpRouter> {

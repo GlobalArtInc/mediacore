@@ -1,13 +1,14 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use str0m::change::{SdpAnswer, SdpApi, SdpOffer, SdpPendingOffer};
-use str0m::format::PayloadParams;
+use str0m::format::{Codec, PayloadParams};
 use str0m::media::{
     Direction, KeyframeRequest, KeyframeRequestKind, MediaAdded, MediaChanged, MediaData,
-    MediaKind, Mid, Rid, Rids,
+    MediaKind, Mid, Pt, Rid,
 };
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpPacket, RtpWrite, SeqNo, Ssrc};
@@ -25,6 +26,10 @@ use crate::negotiation::{
 };
 use crate::router::{Datagram, DatagramRx, SessionId, SessionRoute, UdpRouter};
 use crate::send::{DeclaredStream, OutgoingRtp, RtxCache, SendStream};
+use crate::simulcast::{
+    IngressReport, KeyframeProbe, KeyframeTarget, LAYER_SILENCE_THRESHOLD, LayerActivity, LayerSet,
+    LayerStats, LayerTable,
+};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 64;
 pub const MEDIA_QUEUE_CAPACITY: usize = 512;
@@ -53,6 +58,8 @@ pub struct PeerConfig {
     pub ice_disconnected_grace: Duration,
     pub negotiation_timeout: Duration,
     pub negotiation_backlog: usize,
+    pub layer_silence: Duration,
+    pub keyframe_probe: Option<KeyframeProbe>,
 }
 
 impl Default for PeerConfig {
@@ -69,6 +76,8 @@ impl Default for PeerConfig {
             ice_disconnected_grace: ICE_DISCONNECTED_GRACE,
             negotiation_timeout: NEGOTIATION_TIMEOUT,
             negotiation_backlog: NEGOTIATION_BACKLOG,
+            layer_silence: LAYER_SILENCE_THRESHOLD,
+            keyframe_probe: None,
         }
     }
 }
@@ -92,7 +101,15 @@ pub struct MediaInfo {
     pub kind: MediaKind,
     pub direction: Direction,
     pub rids: Vec<Rid>,
+    pub receive_layers: LayerSet,
+    pub send_layers: LayerSet,
     pub params: Vec<PayloadParams>,
+}
+
+impl MediaInfo {
+    pub fn is_simulcast(&self) -> bool {
+        self.rids.len() > 1
+    }
 }
 
 #[derive(Debug)]
@@ -159,6 +176,8 @@ pub enum PeerEvent {
     Media(Box<MediaData>),
     KeyframeRequested(KeyframeRequest),
     EgressReport(EgressReport),
+    IngressReport(IngressReport),
+    LayerActivity(LayerActivity),
     Disconnected,
 }
 
@@ -182,8 +201,18 @@ enum PeerCommand {
     },
     RequestKeyframe {
         mid: Mid,
-        rid: Option<Rid>,
+        target: KeyframeTarget,
         kind: KeyframeRequestKind,
+    },
+    SetLayerWanted {
+        mid: Mid,
+        rid: Option<Rid>,
+        wanted: bool,
+        reply: oneshot::Sender<Result<bool, TransportError>>,
+    },
+    LayerQuery {
+        mid: Mid,
+        reply: oneshot::Sender<Vec<LayerStats>>,
     },
     DeclareSendStream {
         stream: Box<SendStream>,
@@ -209,6 +238,7 @@ pub struct PeerHandle {
     dropped_media: Arc<AtomicU64>,
     dropped_writes: Arc<AtomicU64>,
     unroutable_writes: Arc<AtomicU64>,
+    missed_keyframes: Arc<AtomicU64>,
     tx: mpsc::Sender<PeerCommand>,
     rtp: mpsc::Sender<Box<OutgoingRtp>>,
 }
@@ -241,6 +271,10 @@ impl PeerHandle {
         self.unroutable_writes.load(Ordering::Relaxed)
     }
 
+    pub fn missed_keyframe_requests(&self) -> u64 {
+        self.missed_keyframes.load(Ordering::Relaxed)
+    }
+
     pub async fn accept_offer(&self, sdp: String) -> Result<String, TransportError> {
         self.request(|reply| PeerCommand::AcceptOffer { sdp, reply })
             .await?
@@ -270,7 +304,63 @@ impl PeerHandle {
         rid: Option<Rid>,
         kind: KeyframeRequestKind,
     ) -> Result<(), TransportError> {
-        self.notify(PeerCommand::RequestKeyframe { mid, rid, kind })
+        self.notify(PeerCommand::RequestKeyframe {
+            mid,
+            target: KeyframeTarget::Layer(rid),
+            kind,
+        })
+    }
+
+    pub fn request_keyframe_on_every_layer(
+        &self,
+        mid: Mid,
+        kind: KeyframeRequestKind,
+    ) -> Result<(), TransportError> {
+        self.notify(PeerCommand::RequestKeyframe {
+            mid,
+            target: KeyframeTarget::EveryLayer,
+            kind,
+        })
+    }
+
+    pub async fn set_layer_wanted(
+        &self,
+        mid: Mid,
+        rid: Option<Rid>,
+        wanted: bool,
+    ) -> Result<bool, TransportError> {
+        self.request(|reply| PeerCommand::SetLayerWanted {
+            mid,
+            rid,
+            wanted,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn pause_layer(&self, mid: Mid, rid: Option<Rid>) -> Result<bool, TransportError> {
+        self.set_layer_wanted(mid, rid, false).await
+    }
+
+    pub async fn resume_layer(&self, mid: Mid, rid: Option<Rid>) -> Result<bool, TransportError> {
+        self.set_layer_wanted(mid, rid, true).await
+    }
+
+    pub async fn layers(&self, mid: Mid) -> Result<Vec<LayerStats>, TransportError> {
+        self.request(|reply| PeerCommand::LayerQuery { mid, reply })
+            .await
+    }
+
+    pub async fn layer(
+        &self,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> Result<Option<LayerStats>, TransportError> {
+        Ok(self
+            .layers(mid)
+            .await?
+            .into_iter()
+            .find(|layer| layer.rid == rid))
     }
 
     pub async fn declare_send_stream(
@@ -436,6 +526,7 @@ fn build_peer(
     let dropped_media = Arc::new(AtomicU64::new(0));
     let dropped_writes = Arc::new(AtomicU64::new(0));
     let unroutable_writes = Arc::new(AtomicU64::new(0));
+    let missed_keyframes = Arc::new(AtomicU64::new(0));
 
     let handle = PeerHandle {
         id: route.id(),
@@ -444,6 +535,7 @@ fn build_peer(
         dropped_media: Arc::clone(&dropped_media),
         dropped_writes,
         unroutable_writes: Arc::clone(&unroutable_writes),
+        missed_keyframes: Arc::clone(&missed_keyframes),
         tx,
         rtp: rtp_tx,
     };
@@ -467,6 +559,11 @@ fn build_peer(
         creds,
         ice: IceWatch::new(config.ice_disconnected_grace),
         renegotiation: Renegotiation::new(config.negotiation_timeout, config.negotiation_backlog),
+        layers: LayerTable::default(),
+        codecs: HashMap::new(),
+        probe: config.keyframe_probe.clone(),
+        layer_silence: config.layer_silence,
+        missed_keyframes,
         drain_deadline: None,
         commands_closed: false,
         writes_closed: false,
@@ -620,6 +717,11 @@ struct PeerActor {
     creds: Arc<RwLock<IceCreds>>,
     ice: IceWatch,
     renegotiation: Renegotiation,
+    layers: LayerTable,
+    codecs: HashMap<Pt, Codec>,
+    probe: Option<KeyframeProbe>,
+    layer_silence: Duration,
+    missed_keyframes: Arc<AtomicU64>,
     drain_deadline: Option<Instant>,
     commands_closed: bool,
     writes_closed: bool,
@@ -775,8 +877,19 @@ impl PeerActor {
             PeerCommand::AddRemoteCandidate { candidate, reply } => {
                 let _ = reply.send(self.add_remote_candidate(&candidate));
             }
-            PeerCommand::RequestKeyframe { mid, rid, kind } => {
-                self.request_keyframe(mid, rid, kind);
+            PeerCommand::RequestKeyframe { mid, target, kind } => {
+                self.request_keyframe(mid, target, kind);
+            }
+            PeerCommand::SetLayerWanted {
+                mid,
+                rid,
+                wanted,
+                reply,
+            } => {
+                let _ = reply.send(self.set_layer_wanted(mid, rid, wanted));
+            }
+            PeerCommand::LayerQuery { mid, reply } => {
+                let _ = reply.send(self.layers.snapshot(mid));
             }
             PeerCommand::DeclareSendStream { stream, reply } => {
                 let _ = reply.send(self.declare_send_stream(*stream));
@@ -971,19 +1084,42 @@ impl PeerActor {
 
     fn media_by_mid(&self, mid: Mid) -> Option<MediaInfo> {
         let media = self.rtc.media(mid)?;
+        let direction = media.direction();
 
-        let rids = match media.rids_tx() {
-            Rids::Specific(rids) => rids.clone(),
-            _ => Vec::new(),
+        Some(self.media_layers(mid, media.kind(), direction))
+    }
+
+    fn media_layers(&self, mid: Mid, kind: MediaKind, direction: Direction) -> MediaInfo {
+        let (receive_layers, send_layers) = match self.rtc.media(mid) {
+            Some(media) => (
+                LayerSet::from(media.rids_rx()),
+                LayerSet::from(media.rids_tx()),
+            ),
+            None => (LayerSet::None, LayerSet::None),
         };
 
-        Some(MediaInfo {
+        let carried = if direction.is_receiving() {
+            &receive_layers
+        } else {
+            &send_layers
+        };
+
+        MediaInfo {
             mid,
-            kind: media.kind(),
-            direction: media.direction(),
-            rids,
+            kind,
+            direction,
+            rids: carried.rids().to_vec(),
+            receive_layers,
+            send_layers,
             params: self.negotiated_params(mid),
-        })
+        }
+    }
+
+    fn receive_layers(&self, mid: Mid) -> LayerSet {
+        self.rtc
+            .media(mid)
+            .map(|media| LayerSet::from(media.rids_rx()))
+            .unwrap_or_default()
     }
 
     fn negotiated_params(&self, mid: Mid) -> Vec<PayloadParams> {
@@ -1050,10 +1186,167 @@ impl PeerActor {
         Ok(())
     }
 
-    fn request_keyframe(&mut self, mid: Mid, rid: Option<Rid>, kind: KeyframeRequestKind) {
-        match self.rtc.direct_api().stream_rx_by_mid(mid, rid) {
-            Some(stream) => stream.request_keyframe(kind),
-            None => tracing::debug!(%mid, ?rid, "no receive stream to request a keyframe on"),
+    fn resolve_layer(&self, mid: Mid, rid: Option<Rid>) -> Result<Option<Rid>, TransportError> {
+        if self.rtc.media(mid).is_none() {
+            return Err(TransportError::UnknownMid(mid));
+        }
+
+        let negotiated = self.receive_layers(mid);
+
+        match rid {
+            Some(rid) if negotiated.is_specific() && !negotiated.contains(rid) => {
+                Err(TransportError::UnknownLayer { mid, rid })
+            }
+            Some(rid) => Ok(Some(rid)),
+            None => match negotiated.rids() {
+                [] => Ok(None),
+                [only] => Ok(Some(*only)),
+                _ => Err(TransportError::AmbiguousLayer(mid)),
+            },
+        }
+    }
+
+    fn keyframe_layers(
+        &self,
+        mid: Mid,
+        target: KeyframeTarget,
+    ) -> Result<Vec<Option<Rid>>, TransportError> {
+        match target {
+            KeyframeTarget::Layer(rid) => Ok(vec![self.resolve_layer(mid, rid)?]),
+            KeyframeTarget::EveryLayer => {
+                if self.rtc.media(mid).is_none() {
+                    return Err(TransportError::UnknownMid(mid));
+                }
+
+                match self.receive_layers(mid).rids() {
+                    [] => Ok(vec![None]),
+                    rids => Ok(rids.iter().copied().map(Some).collect()),
+                }
+            }
+        }
+    }
+
+    fn request_keyframe(&mut self, mid: Mid, target: KeyframeTarget, kind: KeyframeRequestKind) {
+        let layers = match self.keyframe_layers(mid, target) {
+            Ok(layers) => layers,
+            Err(error) => {
+                self.missed_keyframes.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%mid, ?target, %error, "refusing an unaimed keyframe request");
+                return;
+            }
+        };
+
+        for rid in layers {
+            self.request_keyframe_on(mid, rid, kind);
+        }
+    }
+
+    fn request_keyframe_on(&mut self, mid: Mid, rid: Option<Rid>, kind: KeyframeRequestKind) {
+        if !self.layers.wanted(mid, rid) {
+            tracing::debug!(%mid, ?rid, "not asking a layer we paused for a keyframe");
+            return;
+        }
+
+        let asked = match self.rtc.direct_api().stream_rx_by_mid(mid, rid) {
+            Some(stream) if rid.is_none() || stream.rid() == rid => {
+                stream.request_keyframe(kind);
+                true
+            }
+            _ => false,
+        };
+
+        if !asked {
+            self.missed_keyframes.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%mid, ?rid, "no receive stream to request a keyframe on");
+            return;
+        }
+
+        self.layers.note_keyframe_request(mid, rid, kind);
+    }
+
+    fn set_layer_wanted(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        wanted: bool,
+    ) -> Result<bool, TransportError> {
+        let rid = self.resolve_layer(mid, rid)?;
+        let changed = self.layers.set_wanted(mid, rid, wanted);
+
+        self.configure_layer(mid, rid);
+
+        if changed {
+            tracing::info!(%mid, ?rid, wanted, "layer demand changed");
+        }
+
+        if wanted && changed {
+            self.request_keyframe_on(mid, rid, KeyframeRequestKind::Pli);
+        }
+
+        Ok(changed)
+    }
+
+    fn configure_layer(&mut self, mid: Mid, rid: Option<Rid>) {
+        let suppress = !self.layers.wanted(mid, rid);
+        let silence = self.layer_silence;
+
+        let applied = match self.rtc.direct_api().stream_rx_by_mid(mid, rid) {
+            Some(stream) if rid.is_none() || stream.rid() == rid => {
+                stream.set_pause_threshold(silence);
+                stream.suppress_nack(suppress);
+                true
+            }
+            _ => false,
+        };
+
+        if applied {
+            self.layers.note_nack_suppressed(mid, rid, suppress);
+        }
+    }
+
+    fn codec_for(&mut self, pt: Pt) -> Option<Codec> {
+        if let Some(codec) = self.codecs.get(&pt) {
+            return Some(*codec);
+        }
+
+        let codec = self
+            .rtc
+            .codec_config()
+            .params()
+            .iter()
+            .find(|params| params.pt() == pt)
+            .map(|params| params.spec().codec)?;
+
+        self.codecs.insert(pt, codec);
+
+        Some(codec)
+    }
+
+    fn carries_keyframe(&mut self, packet: &RtpPacket) -> bool {
+        if self.probe.is_none() {
+            return false;
+        }
+
+        let Some(codec) = self.codec_for(packet.header.payload_type) else {
+            return false;
+        };
+
+        self.probe
+            .as_ref()
+            .is_some_and(|probe| probe.probe(codec, &packet.payload))
+    }
+
+    fn note_intake(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc, packet: &RtpPacket) {
+        let keyframe = self.carries_keyframe(packet);
+        let bytes = packet.payload.len() as u64;
+
+        let fresh = self
+            .layers
+            .observe(mid, rid, ssrc, bytes, keyframe, packet.timestamp);
+
+        if fresh {
+            tracing::debug!(%mid, ?rid, ?ssrc, "a layer started arriving");
+            self.configure_layer(mid, rid);
         }
     }
 
@@ -1099,10 +1392,16 @@ impl PeerActor {
                 let info = self.media_info(added);
                 self.sink.emit_control(PeerEvent::MediaAdded(info))
             }
-            Event::MediaChanged(changed) => match self.media_changed(changed) {
-                Some(info) => self.sink.emit_control(PeerEvent::MediaChanged(info)),
-                None => true,
-            },
+            Event::MediaChanged(changed) => {
+                if changed.direction == Direction::Inactive {
+                    self.layers.forget(changed.mid);
+                }
+
+                match self.media_changed(changed) {
+                    Some(info) => self.sink.emit_control(PeerEvent::MediaChanged(info)),
+                    None => true,
+                }
+            }
             Event::RtpPacket(packet) => {
                 let ssrc = packet.header.ssrc;
                 let carried_mid_extension = packet.header.ext_vals.mid.is_some();
@@ -1111,6 +1410,8 @@ impl PeerActor {
                     tracing::trace!(?ssrc, "rtp packet on an unmapped stream");
                     return true;
                 };
+
+                self.note_intake(mid, rid, ssrc, &packet);
 
                 let incoming = IncomingRtp {
                     mid,
@@ -1128,9 +1429,30 @@ impl PeerActor {
             Event::MediaEgressStats(stats) => self
                 .sink
                 .emit_control(PeerEvent::EgressReport(stats.into())),
+            Event::MediaIngressStats(stats) => {
+                let report = IngressReport::from(stats);
+                self.layers.merge_ingress(&report);
+                self.sink.emit_control(PeerEvent::IngressReport(report))
+            }
             Event::StreamPaused(paused) => {
-                tracing::debug!(ssrc = ?paused.ssrc, paused = paused.paused, "stream pause changed");
-                true
+                let activity = LayerActivity {
+                    mid: paused.mid,
+                    rid: paused.rid,
+                    ssrc: paused.ssrc,
+                    active: !paused.paused,
+                };
+
+                self.layers.note_activity(activity, Instant::now());
+
+                tracing::debug!(
+                    mid = %activity.mid,
+                    rid = ?activity.rid,
+                    ssrc = ?activity.ssrc,
+                    active = activity.active,
+                    "layer activity changed"
+                );
+
+                self.sink.emit_control(PeerEvent::LayerActivity(activity))
             }
             Event::Closed => {
                 self.rtc.disconnect();
@@ -1160,19 +1482,7 @@ impl PeerActor {
     }
 
     fn media_info(&self, added: MediaAdded) -> MediaInfo {
-        let rids = added
-            .simulcast
-            .as_ref()
-            .map(|simulcast| simulcast.send.iter().map(|layer| layer.rid).collect())
-            .unwrap_or_default();
-
-        MediaInfo {
-            mid: added.mid,
-            kind: added.kind,
-            direction: added.direction,
-            rids,
-            params: self.negotiated_params(added.mid),
-        }
+        self.media_layers(added.mid, added.kind, added.direction)
     }
 }
 

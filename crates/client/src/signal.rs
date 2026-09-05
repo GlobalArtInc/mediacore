@@ -348,6 +348,14 @@ async fn dispatch(
                 update.stream_states.clone(),
             ));
         }
+        signal_response::Message::SubscribedQualityUpdate(update) => {
+            #[allow(deprecated)]
+            emitted.push(ClientEvent::SubscribedQualityChanged {
+                track_sid: update.track_sid.clone(),
+                codecs: update.subscribed_codecs.clone(),
+                qualities: update.subscribed_qualities.clone(),
+            });
+        }
         signal_response::Message::SubscriptionPermissionUpdate(update) => {
             emitted.push(ClientEvent::SubscriptionPermissionChanged {
                 participant_sid: update.participant_sid.clone(),

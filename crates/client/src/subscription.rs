@@ -84,6 +84,7 @@ impl SubscriptionRequest {
 pub struct TrackSettings {
     track_sids: Vec<String>,
     disabled: bool,
+    quality: Option<livekit::VideoQuality>,
     width: u32,
     height: u32,
     fps: u32,
@@ -107,6 +108,11 @@ impl TrackSettings {
         self
     }
 
+    pub fn with_quality(mut self, quality: livekit::VideoQuality) -> Self {
+        self.quality = Some(quality);
+        self
+    }
+
     pub fn with_size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
@@ -127,7 +133,7 @@ impl TrackSettings {
         livekit::UpdateTrackSettings {
             track_sids: self.track_sids.clone(),
             disabled: self.disabled,
-            quality: livekit::VideoQuality::High as i32,
+            quality: self.quality.unwrap_or(livekit::VideoQuality::High) as i32,
             width: self.width,
             height: self.height,
             fps: self.fps,
@@ -211,6 +217,35 @@ mod tests {
                 assert_eq!(update.participant_tracks[0].participant_sid, "PA_bob");
             }
             other => panic!("expected a subscription request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn track_settings_ask_for_the_top_quality_unless_told_otherwise() {
+        let settings = TrackSettings::for_tracks(["TR_a"]);
+        assert_eq!(
+            settings.to_proto().quality,
+            livekit::VideoQuality::High as i32
+        );
+
+        let low = settings.with_quality(livekit::VideoQuality::Low);
+        assert_eq!(low.to_proto().quality, livekit::VideoQuality::Low as i32);
+    }
+
+    #[test]
+    fn asking_for_a_quality_and_asking_for_a_size_are_both_carried() {
+        let message = TrackSettings::for_tracks(["TR_a"])
+            .with_quality(livekit::VideoQuality::Medium)
+            .with_size(640, 360)
+            .to_message();
+
+        match encoded(message) {
+            signal_request::Message::TrackSetting(settings) => {
+                assert_eq!(settings.quality, livekit::VideoQuality::Medium as i32);
+                assert_eq!(settings.width, 640);
+                assert_eq!(settings.height, 360);
+            }
+            other => panic!("expected track settings, got {other:?}"),
         }
     }
 

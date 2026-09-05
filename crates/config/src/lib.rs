@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
 pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
+pub const DEFAULT_DYNACAST_PAUSE_DELAY_MS: u32 = 5_000;
+pub const DEFAULT_LAYER_UPGRADE_HOLD_MS: u32 = 2_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -20,6 +22,7 @@ pub struct Config {
     pub node_id: String,
     pub room: RoomConfig,
     pub rtc: RtcConfig,
+    pub video: VideoConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +49,32 @@ pub struct RtcConfig {
     pub negotiation_timeout: u32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VideoConfig {
+    pub dynacast_pause_delay_ms: u32,
+    pub layer_upgrade_hold_ms: u32,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            dynacast_pause_delay_ms: DEFAULT_DYNACAST_PAUSE_DELAY_MS,
+            layer_upgrade_hold_ms: DEFAULT_LAYER_UPGRADE_HOLD_MS,
+        }
+    }
+}
+
+impl VideoConfig {
+    pub fn dynacast_pause_delay(&self) -> Duration {
+        Duration::from_millis(self.dynacast_pause_delay_ms.into())
+    }
+
+    pub fn layer_upgrade_hold(&self) -> Duration {
+        Duration::from_millis(self.layer_upgrade_hold_ms.into())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -57,6 +86,7 @@ impl Default for Config {
             node_id: format!("ND_{}", short_id()),
             room: RoomConfig::default(),
             rtc: RtcConfig::default(),
+            video: VideoConfig::default(),
         }
     }
 }
@@ -276,6 +306,32 @@ mod tests {
         let config =
             Config::parse("keys:\n  key1: secret1\nrtc:\n  negotiation_timeout: 2\n").unwrap();
         assert_eq!(config.rtc.negotiation_grace(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_simulcast_timings_are_configurable() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+        assert_eq!(
+            config.video.dynacast_pause_delay(),
+            Duration::from_millis(DEFAULT_DYNACAST_PAUSE_DELAY_MS.into())
+        );
+        assert_eq!(
+            config.video.layer_upgrade_hold(),
+            Duration::from_millis(DEFAULT_LAYER_UPGRADE_HOLD_MS.into())
+        );
+
+        let config = Config::parse(
+            "keys:\n  key1: secret1\nvideo:\n  dynacast_pause_delay_ms: 250\n  layer_upgrade_hold_ms: 100\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.video.dynacast_pause_delay(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            config.video.layer_upgrade_hold(),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]

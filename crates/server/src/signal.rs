@@ -21,6 +21,7 @@ use crate::subscriber::SubscriberSession;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+const LAYER_INTERVAL: Duration = Duration::from_millis(250);
 const PING_TIMEOUT_SECONDS: i32 = 60;
 const PING_INTERVAL_SECONDS: i32 = 15;
 
@@ -125,6 +126,8 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
     timeouts.tick().await;
     let mut reconciles = tokio::time::interval(RECONCILE_INTERVAL);
     reconciles.tick().await;
+    let mut layers = tokio::time::interval(LAYER_INTERVAL);
+    layers.tick().await;
 
     subscriber.on_room_changed(&state, &joined).await;
 
@@ -141,6 +144,8 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     .await;
                     break;
                 }
+
+                publisher.apply_pending(&state, &joined).await;
             }
             event = subscriber.next_event() => {
                 let Some(event) = event else { break };
@@ -206,6 +211,9 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     }
                 }
             }
+            _ = layers.tick() => {
+                publisher.tick(&state, &joined).await;
+            }
             _ = reconciles.tick() => {
                 subscriber.on_room_changed(&state, &joined).await;
             }
@@ -266,7 +274,7 @@ async fn handle_request(
             true
         }
         signal_request::Message::TrackSetting(settings) => {
-            subscriber.on_track_settings(joined, &settings);
+            subscriber.on_track_settings(state, joined, &settings).await;
             true
         }
         signal_request::Message::Mute(mute) => {

@@ -99,6 +99,7 @@ pub struct PublishedTrack {
     pub width: u32,
     pub height: u32,
     pub layers: Vec<livekit::VideoLayer>,
+    pub live_layers: Vec<livekit::VideoLayer>,
     pub stream: String,
     pub encryption: livekit::encryption::Type,
     pub audio_features: Vec<i32>,
@@ -136,6 +137,7 @@ impl PublishedTrack {
             width: request.width,
             height: request.height,
             layers: sorted_layers(&request.layers),
+            live_layers: Vec::new(),
             stream,
             encryption: livekit::encryption::Type::try_from(request.encryption)
                 .unwrap_or(livekit::encryption::Type::None),
@@ -158,10 +160,34 @@ impl PublishedTrack {
         self.mid.is_some()
     }
 
+    pub fn is_simulcast(&self) -> bool {
+        self.layers.len() > 1
+    }
+
+    pub fn reported_layers(&self) -> &[livekit::VideoLayer] {
+        if self.live_layers.is_empty() {
+            &self.layers
+        } else {
+            &self.live_layers
+        }
+    }
+
+    pub(crate) fn set_live_layers(&mut self, layers: Vec<livekit::VideoLayer>) -> bool {
+        let layers = sorted_layers(&layers);
+
+        if self.live_layers == layers {
+            return false;
+        }
+
+        self.live_layers = layers;
+        true
+    }
+
     #[allow(deprecated)]
     pub fn to_proto(&self) -> livekit::TrackInfo {
         let mime_type = self.mime_type.clone().unwrap_or_default();
         let mid = self.mid.clone().unwrap_or_default();
+        let layers = self.reported_layers().to_vec();
 
         livekit::TrackInfo {
             sid: self.sid.clone(),
@@ -170,16 +196,16 @@ impl PublishedTrack {
             muted: self.muted,
             width: self.width,
             height: self.height,
-            simulcast: self.layers.len() > 1,
+            simulcast: self.is_simulcast(),
             source: self.source as i32,
-            layers: self.layers.clone(),
+            layers: layers.clone(),
             mime_type: mime_type.clone(),
             mid: mid.clone(),
             codecs: vec![livekit::SimulcastCodecInfo {
                 mime_type,
                 mid,
                 cid: self.cid.clone(),
-                layers: self.layers.clone(),
+                layers,
                 video_layer_mode: livekit::video_layer::Mode::OneSpatialLayerPerStream as i32,
                 sdp_cid: String::new(),
             }],

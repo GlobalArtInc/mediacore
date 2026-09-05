@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use str0m::media::Mid;
+use str0m::media::{Mid, Rid};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -34,6 +34,10 @@ pub enum TransportError {
     NegotiationFailed,
     #[error("this session has no media with mid `{0}`")]
     UnknownMid(Mid),
+    #[error("mid `{mid}` did not negotiate a layer with rid `{rid}`")]
+    UnknownLayer { mid: Mid, rid: Rid },
+    #[error("mid `{0}` carries several layers, name the rid instead of the whole track")]
+    AmbiguousLayer(Mid),
     #[error("{0} is not implemented in this milestone")]
     NotImplemented(&'static str),
     #[error("webrtc error")]

@@ -28,6 +28,14 @@ pub enum ClientError {
     NothingToNegotiate,
     #[error("no payload type for {codec} was negotiated on mid {mid}")]
     CodecNotNegotiated { codec: &'static str, mid: String },
+    #[error("`{0}` is not a usable rid: it must be 1 to 8 alphanumeric characters")]
+    InvalidRid(String),
+    #[error("the peer negotiated no stream for rid `{rid}` on mid {mid}")]
+    LayerNotNegotiated { mid: String, rid: String },
+    #[error("rid `{0}` is claimed by more than one layer of the same track")]
+    DuplicateRid(String),
+    #[error("this track has no layer with rid `{0}`")]
+    UnknownLayer(String),
     #[error("the publisher transport is gone")]
     TransportGone,
     #[error("cannot use {0} as a host candidate: {1}")]

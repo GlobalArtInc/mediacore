@@ -6,6 +6,10 @@ const OPUS_TOC_CELT_FULLBAND_20MS_MONO: u8 = 0x78;
 const VP8_DESCRIPTOR_START_OF_PARTITION: u8 = 0x10;
 const VP8_KEYFRAME_START_CODE: [u8; 3] = [0x9d, 0x01, 0x2a];
 
+pub const LAYER_TAG_TRAILER: usize = 4;
+
+const LAYER_TAG_MAGIC: [u8; 2] = [0x4c, 0x59];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     Opus,
@@ -38,6 +42,7 @@ pub struct MediaProfile {
     pub width: u32,
     pub height: u32,
     pub keyframe_interval: u64,
+    pub layer_tag: Option<u8>,
 }
 
 impl MediaProfile {
@@ -51,6 +56,7 @@ impl MediaProfile {
             width: 0,
             height: 0,
             keyframe_interval: 0,
+            layer_tag: None,
         }
     }
 
@@ -64,26 +70,43 @@ impl MediaProfile {
             width: 320,
             height: 240,
             keyframe_interval: 30,
+            layer_tag: None,
         }
+    }
+
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    pub fn with_payload_size(mut self, payload_size: usize) -> Self {
+        self.payload_size = payload_size;
+        self
+    }
+
+    pub fn with_layer_tag(mut self, tag: u8) -> Self {
+        self.layer_tag = Some(tag);
+        self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SyntheticPacket {
+pub struct SyntheticPacket {
     pub payload: Vec<u8>,
     pub marker: bool,
     pub ticks: u32,
 }
 
 #[derive(Debug)]
-pub(crate) struct SyntheticSource {
+pub struct SyntheticSource {
     profile: MediaProfile,
     index: u64,
     keyframe_requested: bool,
 }
 
 impl SyntheticSource {
-    pub(crate) fn new(profile: MediaProfile) -> Self {
+    pub fn new(profile: MediaProfile) -> Self {
         Self {
             profile,
             index: 0,
@@ -91,39 +114,85 @@ impl SyntheticSource {
         }
     }
 
-    pub(crate) fn request_keyframe(&mut self) {
+    pub fn request_keyframe(&mut self) {
         self.keyframe_requested = true;
     }
 
-    pub(crate) fn next(&mut self) -> SyntheticPacket {
+    pub fn next_packet(&mut self) -> SyntheticPacket {
         let index = self.index;
         self.index += 1;
 
         match self.profile.codec {
-            Codec::Opus => SyntheticPacket {
-                payload: opus_payload(self.profile.payload_size),
-                marker: index == 0,
-                ticks: self.profile.ticks_per_packet,
-            },
+            Codec::Opus => {
+                let mut payload = opus_payload(self.profile.payload_size);
+                stamp_layer_tag(&mut payload, 1, self.profile.layer_tag);
+
+                SyntheticPacket {
+                    payload,
+                    marker: index == 0,
+                    ticks: self.profile.ticks_per_packet,
+                }
+            }
             Codec::Vp8 => {
                 let periodic = self.profile.keyframe_interval > 0
                     && index.is_multiple_of(self.profile.keyframe_interval);
                 let keyframe = periodic || self.keyframe_requested;
                 self.keyframe_requested = false;
 
+                let mut payload = vp8_payload(
+                    keyframe,
+                    self.profile.payload_size,
+                    self.profile.width,
+                    self.profile.height,
+                );
+                stamp_layer_tag(
+                    &mut payload,
+                    vp8_header_len(keyframe),
+                    self.profile.layer_tag,
+                );
+
                 SyntheticPacket {
-                    payload: vp8_payload(
-                        keyframe,
-                        self.profile.payload_size,
-                        self.profile.width,
-                        self.profile.height,
-                    ),
+                    payload,
                     marker: true,
                     ticks: self.profile.ticks_per_packet,
                 }
             }
         }
     }
+}
+
+pub fn layer_tag(payload: &[u8]) -> Option<u8> {
+    let trailer = payload.len().checked_sub(LAYER_TAG_TRAILER)?;
+    let trailer = &payload[trailer..];
+
+    if trailer[..2] != LAYER_TAG_MAGIC || trailer[3] != !trailer[2] {
+        return None;
+    }
+
+    Some(trailer[2])
+}
+
+pub(crate) fn stamp_layer_tag(payload: &mut [u8], protected: usize, tag: Option<u8>) {
+    let Some(tag) = tag else {
+        return;
+    };
+
+    let Some(at) = payload
+        .len()
+        .checked_sub(LAYER_TAG_TRAILER)
+        .filter(|at| *at >= protected)
+    else {
+        return;
+    };
+
+    payload[at] = LAYER_TAG_MAGIC[0];
+    payload[at + 1] = LAYER_TAG_MAGIC[1];
+    payload[at + 2] = tag;
+    payload[at + 3] = !tag;
+}
+
+pub(crate) fn vp8_header_len(keyframe: bool) -> usize {
+    if keyframe { 11 } else { 4 }
 }
 
 pub(crate) fn opus_payload(size: usize) -> Vec<u8> {
@@ -137,7 +206,7 @@ pub(crate) fn opus_payload(size: usize) -> Vec<u8> {
 }
 
 pub(crate) fn vp8_payload(keyframe: bool, size: usize, width: u32, height: u32) -> Vec<u8> {
-    let header = if keyframe { 11 } else { 4 };
+    let header = vp8_header_len(keyframe);
     let size = size.max(header + 1);
 
     let mut payload = Vec::with_capacity(size);
@@ -195,8 +264,8 @@ mod tests {
     #[test]
     fn opus_source_paces_one_packet_per_twenty_milliseconds() {
         let mut source = SyntheticSource::new(MediaProfile::opus());
-        let first = source.next();
-        let second = source.next();
+        let first = source.next_packet();
+        let second = source.next_packet();
 
         assert!(first.marker);
         assert!(!second.marker);
@@ -208,25 +277,88 @@ mod tests {
     fn video_source_starts_with_a_keyframe_and_repeats_it() {
         let mut source = SyntheticSource::new(MediaProfile::vp8());
 
-        let first = source.next();
+        let first = source.next_packet();
         assert_eq!(first.payload[1] & 0x01, 0x00);
         assert!(first.marker);
 
         for _ in 1..30 {
-            let packet = source.next();
+            let packet = source.next_packet();
             assert_eq!(packet.payload[1] & 0x01, 0x01);
         }
 
-        assert_eq!(source.next().payload[1] & 0x01, 0x00);
+        assert_eq!(source.next_packet().payload[1] & 0x01, 0x00);
+    }
+
+    #[test]
+    fn an_untagged_profile_leaves_the_payload_unmarked() {
+        let mut source = SyntheticSource::new(MediaProfile::vp8());
+        assert_eq!(layer_tag(&source.next_packet().payload), None);
+    }
+
+    #[test]
+    fn a_tagged_profile_stamps_every_packet_keyframe_or_not() {
+        let mut source = SyntheticSource::new(MediaProfile::vp8().with_layer_tag(b'h'));
+
+        for _ in 0..40 {
+            let packet = source.next_packet();
+            assert_eq!(layer_tag(&packet.payload), Some(b'h'));
+        }
+    }
+
+    #[test]
+    fn the_tag_does_not_disturb_the_vp8_header() {
+        let mut source = SyntheticSource::new(MediaProfile::vp8().with_layer_tag(0xff));
+
+        let keyframe = source.next_packet();
+        assert_eq!(keyframe.payload[1] & 0x01, 0x00);
+        assert_eq!(&keyframe.payload[4..7], &[0x9d, 0x01, 0x2a]);
+
+        let interframe = source.next_packet();
+        assert_eq!(interframe.payload[1] & 0x01, 0x01);
+        assert_eq!(layer_tag(&interframe.payload), Some(0xff));
+    }
+
+    #[test]
+    fn two_layers_are_told_apart_by_their_tag() {
+        let mut low = SyntheticSource::new(MediaProfile::vp8().with_layer_tag(b'q'));
+        let mut high = SyntheticSource::new(MediaProfile::vp8().with_layer_tag(b'f'));
+
+        assert_eq!(layer_tag(&low.next_packet().payload), Some(b'q'));
+        assert_eq!(layer_tag(&high.next_packet().payload), Some(b'f'));
+    }
+
+    #[test]
+    fn a_payload_too_short_to_hold_a_tag_is_left_alone() {
+        let mut payload = vec![0x10, 0x00, 0x00, 0x00, 0x00];
+        stamp_layer_tag(&mut payload, 4, Some(b'q'));
+
+        assert_eq!(payload, vec![0x10, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(layer_tag(&payload), None);
+    }
+
+    #[test]
+    fn a_payload_that_only_looks_tagged_is_not_read_as_one() {
+        assert_eq!(layer_tag(&[0x4c, 0x59, 0x10, 0x10]), None);
+        assert_eq!(layer_tag(&[0x00, 0x00, 0x10, 0xef]), None);
+        assert_eq!(layer_tag(&[0x59]), None);
+    }
+
+    #[test]
+    fn an_audio_profile_can_carry_a_tag_too() {
+        let mut source = SyntheticSource::new(MediaProfile::opus().with_layer_tag(7));
+        let packet = source.next_packet();
+
+        assert_eq!(packet.payload[0], 0x78);
+        assert_eq!(layer_tag(&packet.payload), Some(7));
     }
 
     #[test]
     fn a_keyframe_request_is_honoured_on_the_next_packet() {
         let mut source = SyntheticSource::new(MediaProfile::vp8());
-        let _ = source.next();
-        assert_eq!(source.next().payload[1] & 0x01, 0x01);
+        let _ = source.next_packet();
+        assert_eq!(source.next_packet().payload[1] & 0x01, 0x01);
 
         source.request_keyframe();
-        assert_eq!(source.next().payload[1] & 0x01, 0x00);
+        assert_eq!(source.next_packet().payload[1] & 0x01, 0x00);
     }
 }

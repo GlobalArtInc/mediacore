@@ -4,5 +4,6 @@ pub mod media;
 pub mod peer;
 pub mod publisher;
 pub mod signal;
+pub mod simulcast;
 pub mod state;
 pub mod subscriber;

@@ -3,6 +3,7 @@ mod events;
 mod media;
 mod receiver;
 mod signal;
+mod simulcast;
 mod subscriber;
 mod subscription;
 mod track;
@@ -13,23 +14,31 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use mediacore_proto::livekit::{self, signal_request, signal_response};
-use str0m::media::Mid;
+use str0m::media::{Mid, Rid};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub use crate::error::ClientError;
 pub use crate::events::{ClientEvent, EventStream, RemoteTrack};
-pub use crate::media::{Codec, MediaProfile};
-pub use crate::receiver::{DEFAULT_PAYLOAD_WINDOW, ReceivedPacket, Span, TrackReport};
+pub use crate::media::{
+    Codec, LAYER_TAG_TRAILER, MediaProfile, SyntheticPacket, SyntheticSource, layer_tag,
+};
+pub use crate::receiver::{
+    DEFAULT_PAYLOAD_WINDOW, DEFAULT_SWITCH_HISTORY, LayerId, LayerReport, MAX_LAYERS,
+    MAX_TRACKED_MISSING, ReceivedPacket, Span, Switch, TrackReport,
+};
 pub use crate::signal::SignalStream;
+pub use crate::simulcast::{
+    LayerSpec, MAX_RID_LEN, RID_FULL, RID_HALF, RID_QUARTER, default_layers,
+};
 pub use crate::subscription::{SubscriptionRequest, TrackSettings};
 pub use crate::track::{TrackKind, TrackSpec};
-pub use crate::transport::TrackStats;
+pub use crate::transport::{LayerStats, TrackStats};
 pub use mediacore_proto::livekit as proto;
 
 use crate::signal::SignalHandle;
 use crate::subscriber::SubCommand;
-use crate::transport::Command;
+use crate::transport::{Command, PublishSource};
 
 const COMMAND_QUEUE: usize = 64;
 const REPORT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -195,6 +204,8 @@ impl Client {
     }
 
     pub async fn publish(&self, spec: TrackSpec) -> Result<PublishedTrack, ClientError> {
+        simulcast::validate_layers(&spec.layers)?;
+
         let mut responses = self.signal.subscribe();
         self.signal
             .send(signal_request::Message::AddTrack(spec.to_request()))?;
@@ -214,7 +225,7 @@ impl Client {
             kind: spec.kind.media_kind(),
             stream_id: spec.stream_id.clone(),
             track_id: spec.cid.clone(),
-            profile: spec.profile,
+            sources: publish_sources(&spec),
             reply,
         })
         .await?;
@@ -290,6 +301,31 @@ impl Client {
 
     pub fn update_track_settings(&self, settings: &TrackSettings) -> Result<(), ClientError> {
         self.signal.send(settings.to_message())
+    }
+
+    pub fn request_quality<I, S>(
+        &self,
+        track_sids: I,
+        quality: livekit::VideoQuality,
+    ) -> Result<(), ClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.update_track_settings(&TrackSettings::for_tracks(track_sids).with_quality(quality))
+    }
+
+    pub fn request_video_size<I, S>(
+        &self,
+        track_sids: I,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.update_track_settings(&TrackSettings::for_tracks(track_sids).with_size(width, height))
     }
 
     pub async fn received(&self) -> Result<Vec<TrackReport>, ClientError> {
@@ -400,6 +436,23 @@ impl Drop for Client {
     }
 }
 
+fn publish_sources(spec: &TrackSpec) -> Vec<PublishSource> {
+    if spec.layers.is_empty() {
+        return vec![PublishSource {
+            rid: None,
+            profile: spec.profile,
+        }];
+    }
+
+    spec.layers
+        .iter()
+        .map(|layer| PublishSource {
+            rid: Some(Rid::from(layer.rid.as_str())),
+            profile: layer.profile,
+        })
+        .collect()
+}
+
 pub struct PublishedTrack {
     spec: TrackSpec,
     info: Option<livekit::TrackInfo>,
@@ -442,15 +495,42 @@ impl PublishedTrack {
         self.mid.to_string()
     }
 
+    pub fn layers(&self) -> &[LayerSpec] {
+        &self.spec.layers
+    }
+
+    pub fn rids(&self) -> Vec<&str> {
+        self.spec.rids()
+    }
+
     pub async fn start(&self) -> Result<(), ClientError> {
-        self.command(Command::Start(self.mid)).await
+        self.command(Command::Start(self.mid, None)).await
     }
 
     pub async fn stop(&self) -> Result<(), ClientError> {
-        self.command(Command::Stop(self.mid)).await
+        self.command(Command::Stop(self.mid, None)).await
+    }
+
+    pub async fn start_layer(&self, rid: &str) -> Result<(), ClientError> {
+        self.command(Command::Start(self.mid, Some(self.rid(rid)?)))
+            .await
+    }
+
+    pub async fn stop_layer(&self, rid: &str) -> Result<(), ClientError> {
+        self.command(Command::Stop(self.mid, Some(self.rid(rid)?)))
+            .await
     }
 
     pub async fn stats(&self) -> Result<TrackStats, ClientError> {
+        let mut total = TrackStats::default();
+        for layer in self.layer_stats().await? {
+            total.merge(&layer.stats);
+        }
+
+        Ok(total)
+    }
+
+    pub async fn layer_stats(&self) -> Result<Vec<LayerStats>, ClientError> {
         let (reply, stats) = oneshot::channel();
         self.command(Command::Stats(self.mid, reply)).await?;
 
@@ -458,7 +538,24 @@ impl PublishedTrack {
             .await
             .map_err(|_| ClientError::Timeout("track statistics"))?
             .map_err(|_| ClientError::TransportGone)
-            .map(Option::unwrap_or_default)
+    }
+
+    pub async fn stats_of(&self, rid: &str) -> Result<TrackStats, ClientError> {
+        let wanted = self.rid(rid)?.to_string();
+
+        self.layer_stats()
+            .await?
+            .into_iter()
+            .find(|layer| layer.rid.as_deref() == Some(wanted.as_str()))
+            .map(|layer| layer.stats)
+            .ok_or_else(|| ClientError::UnknownLayer(rid.to_owned()))
+    }
+
+    fn rid(&self, rid: &str) -> Result<Rid, ClientError> {
+        self.spec
+            .layer(rid)
+            .map(|layer| Rid::from(layer.rid.as_str()))
+            .ok_or_else(|| ClientError::UnknownLayer(rid.to_owned()))
     }
 
     async fn command(&self, command: Command) -> Result<(), ClientError> {

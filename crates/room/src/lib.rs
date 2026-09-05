@@ -232,6 +232,28 @@ impl Participant {
         self.update_track(track_sid, |track| track.mid = Some(mid.to_owned()))
     }
 
+    pub fn set_track_live_layers(
+        &self,
+        track_sid: &str,
+        layers: Vec<livekit::VideoLayer>,
+    ) -> Option<PublishedTrack> {
+        let track = {
+            let mut tracks = self.tracks.lock().expect("track lock");
+            let track = tracks.iter_mut().find(|track| track.sid == track_sid)?;
+
+            if !track.set_live_layers(layers) {
+                return None;
+            }
+
+            track.touch();
+            track.clone()
+        };
+
+        self.bump_version();
+
+        Some(track)
+    }
+
     pub fn set_track_mime_type(&self, track_sid: &str, mime_type: &str) -> Option<PublishedTrack> {
         self.update_track(track_sid, |track| {
             track.mime_type = Some(mime_type.to_owned())
@@ -488,6 +510,19 @@ impl Room {
     ) -> Option<PublishedTrack> {
         let publisher = self.participant_by_sid(publisher_sid)?;
         let track = publisher.set_track_muted(track_sid, muted)?;
+        self.announce(&publisher);
+
+        Some(track)
+    }
+
+    pub fn set_track_live_layers(
+        &self,
+        publisher_sid: &str,
+        track_sid: &str,
+        layers: Vec<livekit::VideoLayer>,
+    ) -> Option<PublishedTrack> {
+        let publisher = self.participant_by_sid(publisher_sid)?;
+        let track = publisher.set_track_live_layers(track_sid, layers)?;
         self.announce(&publisher);
 
         Some(track)
@@ -1144,6 +1179,88 @@ mod tests {
                 .map(|(publisher, _)| publisher.sid.clone()),
             Some(bob.participant.sid.clone())
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_layers_a_track_reports_follow_the_ones_that_are_arriving() {
+        let registry = Registry::new(RoomDefaults::default());
+        let (alice_tx, mut alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+
+        let mut request = camera("cid-1");
+        request.layers = vec![
+            layer(livekit::VideoQuality::Low, "q", 320, 180),
+            layer(livekit::VideoQuality::Medium, "h", 640, 360),
+            layer(livekit::VideoQuality::High, "f", 1280, 720),
+        ];
+
+        let published = bob
+            .room
+            .publish_track(&bob.participant.sid, &request)
+            .expect("bob may publish");
+        assert_eq!(published.to_proto().layers.len(), 3);
+        assert!(published.to_proto().simulcast);
+        drain(&mut alice_rx);
+
+        let live = bob
+            .room
+            .set_track_live_layers(
+                &bob.participant.sid,
+                &published.sid,
+                vec![
+                    layer(livekit::VideoQuality::Low, "q", 320, 180),
+                    layer(livekit::VideoQuality::Medium, "h", 640, 360),
+                ],
+            )
+            .expect("the live layers are recorded");
+
+        assert_eq!(live.live_layers.len(), 2);
+        assert_eq!(live.layers.len(), 3, "the declared ladder is kept");
+        assert!(
+            live.to_proto().simulcast,
+            "a track whose top layer went quiet is still a simulcast track"
+        );
+
+        let update = expect_update(&mut alice_rx);
+        let reported = &update.participants[0].tracks[0].layers;
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[1].rid, "h");
+        assert!(live.version > published.version);
+
+        assert!(
+            bob.room
+                .set_track_live_layers(
+                    &bob.participant.sid,
+                    &published.sid,
+                    vec![
+                        layer(livekit::VideoQuality::Low, "q", 320, 180),
+                        layer(livekit::VideoQuality::Medium, "h", 640, 360),
+                    ],
+                )
+                .is_none(),
+            "an unchanged layer set is not announced again"
+        );
+
+        assert_eq!(alice.room.participant_count(), 2);
+    }
+
+    fn layer(
+        quality: livekit::VideoQuality,
+        rid: &str,
+        width: u32,
+        height: u32,
+    ) -> livekit::VideoLayer {
+        livekit::VideoLayer {
+            quality: quality as i32,
+            rid: rid.to_owned(),
+            width,
+            height,
+            ..Default::default()
+        }
     }
 
     #[test]

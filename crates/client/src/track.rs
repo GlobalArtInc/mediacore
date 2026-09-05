@@ -2,6 +2,7 @@ use mediacore_proto::livekit;
 use str0m::media::MediaKind;
 
 use crate::media::MediaProfile;
+use crate::simulcast::{LayerSpec, default_layers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackKind {
@@ -33,6 +34,7 @@ pub struct TrackSpec {
     pub source: livekit::TrackSource,
     pub stream_id: String,
     pub profile: MediaProfile,
+    pub layers: Vec<LayerSpec>,
 }
 
 impl TrackSpec {
@@ -45,6 +47,7 @@ impl TrackSpec {
             kind: TrackKind::Audio,
             source: livekit::TrackSource::Microphone,
             profile: MediaProfile::opus(),
+            layers: Vec::new(),
         }
     }
 
@@ -57,7 +60,32 @@ impl TrackSpec {
             kind: TrackKind::Video,
             source: livekit::TrackSource::Camera,
             profile: MediaProfile::vp8(),
+            layers: Vec::new(),
         }
+    }
+
+    pub fn simulcast_video(name: impl Into<String>) -> Self {
+        Self::video(name).with_layers(default_layers())
+    }
+
+    pub fn with_layers(mut self, layers: Vec<LayerSpec>) -> Self {
+        if let Some(top) = layers.last() {
+            self.profile = top.profile;
+        }
+        self.layers = layers;
+        self
+    }
+
+    pub fn is_simulcast(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
+    pub fn layer(&self, rid: &str) -> Option<&LayerSpec> {
+        self.layers.iter().find(|layer| layer.rid == rid)
+    }
+
+    pub fn rids(&self) -> Vec<&str> {
+        self.layers.iter().map(|layer| layer.rid.as_str()).collect()
     }
 
     pub fn with_cid(mut self, cid: impl Into<String>) -> Self {
@@ -83,6 +111,9 @@ impl TrackSpec {
     pub fn to_request(&self) -> livekit::AddTrackRequest {
         let layers = match self.kind {
             TrackKind::Audio => Vec::new(),
+            TrackKind::Video if self.is_simulcast() => {
+                self.layers.iter().map(LayerSpec::to_video_layer).collect()
+            }
             TrackKind::Video => vec![livekit::VideoLayer {
                 quality: livekit::VideoQuality::High as i32,
                 width: self.profile.width,
@@ -151,6 +182,46 @@ mod tests {
             livekit::VideoQuality::High as i32
         );
         assert_eq!(request.simulcast_codecs[0].codec, "vp8");
+    }
+
+    #[test]
+    fn a_simulcast_spec_declares_one_layer_per_encoding() {
+        let spec = TrackSpec::simulcast_video("cam");
+        let request = spec.to_request();
+
+        assert_eq!(spec.rids(), vec!["q", "h", "f"]);
+        assert_eq!(request.layers.len(), 3);
+        assert_eq!(request.layers[0].rid, "q");
+        assert_eq!(request.layers[0].quality, livekit::VideoQuality::Low as i32);
+        assert_eq!(request.layers[1].rid, "h");
+        assert_eq!(
+            request.layers[1].quality,
+            livekit::VideoQuality::Medium as i32
+        );
+        assert_eq!(request.layers[2].rid, "f");
+        assert_eq!(
+            request.layers[2].quality,
+            livekit::VideoQuality::High as i32
+        );
+        assert_eq!(request.layers[2].bitrate, 1_700_000);
+    }
+
+    #[test]
+    fn a_simulcast_spec_reports_the_top_layer_as_the_track_size() {
+        let request = TrackSpec::simulcast_video("cam").to_request();
+
+        assert_eq!(request.width, 1_280);
+        assert_eq!(request.height, 720);
+    }
+
+    #[test]
+    fn each_layer_of_a_spec_can_be_looked_up_by_rid() {
+        let spec = TrackSpec::simulcast_video("cam");
+
+        assert_eq!(spec.layer("h").map(|layer| layer.height), Some(360));
+        assert_eq!(spec.layer("nope"), None);
+        assert!(spec.is_simulcast());
+        assert!(!TrackSpec::video("cam").is_simulcast());
     }
 
     #[test]

@@ -296,6 +296,7 @@ impl Subscriber {
             payload_type: *packet.header.payload_type,
             ssrc: *packet.header.ssrc,
             marker: packet.header.marker,
+            rid: packet.header.ext_vals.rid.map(|rid| rid.to_string()),
             payload: packet.payload.to_vec(),
         });
     }

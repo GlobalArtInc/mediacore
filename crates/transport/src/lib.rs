@@ -4,6 +4,7 @@ mod negotiation;
 mod peer;
 mod router;
 mod send;
+mod simulcast;
 
 pub use crypto::TransportCrypto;
 pub use error::TransportError;
@@ -22,6 +23,10 @@ pub use router::{
 pub use send::{
     AUDIO_RTX_CACHE_PACKETS, DeclaredStream, OutgoingRtp, RTX_CACHE_AGE, RTX_RATIO_CAP, RtxCache,
     SendStream, VIDEO_RTX_CACHE_PACKETS,
+};
+pub use simulcast::{
+    IngressReport, KeyframeProbe, KeyframeTarget, LAYER_SILENCE_THRESHOLD, LayerActivity, LayerSet,
+    LayerStats,
 };
 
 pub use str0m;

@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use mediacore_config::Config;
+use mediacore_proto::livekit;
 use mediacore_room::{Registry, RoomDefaults};
 
-use crate::forward::MediaRouter;
+use mediacore_sfu::SelectorConfig;
+
+use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
 
@@ -37,6 +40,19 @@ impl AppState {
             media: Arc::new(media),
             publishers: Arc::new(Publishers::default()),
             router: Arc::new(MediaRouter::default()),
+        }
+    }
+
+    pub fn source_config(&self, source: livekit::TrackSource) -> SourceConfig {
+        SourceConfig {
+            pause_delay: self.config.video.dynacast_pause_delay(),
+            tracker: tracker_config(source),
+        }
+    }
+
+    pub fn selector_config(&self) -> SelectorConfig {
+        SelectorConfig {
+            upgrade_hold: self.config.video.layer_upgrade_hold(),
         }
     }
 }

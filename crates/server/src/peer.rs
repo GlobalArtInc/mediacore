@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use mediacore_proto::livekit::{self, signal_response};
 use mediacore_room::Joined;
@@ -10,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use crate::forward::TrackSource;
 use crate::publisher::PublisherStats;
+use crate::simulcast::{LayerMap, apply_quality_update};
 use crate::state::AppState;
 
 pub struct PublisherSession {
@@ -20,6 +22,7 @@ pub struct PublisherSession {
     queued_candidates: Vec<String>,
     cid_by_mid: HashMap<String, String>,
     sid_by_mid: HashMap<String, String>,
+    dirty: HashSet<String>,
 }
 
 impl PublisherSession {
@@ -32,6 +35,7 @@ impl PublisherSession {
             queued_candidates: Vec::new(),
             cid_by_mid: HashMap::new(),
             sid_by_mid: HashMap::new(),
+            dirty: HashSet::new(),
         }
     }
 
@@ -145,7 +149,11 @@ impl PublisherSession {
                 );
 
                 if let Some(track_sid) = track_sid {
-                    state.router.forward(&track_sid, &rtp);
+                    let effects = state.router.forward(&track_sid, &rtp);
+
+                    if !effects.is_empty() {
+                        self.dirty.insert(track_sid);
+                    }
                 }
             }
             PeerEvent::EgressReport(report) => {
@@ -155,6 +163,30 @@ impl PublisherSession {
                     rtt = ?report.rtt,
                     "publisher egress report"
                 );
+            }
+            PeerEvent::IngressReport(report) => {
+                tracing::trace!(
+                    identity = %joined.participant.identity,
+                    mid = %report.mid,
+                    rid = ?report.rid,
+                    packets = report.packets,
+                    nacks = report.nacks,
+                    loss = ?report.loss,
+                    "publisher layer ingress report"
+                );
+            }
+            PeerEvent::LayerActivity(activity) => {
+                tracing::debug!(
+                    identity = %joined.participant.identity,
+                    mid = %activity.mid,
+                    rid = ?activity.rid,
+                    active = activity.active,
+                    "a publisher layer changed state"
+                );
+
+                if let Some(track_sid) = self.sid_by_mid.get(&*activity.mid) {
+                    self.dirty.insert(track_sid.clone());
+                }
             }
             PeerEvent::Media(_) | PeerEvent::KeyframeRequested(_) => {}
             PeerEvent::Disconnected => {
@@ -168,6 +200,37 @@ impl PublisherSession {
         }
 
         true
+    }
+
+    pub async fn tick(&mut self, state: &AppState, joined: &Joined) {
+        let now = Instant::now();
+
+        for track_sid in self.sid_by_mid.values() {
+            state.router.tick_track(track_sid, now);
+            self.dirty.insert(track_sid.clone());
+        }
+
+        self.apply_pending(state, joined).await;
+    }
+
+    pub async fn apply_pending(&mut self, state: &AppState, joined: &Joined) {
+        if self.dirty.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+
+        for track_sid in std::mem::take(&mut self.dirty) {
+            if let Some(layers) = state.router.live_layers(&track_sid) {
+                joined
+                    .room
+                    .set_track_live_layers(&joined.participant.sid, &track_sid, layers);
+            }
+
+            if let Some(update) = state.router.pending_quality_update(&track_sid, now) {
+                apply_quality_update(state, &joined.room, &update).await;
+            }
+        }
     }
 
     pub fn close(&mut self, state: &AppState, participant_sid: &str) {
@@ -376,10 +439,21 @@ impl PublisherSession {
         self.sid_by_mid.insert(mid.clone(), track.sid.clone());
 
         if let Some(handle) = self.handle.clone() {
+            let layers = LayerMap::build(&track.layers, &info.rids);
+
             state.router.register_source(
                 &track.sid,
-                TrackSource::new(handle, info.mid, track.kind, &mime_type),
+                TrackSource::new(
+                    handle,
+                    info.mid,
+                    track.kind,
+                    &mime_type,
+                    &joined.participant.sid,
+                    layers,
+                    state.source_config(track.source),
+                ),
             );
+            self.dirty.insert(track.sid.clone());
         }
 
         tracing::info!(
@@ -387,7 +461,7 @@ impl PublisherSession {
             track = %track.sid,
             %mid,
             %mime_type,
-            rids = info.rids.len(),
+            rids = ?info.rids,
             "publisher media is live"
         );
 
