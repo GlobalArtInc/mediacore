@@ -470,7 +470,9 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    // The length was just checked to be even, so the remainder here is empty.
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for pair in pairs {
         let high = char::from(pair[0]).to_digit(16)?;
         let low = char::from(pair[1]).to_digit(16)?;
         out.push((high * 16 + low) as u8);
