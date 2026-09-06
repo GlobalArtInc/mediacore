@@ -2356,3 +2356,473 @@ async fn a_deployment_that_signs_nobody_in_is_the_page_it_always_was() {
         "the token endpoint asks for a session on a deployment that has none: {body}"
     );
 }
+
+/// The stylesheet with its prose taken out. Some of the questions below are
+/// about what a rule says, and the comment above a rule tends to say the same
+/// words on purpose.
+fn without_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some((before, after)) = rest.split_once("/*") {
+        out.push_str(before);
+        rest = after
+            .split_once("*/")
+            .expect("a comment in this stylesheet is closed")
+            .1;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text inside one `@media` block. `rule_of` above stops at the first `}`,
+/// which inside a media query is the end of its first rule rather than the end
+/// of the block, so a question about a whole breakpoint needs to count braces.
+fn media_of<'a>(css: &'a str, query: &str) -> &'a str {
+    let start = css
+        .find(query)
+        .unwrap_or_else(|| panic!("the stylesheet no longer carries `{query}`"))
+        + query.len();
+    let rest = &css[start..];
+    let mut depth = 1usize;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the `{query}` block is never closed");
+}
+
+/// Eight controls do not go across a phone, and both ways of being wrong about
+/// that are silent. Put one back in the row and every target in it is too small
+/// to hit; take one out without giving it somewhere to go and it is gone for
+/// good on the only screen most people will ever open this page on.
+#[tokio::test]
+async fn every_control_a_phone_takes_off_the_bar_is_still_one_press_away() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let bar = page
+        .split_once(r#"<div class="bar""#)
+        .expect("the control bar is in the page")
+        .1
+        .split_once("</div>")
+        .expect("the control bar is closed")
+        .0;
+
+    assert!(
+        bar.starts_with(r#" id="bar""#),
+        "the control bar has no id of its own, so nothing can say whether the controls behind          `More` are showing: {bar}"
+    );
+
+    for control in [
+        "mute",
+        "audio-settings",
+        "noise",
+        "share-screen",
+        "camera",
+        "bench-toggle",
+        "bar-more",
+        "leave",
+    ] {
+        assert!(
+            bar.contains(&format!("id=\"{control}\"")),
+            "`{control}` is not in the control bar, so on a phone it is nowhere at all"
+        );
+    }
+
+    let more = bar
+        .split_once(r#"id="bar-more""#)
+        .expect("the bar has no overflow control")
+        .1
+        .split_once('>')
+        .expect("its tag is closed")
+        .0;
+    assert!(
+        more.contains(r#"aria-expanded="false""#)
+            && more.contains(r#"aria-controls="audio-settings noise share-screen bench-toggle""#)
+            && more.contains("aria-label="),
+        "the control that holds the rest of the bar does not say what it holds or whether it is \
+         open, so a screen reader user is told there is a button and nothing else: {more}"
+    );
+
+    let narrow = media_of(&css, "@media (max-width: 34rem) {");
+    assert!(
+        narrow.contains("#bar-more {\n    display: inline-flex;"),
+        "the overflow control is never drawn, so the controls behind it cannot be reached: \
+         {narrow}"
+    );
+
+    let put_away = narrow
+        .split_once(r#".bar:not([data-more="open"])"#)
+        .expect(
+            "nothing takes any control off the bar on a phone, so all eight are laid across 375 \
+             pixels and none of them can be pressed",
+        )
+        .1
+        .split_once('}')
+        .expect("the rule is closed")
+        .0;
+    assert!(
+        put_away.contains("display: none"),
+        "the controls behind `More` are not actually put away: {put_away}"
+    );
+    for behind in [
+        "#audio-settings",
+        "#noise",
+        "#share-screen",
+        "#bench-toggle",
+    ] {
+        assert!(
+            put_away.contains(behind),
+            "`{behind}` is in the phone's row as well as behind `More`, which is one control too \
+             many for the width: {put_away}"
+        );
+    }
+    for kept in ["#mute", "#camera", "#leave"] {
+        assert!(
+            !put_away.contains(kept),
+            "`{kept}` is only reachable behind a press on a phone, and it is one of the four a \
+             call is actually made of: {put_away}"
+        );
+    }
+}
+
+/// 44 CSS pixels is the number, not a feeling. Every one of these was drawn to
+/// sit beside a cursor that could hit a quarter of that.
+#[tokio::test]
+async fn nothing_a_thumb_has_to_hit_is_smaller_than_a_thumb() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let touch = media_of(&css, "@media (pointer: coarse), (max-width: 52rem) {");
+
+    for control in [
+        ".control",
+        ".share-act",
+        ".share-tab",
+        ".choice",
+        ".switch",
+        ".link-button",
+        ".people-toggle",
+    ] {
+        assert!(
+            touch.contains(control),
+            "`{control}` keeps the size it had beside a mouse pointer, and a finger misses it"
+        );
+    }
+    assert!(
+        touch.contains("min-height: 44px") && touch.contains("min-width: 44px"),
+        "the smallest target a finger can hit is not stated anywhere: {touch}"
+    );
+    assert!(
+        touch.contains("font-size: 16px"),
+        "a field on a phone is smaller than 16px, which iOS Safari answers by zooming the page in \
+         on it and never zooming back out -- so the rest of the visit is spent on a page twice \
+         the width of the screen: {touch}"
+    );
+}
+
+/// `100vh` is not the height of a phone's window. It is the height that window
+/// has once the address bar has scrolled away, and this page does not scroll,
+/// so the address bar never goes.
+#[tokio::test]
+async fn the_page_is_measured_against_the_window_it_actually_has() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    assert!(
+        page.contains("viewport-fit=cover"),
+        "the page does not ask for the whole display, so `env(safe-area-inset-*)` is zero \
+         everywhere and every rule below that reads one is measuring nothing"
+    );
+
+    for (index, _) in css.match_indices("vh") {
+        let before = css[..index].chars().next_back().unwrap_or(' ');
+        assert!(
+            !before.is_ascii_digit(),
+            "a viewport height in this stylesheet is a static one, so a control bar sized against \
+             it is behind the address bar for as long as the address bar is showing: {}",
+            &css[index.saturating_sub(60)..index + 2]
+        );
+    }
+
+    let phone = media_of(
+        &css,
+        "@media (max-width: 52rem), (max-width: 60rem) and (max-height: 30rem) {",
+    );
+    let bar = rule_of(phone, ".bar");
+    assert!(
+        bar.contains("env(safe-area-inset-bottom)"),
+        "the control bar runs under the home indicator, so the press that leaves the call is the \
+         swipe that leaves the browser: {bar}"
+    );
+    assert!(
+        bar.contains("env(safe-area-inset-left)") && bar.contains("env(safe-area-inset-right)"),
+        "sideways, the notch is over one end of the control bar: {bar}"
+    );
+
+    // The same, on the rules a window too wide for any of the questions above
+    // is laid out by. A tablet held sideways is 1024 pixels across with a home
+    // indicator along the bottom of it, and it never reaches a breakpoint here.
+    for (owner, rule) in [
+        (".bar", rule_of(&css, ".bar")),
+        (".stage", rule_of(&css, ".stage")),
+        (".lobby", rule_of(&css, ".lobby")),
+    ] {
+        assert!(
+            rule.contains("env(safe-area-inset-"),
+            "`{owner}` is inset for the phone and for nothing else, so a tablet -- which is too \
+             wide for every breakpoint in this file and has the same strip along the bottom -- \
+             draws it under that strip: {rule}"
+        );
+    }
+}
+
+/// A 17.5rem column is half a phone screen and the 40dvh strip it used to
+/// become was a third of one, spent on a list the tiles underneath already
+/// show. What only the roster says has to survive that.
+#[tokio::test]
+async fn the_roster_is_one_line_on_a_phone_and_its_list_is_one_press_from_it() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let head = page
+        .split_once(r#"<header class="roster-head">"#)
+        .expect("the roster has a head")
+        .1
+        .split_once("</header>")
+        .expect("the head is closed")
+        .0;
+    assert!(
+        head.contains(r#"id="room-state""#),
+        "the connection pill is no longer on the line a phone keeps, and it is the only thing on \
+         the page that says the call is still up: {head}"
+    );
+    assert!(
+        head.contains(r#"id="people-toggle""#)
+            && head.contains(r#"aria-controls="participants""#)
+            && head.contains(r#"aria-expanded="false""#),
+        "nothing on that line opens the list, so who is in the room is unreachable on a phone: \
+         {head}"
+    );
+
+    let sheet = rule_of(&css, ".roster-sheet");
+    assert!(
+        sheet.contains("display: contents"),
+        "the wrapper the phone sheet needs is a box on a desktop as well, so the roster column is \
+         laid out by rules that were never written for it: {sheet}"
+    );
+
+    let phone = media_of(
+        &css,
+        "@media (max-width: 52rem), (max-width: 60rem) and (max-height: 30rem) {",
+    );
+    let line = rule_of(phone, ".roster");
+    assert!(
+        !line.contains("max-height"),
+        "the roster is still handed a share of the screen across the top of a phone before \
+         anybody has asked it for anything: {line}"
+    );
+    assert!(
+        phone.contains(r#".roster:not([data-people="open"]) .roster-sheet"#),
+        "the list is not put away on a phone until somebody asks for it: {phone}"
+    );
+
+    let open = rule_of(phone, r#".roster[data-people="open"] .roster-sheet"#);
+    assert!(
+        open.contains("position: absolute") && open.contains("dvh"),
+        "the list pushes the stage down instead of coming over it, so the picture -- and the \
+         control bar under it -- move under the thumb that is reaching for them: {open}"
+    );
+    assert!(
+        phone.contains(r#".roster[data-people="open"] .foot"#),
+        "the room's own address and the licence notice are only in the footer, and the footer is \
+         the first thing a narrow window turns off: {phone}"
+    );
+}
+
+/// The audio menu is a dropdown from a bar that has become something else. On a
+/// phone it is a sheet, and a sheet without a backdrop is a sheet whose
+/// dismissing press lands on whatever tile was underneath it.
+#[tokio::test]
+async fn the_audio_menu_is_a_sheet_a_thumb_can_reach() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let phone = media_of(
+        &css,
+        "@media (max-width: 52rem), (max-width: 60rem) and (max-height: 30rem) {",
+    );
+    let menu = rule_of(phone, ".menu");
+    assert!(
+        menu.contains("position: fixed") && menu.contains("bottom: 0"),
+        "the menu is still hung off the bar, which on a phone is a panel anchored to something \
+         that moves with the address bar: {menu}"
+    );
+    assert!(
+        menu.contains("env(safe-area-inset-bottom)") && menu.contains("dvh"),
+        "the sheet runs under the home indicator, or is measured against a window this browser \
+         does not have: {menu}"
+    );
+    assert!(
+        phone.contains(r#".bar[data-menu="open"]::before"#),
+        "the sheet has no backdrop, so the press that dismisses it is also a press on the tile \
+         underneath -- which is a button, and answers it: {phone}"
+    );
+
+    let toggle = body_of(&js, "\nfunction toggleMenu(");
+    assert!(
+        toggle.contains("el.bar.dataset.menu"),
+        "nothing tells the page the sheet is open, so the backdrop above is never drawn: {toggle}"
+    );
+}
+
+/// A page that scrolls sideways on a phone is a page half of whose controls are
+/// off the edge of it. Every wide thing here scrolls inside itself instead.
+#[tokio::test]
+async fn nothing_a_phone_shows_puts_a_sideways_scrollbar_on_the_page() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    for owner in [
+        "body", ".page", ".shell", ".main", ".roster", ".stage", ".bar",
+    ] {
+        let rule = rule_of(&css, owner);
+        assert!(
+            !rule.contains("overflow-x"),
+            "`{owner}` scrolls sideways, and a page that scrolls sideways on a phone is a page \
+             half of whose controls are off the edge of it: {rule}"
+        );
+    }
+
+    let bar = rule_of(&css, ".bar");
+    assert!(
+        bar.contains("flex-wrap: wrap"),
+        "the control bar does not wrap, so a control the row cannot fit is a control off the edge \
+         of the screen with no way of reaching it: {bar}"
+    );
+}
+
+/// A phone turned sideways is 844 pixels across, or 932, or 956. Every one of
+/// those is wider than the width this file calls a phone, and a layout that
+/// asked the width alone would hand the orientation a shared screen is watched
+/// in back to the desktop.
+#[tokio::test]
+async fn a_phone_turned_sideways_is_answered_by_height_because_its_width_is_a_desktop_width() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let phone = "@media (max-width: 52rem), (max-width: 60rem) and (max-height: 30rem) {";
+    assert!(
+        css.contains(phone),
+        "the phone's window is a width and nothing else, so a phone held sideways keeps a 17.5rem \
+         roster column and a control bar wrapped onto two rows in a window 390 pixels tall"
+    );
+
+    let sideways = media_of(&css, "@media (max-width: 60rem) and (max-height: 30rem) {");
+    assert!(
+        sideways.contains(".roster-head") && sideways.contains(".bar"),
+        "nothing gives the picture the lines of chrome back sideways, where there are 375 of them \
+         in total: {sideways}"
+    );
+    let beside = rule_of(
+        sideways,
+        r#"#room[data-fullscreen="off"] .stage[data-layout="share"]"#,
+    );
+    assert!(
+        beside.contains("display: grid"),
+        "a shared screen and one row of faces under it want more than 370 pixels of height, and \
+         sideways the stage has about 260 -- so stacked, the faces are simply off the bottom of \
+         the screen while 500 pixels of width sit empty beside the picture: {beside}"
+    );
+
+    // One rule for both layouts that hold a shared screen -- the selector list
+    // is asked about by its last member, which is the one a `{` follows.
+    let picture = rule_of(
+        sideways,
+        r#"#room[data-fullscreen="off"] .stage[data-main="share"] .share-view"#,
+    );
+    assert!(
+        picture.contains("aspect-ratio") && picture.contains("width: auto"),
+        "the picture sideways is sized from its width, which is the axis with room to spare: a \
+         box given a width and capped by height keeps that width and letterboxes itself inside \
+         it, and the size badge and both corner buttons are positioned against that box -- so \
+         they end up out in the black beside the picture: {picture}"
+    );
+    assert!(
+        !sideways.contains("orientation"),
+        "the question is asked as an orientation, which a desktop window 1440 by 460 answers the \
+         same way a phone does: {sideways}"
+    );
+}
+
+/// Mobile Safari answers `:hover` on a tap and leaves it answered until
+/// something else is tapped. Every hover on this page lights a border, and a
+/// lit border here means a control that is on.
+#[tokio::test]
+async fn a_finger_gets_a_press_where_a_pointer_gets_a_hover() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    // The prose comes out first: the comment that explains why the hovers were
+    // gathered says the word as often as the rules do.
+    let bare = without_comments(&css);
+    let pointer = media_of(&bare, "@media (hover: hover) {");
+    assert_eq!(
+        bare.matches(":hover").count(),
+        pointer.matches(":hover").count(),
+        "a hover lives outside the block that asks whether this pointer has one, so a finger sets \
+         it with a tap and nothing ever takes it back -- and every hover on this page lights a \
+         border, which is what a control that is on looks like"
+    );
+
+    let touch = media_of(&css, "@media (pointer: coarse), (max-width: 52rem) {");
+    assert!(
+        touch.contains(":active"),
+        "with hover gone a control answers a press with nothing at all until whatever it does has \
+         happened, which on a bad link is long enough to press it again: {touch}"
+    );
+    assert!(
+        touch.contains("touch-action: manipulation"),
+        "a second press inside a third of a second is a double-tap and a double-tap is a zoom, \
+         and muting twice quickly is an ordinary thing to do: {touch}"
+    );
+}
+
+/// Both of the phone's panels are put away with `display: none`, and
+/// `display: none` on the element holding the focus hands the focus to the
+/// document body -- from where the next Tab starts at the top of the page.
+#[tokio::test]
+async fn closing_a_panel_does_not_throw_the_keyboard_back_to_the_top_of_the_page() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let keep = body_of(&js, "\nfunction keepFocus(");
+    assert!(
+        keep.contains("contains(document.activeElement)") && keep.contains("fallback.focus()"),
+        "nothing carries the focus out of a panel that is closing: {keep}"
+    );
+
+    for (panel, holder) in [
+        ("\nfunction toggleTray(", "el.barMore"),
+        ("\nfunction togglePeople(", "el.peopleToggle"),
+    ] {
+        let body = body_of(&js, panel);
+        assert!(
+            body.contains("keepFocus(") && body.contains(holder),
+            "`{panel}` lays its panel out away without saying where the keyboard goes, so a press \
+             outside it -- which is how a sheet is usually dismissed -- loses the place: {body}"
+        );
+    }
+}

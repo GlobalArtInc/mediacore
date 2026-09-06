@@ -106,7 +106,11 @@ button:disabled {
   flex: 1;
   display: grid;
   place-items: center;
-  padding: 6vh 1.2rem 3rem;
+  /* `dvh` for the same reason the room uses it, and the insets because the page
+     asks for the whole display: sideways the notch is over one end of this card,
+     and upright the home indicator is over the bottom of it. */
+  padding: 6dvh max(1.2rem, env(safe-area-inset-right))
+    calc(3rem + env(safe-area-inset-bottom)) max(1.2rem, env(safe-area-inset-left));
   background:
     radial-gradient(70rem 34rem at 50% -18rem, #16202a 0%, transparent 62%),
     var(--ink);
@@ -225,10 +229,6 @@ select {
   color: var(--accent-ink);
 }
 
-#join:not(:disabled):hover {
-  filter: brightness(1.08);
-}
-
 .status {
   margin: 0.9rem 0 0;
   min-height: 1.2rem;
@@ -306,6 +306,66 @@ select {
 .pill[data-state="lost"] {
   color: var(--danger);
   border-color: var(--danger-line);
+}
+
+/*
+ * Two controls a wide window has no use for: the button that opens the list of
+ * people, and the one that holds the controls a phone's bar cannot fit. They
+ * are laid out away rather than marked `hidden`, because `hidden` is an
+ * attribute somebody would then have to write and unwrite on a resize -- a
+ * handler for a question the stylesheet is already answering -- and because
+ * `display: none` is also what takes a control nobody can see out of the tab
+ * order.
+ */
+.people-toggle,
+#bar-more {
+  display: none;
+}
+
+.people-toggle {
+  flex: none;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.roster[data-people="open"] .people-toggle {
+  color: var(--text);
+  border-color: #38424e;
+}
+
+.people-toggle .icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transform: rotate(180deg);
+  transition: transform 0.15s ease;
+}
+
+.roster[data-people="open"] .people-toggle .icon {
+  transform: rotate(0deg);
+}
+
+/*
+ * The list and the footer under it are one thing to move, because on a phone
+ * they travel together into a sheet over the stage. `display: contents` on
+ * every other window means the wrapper is not a box at all and the column is
+ * laid out by exactly the rules it always was -- the same trick, and for the
+ * same reason, as `.reel` further down.
+ */
+.roster-sheet {
+  display: contents;
 }
 
 .participants {
@@ -423,7 +483,6 @@ li[data-speaking="true"] .state {
   text-underline-offset: 0.2em;
 }
 
-.foot-notice:hover,
 .foot-notice:focus-visible {
   color: var(--text);
 }
@@ -442,7 +501,8 @@ li[data-speaking="true"] .state {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 1.1rem 1.2rem;
+  padding: 1.1rem max(1.2rem, env(safe-area-inset-right)) 1.1rem
+    max(1.2rem, env(safe-area-inset-left));
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -493,10 +553,6 @@ li[data-speaking="true"] .state {
   background: rgb(4 7 10 / 0.74);
   color: var(--text);
   font-size: 0.78rem;
-}
-
-.share-act:hover {
-  border-color: #38424e;
 }
 
 .share-act[aria-pressed="true"] {
@@ -1038,7 +1094,7 @@ li[data-speaking="true"] .state {
   align-items: baseline;
   justify-content: space-between;
   gap: 0.8rem;
-  margin: 0 1.2rem;
+  margin: 0 max(1.2rem, env(safe-area-inset-right)) 0 max(1.2rem, env(safe-area-inset-left));
   padding: 0.6rem 0.8rem;
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
@@ -1059,11 +1115,13 @@ li[data-speaking="true"] .state {
 }
 
 .main .alert {
-  margin: 0.6rem 1.2rem 0;
+  margin: 0.6rem max(1.2rem, env(safe-area-inset-right)) 0
+    max(1.2rem, env(safe-area-inset-left));
 }
 
 .banner {
-  margin: 0.6rem 1.2rem 0;
+  margin: 0.6rem max(1.2rem, env(safe-area-inset-right)) 0
+    max(1.2rem, env(safe-area-inset-left));
   padding: 0.65rem 0.9rem;
   background: var(--raised);
   border: 1px solid var(--warn);
@@ -1077,7 +1135,16 @@ li[data-speaking="true"] .state {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.75rem 1.2rem;
+  /*
+   * The insets are on the base rule and not only in the phone's own block,
+   * because a tablet held sideways is 1024 pixels across -- too wide for any
+   * question this file asks about phones -- with the home indicator along the
+   * bottom of it just the same, and Leave drawn under that strip is a call
+   * ended by the swipe that leaves the browser. `env()` is zero on a screen
+   * that has no such strip, so this costs a desktop nothing at all.
+   */
+  padding: 0.75rem max(1.2rem, env(safe-area-inset-right))
+    calc(0.75rem + env(safe-area-inset-bottom)) max(1.2rem, env(safe-area-inset-left));
   margin-top: 0.7rem;
   border-top: 1px solid var(--line);
   background: var(--surface);
@@ -1094,10 +1161,6 @@ li[data-speaking="true"] .state {
   color: var(--text);
   font-size: 0.85rem;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
-}
-
-.control:not(:disabled):hover {
-  border-color: #38424e;
 }
 
 .control .icon {
@@ -1241,7 +1304,7 @@ li[data-speaking="true"] .state {
   bottom: calc(100% + 0.5rem);
   z-index: 5;
   width: min(28rem, calc(100% - 2.4rem));
-  max-height: min(60vh, 34rem);
+  max-height: min(60dvh, 34rem);
   overflow-y: auto;
   padding: 1rem;
   border: 1px solid var(--line);
@@ -1444,30 +1507,424 @@ li[data-speaking="true"] .state {
   }
 }
 
-@media (max-width: 52rem) {
+/*
+ * Every hover this page has, gathered here because they are all one question --
+ * is there a pointer that can take a hover back? A finger cannot, and mobile
+ * Safari answers `:hover` on a tap anyway and leaves it answered until
+ * something else is tapped, so without this the last control pressed keeps a
+ * lit border for the rest of the call and reads as a control that is on. What a
+ * press looks like to a finger is in the block below, where it belongs.
+ */
+@media (hover: hover) {
+  .control:not(:disabled):hover,
+  .share-act:hover {
+    border-color: #38424e;
+  }
+
+  #join:not(:disabled):hover {
+    filter: brightness(1.08);
+  }
+
+  .foot-notice:hover {
+    color: var(--text);
+  }
+}
+
+/*
+ * A finger is not a cursor. 44 CSS pixels each way is the smallest target that
+ * can be hit without aiming, and every pill on this page was drawn to sit
+ * beside a mouse pointer that could hit four.
+ *
+ * The question is about the pointer and not the width, because a tablet held in
+ * two hands is a coarse pointer at 1024 pixels exactly as a phone is at 375.
+ * The width is there for the other half of it: a window dragged narrow on a
+ * machine that has a mouse gets the layout a phone gets, and a layout laid out
+ * for thumbs with targets drawn for a cursor is the worst of both.
+ */
+@media (pointer: coarse), (max-width: 52rem) {
+  /*
+   * iOS Safari zooms the whole page in when a field it is focusing has a font
+   * smaller than 16px, and it does not zoom back out when the field is left.
+   * One tap on the room name and the rest of the visit is spent on a page twice
+   * the width of the screen, scrolling sideways to find the Join button.
+   */
+  input[type="text"],
+  select {
+    font-size: 16px;
+  }
+
+  /*
+   * A pull-to-refresh in the middle of a call reloads the page, and a reloaded
+   * page has left the room. Nothing here scrolls the window itself, so there is
+   * nothing this takes away.
+   */
+  html,
+  body {
+    overscroll-behavior-y: none;
+  }
+
+  .control,
+  .share-act,
+  .share-tab,
+  .choice,
+  .switch,
+  .link-button,
+  .people-toggle,
+  .foot-notice,
+  .toggle,
+  #join {
+    min-height: 44px;
+  }
+
+  .control,
+  .share-act,
+  .people-toggle {
+    min-width: 44px;
+    justify-content: center;
+  }
+
+  .choice {
+    display: flex;
+    align-items: center;
+    padding: 0.6rem 0.8rem;
+  }
+
+  .share-tab {
+    padding: 0.5rem 0.9rem;
+  }
+
+  .link-button {
+    padding: 0.4rem 0.6rem;
+  }
+
+  .foot-notice {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* The rows are their own air now, and the gap that used to be it would put
+     the last switch below the bottom of a phone. */
+  .switches {
+    gap: 0.3rem;
+  }
+
+  .switch {
+    padding: 0.35rem 0;
+  }
+
+  /* A checkbox is 13 pixels of target in the middle of the one question the
+     lobby asks that is not a field. The label around it is the target. */
+  .toggle input {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  /*
+   * What a press looks like. With hover gone -- see the block above -- a
+   * control answers a press with nothing at all until whatever it does has
+   * happened, and on a bad link that is long enough to press it again.
+   */
+  .control:not(:disabled):active,
+  .share-act:active,
+  .share-tab:active,
+  .choice:not(:disabled):active,
+  .people-toggle:active,
+  .switch:active .switch-track {
+    border-color: #4a5764;
+  }
+
+  /* The one control here with no border to answer with. */
+  .link-button:active {
+    color: var(--text);
+  }
+
+  /*
+   * Two gestures a call does not want. A second press inside a third of a
+   * second is a double-tap, and a double-tap is a zoom -- and muting twice
+   * quickly is an ordinary thing to do, not a request to magnify the bar. A
+   * long press is a text selection, and a magnifying glass over the word
+   * "Leave" is not what the press was for. Pinch is untouched; only these
+   * controls are, and only these two gestures on them.
+   */
+  .control,
+  .share-act,
+  .share-tab,
+  .choice,
+  .switch,
+  .people-toggle,
+  .link-button,
+  #join {
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
+/*
+ * The phone, and the two windows that are one window. Narrower than 52rem is a
+ * phone held upright -- and a desktop window dragged that narrow, which gets
+ * the same answers on purpose. Shorter than 30rem while still narrower than
+ * 60rem is the same phone held sideways.
+ *
+ * That second half is not a nicety. A current phone in landscape is 844 pixels
+ * across, or 932, or 956: all of them comfortably wider than 52rem, so on the
+ * width alone a phone turned sideways would go back to a 17.5rem roster column
+ * and a control bar whose eight full-width labels wrap onto two rows -- two
+ * rows of chrome in a window 390 pixels tall, which is the orientation a shared
+ * screen is actually watched in. The 60rem bound is what keeps a short, wide
+ * desktop window out of a layout drawn for a thumb.
+ */
+@media (max-width: 52rem), (max-width: 60rem) and (max-height: 30rem) {
   .shell {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
   }
 
+  /*
+   * The roster stops being a column and becomes one line: which room this is,
+   * whether the link is up, and how many people are here. A 17.5rem column is
+   * half a phone screen, and the 40dvh strip it used to become across the top
+   * was a third of one -- spent on a list the tiles underneath are already
+   * showing, with who is speaking marked on both.
+   *
+   * What only the roster says is in the line that stays. The list itself is one
+   * press away and comes over the stage rather than pushing it down: a picture
+   * that jumps when somebody counts heads is a picture whose Leave button has
+   * moved by the time they reach for it.
+   */
   .roster {
+    position: relative;
     border-right: 0;
     border-bottom: 1px solid var(--line);
-    max-height: 40dvh;
   }
 
+  .roster-head {
+    align-items: center;
+    padding: 0.5rem max(0.8rem, env(safe-area-inset-right)) 0.5rem
+      max(0.8rem, env(safe-area-inset-left));
+    border-bottom: 0;
+  }
+
+  .roster-title h1 {
+    font-size: 1rem;
+  }
+
+  /* The count is the button that opens the list now, and the same number twice
+     across one line is one of them too many. */
+  #room-count {
+    display: none;
+  }
+
+  .people-toggle {
+    display: inline-flex;
+  }
+
+  .roster:not([data-people="open"]) .roster-sheet {
+    display: none;
+  }
+
+  .roster[data-people="open"] .roster-sheet {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 6;
+    /* The sheet spans the window, and sideways one end of the window is under
+       the notch. Its children keep their own padding on top of this. */
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: min(60dvh, 26rem);
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 18px 40px rgb(0 0 0 / 0.55);
+  }
+
+  /* The room's address and the licence notice were simply unreachable on a
+     phone, because the footer holding them was the first thing a narrow window
+     turned off. Inside the sheet there is room for both. */
   .foot {
     display: none;
   }
 
-  .stage,
-  .bar {
-    padding-left: 0.8rem;
-    padding-right: 0.8rem;
+  .roster[data-people="open"] .foot {
+    display: flex;
   }
 
+  .stage {
+    padding: 0.8rem max(0.8rem, env(safe-area-inset-right)) 0.8rem
+      max(0.8rem, env(safe-area-inset-left));
+  }
+
+  /*
+   * Two things about the bottom of a phone's window in one rule, and both of
+   * them are the same lesson.
+   *
+   * The height this bar is measured against is `dvh` and never `vh`: `vh` is
+   * the height the window has once the address bar has scrolled away, so a room
+   * sized in it is taller than the screen for as long as the address bar is
+   * showing -- and this page does not scroll, so the bar never goes, and mute
+   * and leave sit behind it for the whole call.
+   *
+   * `env(safe-area-inset-bottom)` is the home indicator. Without it Leave is
+   * drawn under the strip a phone reserves for the swipe that leaves the
+   * browser, so the press that ends the call is the press that hides it.
+   */
+  .bar {
+    margin-top: 0.5rem;
+    padding: 0.55rem max(0.8rem, env(safe-area-inset-right))
+      calc(0.55rem + env(safe-area-inset-bottom)) max(0.8rem, env(safe-area-inset-left));
+  }
+
+  .notice {
+    margin: 0 max(0.8rem, env(safe-area-inset-right)) 0 max(0.8rem, env(safe-area-inset-left));
+  }
+
+  .main .alert,
+  .banner {
+    margin: 0.5rem max(0.8rem, env(safe-area-inset-right)) 0
+      max(0.8rem, env(safe-area-inset-left));
+  }
+
+  /*
+   * The audio menu becomes a sheet along the bottom, where the thumb already
+   * is. It is fixed to the window rather than hung off the bar because it is
+   * taller than the bar has above it, and because a panel anchored to something
+   * that moves with the address bar arrives with its head off the top of the
+   * screen.
+   */
   .menu {
-    left: 0.8rem;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    width: auto;
+    max-height: min(80dvh, 32rem);
+    border-radius: var(--radius) var(--radius) 0 0;
+    padding: 1rem max(1rem, env(safe-area-inset-right))
+      calc(1rem + env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+  }
+
+  /*
+   * The sheet's backdrop, drawn off the bar because it has to cover the bar as
+   * well: a sheet somebody can reach past to press Leave is a sheet somebody
+   * will reach past to press Leave. A press lands on this element, which is
+   * outside the menu, so the page closes the sheet and nothing underneath it
+   * ever hears the press -- which is the whole point, because underneath it is
+   * a grid of tiles that all answer one.
+   */
+  .bar[data-menu="open"]::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 29;
+    background: rgb(4 7 10 / 0.6);
+  }
+
+  /* The way out of a sheet has to be on the screen the whole time it is open:
+     this one is a long way down a scrolling panel, and a reader who has scrolled
+     to the noise notes should not have to scroll back to leave. */
+  .menu-foot {
+    position: sticky;
+    bottom: calc(-1rem - env(safe-area-inset-bottom));
+    margin-top: 0.3rem;
+    padding: 0.7rem 0 calc(1rem + env(safe-area-inset-bottom));
+    background: var(--surface);
+  }
+
+  #audio-close {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+  }
+
+  /*
+   * Two people are two big tiles down the screen; four are a grid. Which it is
+   * has to be counted rather than measured, because both answers fit: at 375
+   * pixels a two-column grid of a two-person call is two thumbnails adrift in a
+   * black stage, and a column of a six-person call is four people below the
+   * fold. A browser too old for `:has` gets the column, which is the one that
+   * is merely inconvenient.
+   *
+   * Not while a screen is being shared. There the tiles are not the thing being
+   * looked at, and the compact grid keeps them small. It is excluded here by
+   * name rather than left to outrank this, because it does not: `:has()` counts
+   * for as much as an attribute does, so the rule below would have quietly won
+   * and handed a shared screen a strip of half-width faces underneath it.
+   */
+  .cards:not([data-compact="true"]) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.6rem;
+  }
+
+  .cards:not([data-compact="true"]):has(> li:nth-child(3)) {
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  }
+
+  /* Two targets a finger can hit, over a picture drawn for a window with room
+     for a column beside it. */
+  .stage[data-layout="focus"][data-main="person"] .reel .share {
+    width: 14rem;
+  }
+
+  /*
+   * The shared screen put in the middle, in a window taller than it is wide.
+   * Focus gives the middle everything the stage has, and on a desktop what it
+   * has is close enough to 16:9 that the picture fills it. Here it is 349 by
+   * 434: the picture is 349 by 197 and the remaining 237 are a black field with
+   * the frame's border, the size badge and both corner buttons drawn around it
+   * rather than on it.
+   *
+   * So the picture keeps its shape and the view shrinks to it -- which is what
+   * puts the badge and the buttons back on the picture, because the view is the
+   * box they are positioned against -- and the pair sits in the middle of what
+   * focus gave them. Sideways this is the other way round and lives in the
+   * block below: there it is the height that runs out first.
+   */
+  .stage[data-layout="focus"][data-main="share"] .share {
+    justify-content: center;
+  }
+
+  .stage[data-layout="focus"][data-main="share"] .share-view {
+    flex: none;
+  }
+
+  .stage[data-layout="focus"][data-main="share"] .share-frame {
+    height: auto;
+    aspect-ratio: 16 / 9;
+    max-height: 100%;
+  }
+
+  /* The pills on the picture keep their names for a screen reader and lose them
+     for the eye: two words each is a third of the width of a shared screen on a
+     phone, laid over the part of it somebody is trying to read. */
+  .share-act .act-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  /* Sideways, the notch is at one end of the picture and everything drawn in a
+     corner of it is under the notch. */
+  #room[data-fullscreen]:not([data-fullscreen="off"]) .share-foot {
+    padding: 0.4rem max(0.8rem, env(safe-area-inset-right)) 0
+      max(0.8rem, env(safe-area-inset-left));
+  }
+
+  #room[data-fullscreen]:not([data-fullscreen="off"]) .share-stats {
+    left: max(0.9rem, env(safe-area-inset-left));
+  }
+
+  #room[data-fullscreen]:not([data-fullscreen="off"]) .share-acts {
+    right: max(0.9rem, env(safe-area-inset-right));
   }
 
   /* Hidden from the eye, kept for the screen reader: a control with no
@@ -1492,6 +1949,234 @@ li[data-speaking="true"] .state {
     margin: 0;
     overflow: visible;
     clip-path: none;
+  }
+}
+
+/*
+ * Eight controls do not go across 375 pixels. At the 44 apiece the smallest of
+ * them may be they come to more than the screen is wide before a single gap
+ * between them, and every way of keeping all eight in the row ends badly: drawn
+ * smaller they cannot be hit, and scrolled sideways Leave is somewhere you have
+ * to go looking for it, past the mute button, during the moment you wanted to
+ * leave.
+ *
+ * So the bar keeps the four a call is actually made of -- the microphone, the
+ * camera, this button and Leave -- and `More` holds the rest, as full-width
+ * rows carrying the names they never had room for beside a cursor. Nothing is
+ * dropped and nothing is a press further away than that.
+ *
+ * This is a width and not a phone. The same phone held sideways is 812 pixels
+ * across, which is room for all eight at once, so sideways it gets all eight.
+ */
+@media (max-width: 34rem) {
+  .bar {
+    gap: 0.5rem;
+    justify-content: space-between;
+  }
+
+  #bar-more {
+    display: inline-flex;
+  }
+
+  /* Above the row rather than below it: a panel that opens downwards on a phone
+     opens off the bottom of the screen. */
+  #audio-settings,
+  #noise,
+  #share-screen,
+  #bench-toggle {
+    order: -1;
+    flex-basis: 100%;
+    justify-content: flex-start;
+    border-radius: var(--radius);
+  }
+
+  .bar:not([data-more="open"]) #audio-settings,
+  .bar:not([data-more="open"]) #noise,
+  .bar:not([data-more="open"]) #share-screen,
+  .bar:not([data-more="open"]) #bench-toggle {
+    display: none;
+  }
+
+  /* A row the width of the screen has room for the word, and a row with an icon
+     and no word is a guess. */
+  #share-screen .control-label,
+  #bench-toggle .control-label,
+  #bar-more .control-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip-path: none;
+  }
+
+  /* Which engine is running, at the end of its own row. */
+  #noise .control-sub {
+    margin-left: auto;
+    border-left: 0;
+  }
+
+  /* Leave keeps the far end to itself. The gap either side of a control that
+     cannot be undone is the point of it. */
+  #leave {
+    margin-left: 0;
+  }
+}
+
+/*
+ * A phone held sideways: the second half of the window above, tightened. It is
+ * where a shared screen is actually watched, and it is 375 to 440 pixels tall
+ * with the browser's own bar already taking some of them. Every line of chrome
+ * here is a line off the picture, so the room's own line is as thin as it can
+ * be read at and the bar gives up the air around it.
+ *
+ * The same 60rem bound, and for the same reason: without it a desktop window
+ * that happens to be short and wide loses the picture to a cap written for a
+ * screen four times smaller.
+ */
+@media (max-width: 60rem) and (max-height: 30rem) {
+  .roster-head {
+    padding-top: 0.3rem;
+    padding-bottom: 0.3rem;
+  }
+
+  .roster-title h1 {
+    font-size: 0.92rem;
+  }
+
+  .roster[data-people="open"] .roster-sheet {
+    max-height: 72dvh;
+  }
+
+  .stage {
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    gap: 0.6rem;
+  }
+
+  /*
+   * A shared screen and the faces beside it rather than under them.
+   *
+   * Sideways there is width and there is no height. 812 by 375, with a line of
+   * roster and a control bar in it, leaves about 260 pixels for the stage --
+   * and a 16:9 picture with one row of faces underneath needs more than 370 of
+   * them. Stacked, one of the two has to give: either the picture shrinks to a
+   * postage stamp or the faces fall off the bottom edge, and the second is what
+   * was actually happening.
+   *
+   * So sideways they stand side by side, which is what the 500 spare pixels of
+   * width were for. Nothing is moved in the document to do it: `.reel` is
+   * `display: contents` here as everywhere else, so the shared screen and the
+   * tiles are the stage's own children and the grid simply places them -- which
+   * is the reason that wrapper exists at all.
+   */
+  #room[data-fullscreen="off"] .stage[data-layout="share"] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  #room[data-fullscreen="off"] .stage[data-layout="share"] .share {
+    min-height: 0;
+  }
+
+  /*
+   * Here the picture is sized from its height and not from its width, because
+   * sideways the height is what runs out first. A box given a width and capped
+   * by height keeps every pixel of that width and letterboxes itself inside it,
+   * and the size badge and the two corner buttons are positioned against this
+   * box -- so they would sit out in the black rather than on the picture.
+   * Handing it a definite height and an aspect ratio with the width left `auto`
+   * makes the box the size of the picture instead.
+   *
+   * `[data-main="share"]` is the focus layout, where the shared screen is what
+   * somebody put in the middle. It is here rather than beside its own rules
+   * because it is the same sentence: upright the width runs out and the block
+   * above sizes the picture from it, sideways the height does and this sizes it
+   * from that. Written the other way round, a 16:9 picture drawn to the width
+   * of a landscape window is 460 pixels tall in a stage with 289 -- and
+   * centred, so it hangs off both ends of it.
+   */
+  #room[data-fullscreen="off"] .stage[data-layout="share"] .share-view,
+  #room[data-fullscreen="off"] .stage[data-main="share"] .share-view {
+    flex: 1;
+    min-height: 0;
+    align-self: center;
+    width: auto;
+    max-width: 100%;
+    aspect-ratio: 16 / 9;
+  }
+
+  #room[data-fullscreen="off"] .stage[data-layout="share"] .share-frame,
+  #room[data-fullscreen="off"] .stage[data-main="share"] .share-frame {
+    height: 100%;
+    width: 100%;
+    max-height: none;
+    aspect-ratio: auto;
+  }
+
+  /*
+   * The faces beside it. The width is on the tiles and the track is `auto`, not
+   * the other way round, so that a room with nobody else in it -- where the
+   * tiles are `hidden`, and a hidden element is not a grid item at all --
+   * collapses the track rather than leaving a 15rem hole beside the picture.
+   */
+  #room[data-fullscreen="off"] .stage[data-layout="share"] .cards[data-compact="true"] {
+    width: 15rem;
+    min-height: 0;
+    overflow-y: auto;
+    align-content: start;
+    grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+  }
+
+  .bar {
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    padding-bottom: calc(0.4rem + env(safe-area-inset-bottom));
+  }
+
+  /*
+   * Focus goes back to a column beside the middle rather than a strip beneath
+   * it. The strip is what a window too narrow for two columns gets, and its
+   * reason is written at 64rem above: with a roster column on one side and a
+   * strip on the other, a 1024-pixel window has about 300 left for the thing
+   * somebody asked to look at.
+   *
+   * Sideways neither half of that holds. The roster is a line across the top
+   * and has taken no width at all, so a 12rem column still leaves 630 for the
+   * middle -- and the height, which is the one thing there is none of, is what
+   * the strip was spending: 150 pixels of it, off a stage that had 289. Focused
+   * on the shared screen that left a picture 90 pixels across.
+   */
+  .stage[data-layout="focus"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 12rem);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel,
+  .stage[data-layout="focus"][data-main="share"] .cards {
+    grid-area: 1 / 2;
+  }
+
+  .stage[data-layout="focus"] .cards {
+    grid-auto-flow: row;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel {
+    flex-direction: column;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel .share {
+    width: auto;
+  }
+
+  .stage[data-layout="focus"][data-main="share"] .cards {
+    overflow-x: hidden;
+    overflow-y: auto;
   }
 }
 

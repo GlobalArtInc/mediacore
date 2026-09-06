@@ -859,7 +859,9 @@ camera, the bench and leave. The noise control is one button naming the engine t
 pressing it steps through the values on offer — and the audio menu behind the chooser holds the
 same setting as a radio group with a sentence about each. When somebody is sharing a screen it takes the main area and the participants
 shrink to a strip beneath it; when nobody is, the participants fill it. Two people with the same
-name keep the last four characters of their identity beside it, as they always have.
+name keep the last four characters of their identity beside it, as they always have. That is the
+shape on a window with room for it; "On a phone" below is the same room on a screen 375 pixels
+across, which is where most of these calls are actually taken.
 
 ### Putting one thing in the middle
 
@@ -1016,6 +1018,114 @@ the audio menu and returns focus to the button that opened it. `prefers-reduced-
 The bench is one press away rather than always on, and while it is open **it owns the video**: the
 bench tiles attach the tracks and the stage does not. A track attached in two places is a track
 either renderer can detach from under the other, so only one of them ever holds it.
+
+### On a phone
+
+A phone is not a narrow desktop. It is 375 pixels across, a thumb rather than a cursor, a window
+whose height changes as the address bar comes and goes, and a strip along the bottom that belongs to
+the operating system rather than to the page. Every answer below is a question of size and pointer
+that the stylesheet asks for itself -- nothing is sniffed, nothing is remembered, and a window
+dragged narrow on a desktop gets exactly what the phone gets.
+
+**A phone is two windows, and the second one is not narrow.** Upright it is 375 or 390 pixels
+across, which any question about width finds. Turned sideways the same phone is 844 pixels across,
+or 932, or 956 -- wider than a good many laptop windows -- and 390 pixels tall. So the page asks
+about width *or* about height: narrower than 52rem, or shorter than 30rem while still narrower than
+60rem. Without the second half a phone held sideways goes back to the desktop layout, and the
+desktop layout in a window 390 pixels tall is a 17.5rem roster column and a control bar wrapped onto
+two rows. The 60rem bound is what keeps a short, wide desktop window out of a layout drawn for a
+thumb.
+
+**The bar keeps four controls and `More` holds the rest.** Eight of them across 375 pixels is 352
+pixels of button before a single gap between them, at the 44 each that a finger needs, and both ways
+of keeping all eight are worse than moving four: drawn smaller they cannot be hit, and scrolled
+sideways Leave is something you go looking for at the moment you wanted to leave. So the row is the
+microphone, the camera, `More` and Leave -- Leave at the far end with a gap of its own, because the
+one control here that cannot be undone should not be beside the one that is pressed most. Behind
+`More`, as full-width rows carrying the names they never had room for beside a cursor, are the audio
+menu, the noise control, screen share and the bench. Nothing is dropped, and nothing is more than
+one press further away than it was. `More` is a width and nothing else, and it is the one question
+here that stays a pure width: the same phone held sideways has room for all eight at once, so
+sideways there is no `More` and all eight are in the row.
+
+**Which four is not an arbitrary choice.** The microphone and Leave are what a call is; the camera
+is the one thing on a phone that is reached for during it. Screen share is the one that moves,
+because no phone browser hands a web page a screen to capture at all -- on iOS and on Android the
+control is there and disabled, saying so, which is what this page does everywhere rather than hiding
+what a browser will not do. The noise control moves and loses nothing, because the menu behind
+`More` carries the same setting as a radio group with a sentence about each engine.
+
+**The roster is one line**: the room's name, the connection pill, and a count that is a button. A
+17.5rem column is half a phone screen, and the strip it used to become across the top was 40dvh --
+a third of the screen, spent on a list the tiles underneath are already showing, with who is
+speaking marked on both. What only the roster says stays on that line, and the pill is the whole
+reason: on a phone it is the only thing on the page that says the call is still up.
+
+**The list comes over the stage rather than pushing it down.** Pressing the count opens it as a
+sheet under the line, with the room's own address and the licence notice at the bottom of it --
+both of which were simply unreachable on a phone before, because the footer holding them was the
+first thing a narrow window turned off. It comes over the stage because a picture that jumps when
+somebody counts heads is a picture whose Leave button has moved by the time they reach for it.
+
+**The audio menu is a sheet along the bottom**, where the thumb already is, with the way out of it
+kept on the screen while the panel behind it scrolls. It is fixed to the window rather than hung off
+the bar, because a panel anchored to something that moves with the address bar arrives with its head
+off the top of the screen. It has a backdrop, and the backdrop covers the control bar as well: a
+sheet somebody can reach past to press Leave is a sheet somebody will reach past to press Leave, and
+under a sheet drawn over the stage every tile is a button that answers a press.
+
+**Every viewport height is a `dvh` and the bar is inset for the home indicator.** `100vh` is not the
+height of a phone's window: it is the height that window has once the address bar has scrolled away,
+and this page does not scroll, so the address bar never goes and a bar measured in `vh` spends the
+call behind it. `env(safe-area-inset-bottom)` is the other half -- the page asks for the whole
+display with `viewport-fit=cover`, so without the inset Leave is drawn under the strip a swipe
+leaves the browser by, and the press that ends the call is the press that hides it. Sideways, the
+same is true of the notch at one end: the roster's line, the stage, the bar and everything drawn in
+a corner of a fullscreen picture are held off it by `env(safe-area-inset-left)` and its opposite.
+
+The insets are on the ordinary rules and not only inside the phone's own block, because a tablet held
+sideways is 1024 pixels across -- too wide for any question this file asks about phones -- with the
+same strip along the bottom of it. `env()` is zero on a screen that has no such strip, so a desktop
+pays nothing for them.
+
+**A finger has no hover, and mobile Safari answers `:hover` anyway.** It sets it on a tap and leaves
+it set until something else is tapped, and every hover on this page lights a border -- which is what
+a control that is *on* looks like here. So the four rules that answer a hover are inside a question
+about whether this pointer has one, and a press gets its own answer instead. Two gestures are turned
+off on the controls and nowhere else: the double-tap, because a second press inside a third of a
+second is a zoom and muting twice quickly is an ordinary thing to do, and the long press, because a
+magnifying glass over the word "Leave" is not what that press was for. Pinch is untouched.
+
+**Sideways is the case that matters most**, because sideways is how a shared screen is watched, and
+it is 375 to 440 pixels of height with a browser's own bar already in some of them. There the room's
+line is as thin as it can be read at and the bar gives up the air around it -- and, more than either,
+**the room turns through ninety degrees with the phone**. Upright the stage is a column: a picture
+with faces underneath it. Sideways that does not fit and never did -- a stage with about 260 pixels
+in it cannot hold a 16:9 picture and a row of faces, which want more than 370 between them, so one
+of the two goes over the edge. So sideways they stand side by side, which is what the 500 spare
+pixels of width were for: the picture takes the height the window has and whatever width 16:9 makes
+of that, and the faces are a column beside it. Focus does the same thing for the same reason -- the
+strip that runs along the bottom of a narrow window goes back to being a column on the right, because
+that strip's whole argument was about width, and sideways width is the one thing there is plenty of.
+
+**Which way a picture is measured is a question about which axis runs out first**, and it has two
+answers here because the phone has two shapes. Upright the width runs out: the picture is drawn to
+the width it has and its height follows. Sideways the height runs out, so the picture is given the
+height and its width follows. Getting it the wrong way round does not clip anything -- it letterboxes
+instead, and the frame's border, the size badge and the two corner buttons stay around the whole box
+rather than on the picture, which is how you can see at a glance that it is wrong.
+
+**The rest of the stage is the shape it was.** Grid, share, focus and both fullscreens are the same
+four layouts reached by the same conditions; nothing is added and nothing is taken away. What changes
+is the size of what is in them: two tiles across instead of one, and the pills in the corner of a
+picture keeping their names for a screen reader and losing them for the eye, because two words each
+is a third of the width of a shared screen on a phone laid over the part somebody is trying to read.
+
+**The bench stays.** It is a table of numbers and the temptation is to call it a desktop thing, but
+it is the one view that answers *why is this call bad*, and a call is bad on a phone more often than
+it is anywhere else. It needs nothing: the link panel is two columns instead of five, the tiles are
+one, and every one of them scrolls inside the stage rather than putting a sideways scrollbar on the
+page. Nothing on this page ever does that, at any width, and there is a test that says so.
 
 ## What the page shows
 

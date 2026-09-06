@@ -152,6 +152,9 @@ const el = {
   roomCount: document.getElementById("room-count"),
   roomState: document.getElementById("room-state"),
   roomError: document.getElementById("room-error"),
+  roster: document.getElementById("roster"),
+  peopleToggle: document.getElementById("people-toggle"),
+  peopleCount: document.getElementById("people-count"),
   participants: document.getElementById("participants"),
   stage: document.getElementById("stage"),
   spotlight: document.getElementById("spotlight"),
@@ -198,6 +201,8 @@ const el = {
   camera: document.getElementById("camera"),
   cameraLabel: document.getElementById("camera-label"),
   benchToggle: document.getElementById("bench-toggle"),
+  bar: document.getElementById("bar"),
+  barMore: document.getElementById("bar-more"),
   leave: document.getElementById("leave"),
   audio: document.getElementById("audio"),
   footUrl: document.getElementById("foot-url"),
@@ -323,6 +328,8 @@ async function start() {
   document.addEventListener("fullscreenchange", onFullscreenChange);
   el.camera.addEventListener("click", onCamera);
   el.benchToggle.addEventListener("click", onBenchToggle);
+  el.barMore.addEventListener("click", () => toggleTray());
+  el.peopleToggle.addEventListener("click", () => togglePeople());
   el.leave.addEventListener("click", () => leave("You left the room."));
   el.enableAudio.addEventListener("click", onEnableAudio);
   el.noticeDismiss.addEventListener("click", () => clearNotice());
@@ -750,6 +757,8 @@ async function leave(reason) {
   layoutStage({ mode: "grid", main: null });
   paintFocusControl();
   toggleMenu(false);
+  toggleTray(false);
+  togglePeople(false);
   clearNotice();
   el.room.hidden = true;
   el.lobby.hidden = false;
@@ -996,11 +1005,76 @@ function toggleMenu(open) {
   el.audioMenu.hidden = !next;
   el.audioSettings.setAttribute("aria-expanded", String(next));
   el.audioSettings.dataset.on = String(next);
+  // A phone shows this menu as a sheet across the bottom of the window, and
+  // the stylesheet draws the sheet a backdrop off this. It is on the bar
+  // rather than on the menu because the backdrop has to cover the bar too:
+  // a tap that lands on a control while a sheet is open is a tap somebody
+  // meant for the sheet.
+  el.bar.dataset.menu = next ? "open" : "shut";
   if (!next) return;
 
   paintDevices();
   el.micSelect.focus();
   if (media) media.listMicrophones().then(paintDevices);
+}
+
+/**
+ * The controls that do not fit across a phone. Four of the eight stay in the
+ * bar -- the microphone, the camera, this button and Leave -- and the rest are
+ * rows above it, one press away, with the names they never had room for on a
+ * desktop. Nothing here paints a control: they are the same buttons, in the
+ * same bar, carrying the same state they were painted with.
+ */
+function toggleTray(open) {
+  const next = open === undefined ? el.bar.dataset.more !== "open" : open;
+  el.bar.dataset.more = next ? "open" : "shut";
+  el.barMore.setAttribute("aria-expanded", String(next));
+  el.barMore.dataset.on = String(next);
+  if (!next) keepFocus(el.bar, el.barMore);
+}
+
+/**
+ * The list of who is here. It is the column it always was on a desktop, where
+ * this button is not drawn at all; on a phone the column is one line -- the
+ * room, the connection pill and this count -- and the list comes over the
+ * stage rather than pushing it down, because the picture must not move under
+ * a thumb that is reaching for something else.
+ */
+function togglePeople(open) {
+  const next = open === undefined ? el.roster.dataset.people !== "open" : open;
+  el.roster.dataset.people = next ? "open" : "shut";
+  el.peopleToggle.setAttribute("aria-expanded", String(next));
+  if (!next) keepFocus(el.roster, el.peopleToggle);
+  paintPeople();
+}
+
+/**
+ * A panel closing under the keyboard. Both of these are put away with
+ * `display: none`, and `display: none` on the element that has the focus hands
+ * the focus to `document.body` -- from where the next Tab starts at the top of
+ * the page. Whoever was inside gets the button that holds it instead. Pressing
+ * outside the panel is the same story with a pointer, which is why this lives
+ * here rather than beside the Escape key.
+ */
+function keepFocus(within, fallback) {
+  if (within.contains(document.activeElement)) fallback.focus();
+}
+
+/**
+ * On a phone the count is the control that opens the list, so it says both the
+ * number and what pressing it does -- a button named "3 people" tells a screen
+ * reader nothing about what happens next. The number is read off the list
+ * itself, which `render` has just written.
+ */
+function paintPeople() {
+  const count = el.participants.children.length;
+  const many = count === 1 ? "Just you" : `${count} people`;
+  const open = el.roster.dataset.people === "open";
+  el.peopleCount.textContent = many;
+  el.peopleToggle.setAttribute(
+    "aria-label",
+    `${many} in the room. Press to ${open ? "hide" : "show"} the list.`,
+  );
 }
 
 function onKeydown(event) {
@@ -1009,6 +1083,21 @@ function onKeydown(event) {
   if (!el.audioMenu.hidden) {
     toggleMenu(false);
     el.audioSettings.focus();
+    return;
+  }
+
+  // The two panels a narrow window opens over the room, in the order they are
+  // stacked and one press each. Neither is ever open on a desktop, where both
+  // buttons are laid out away, so this costs a wide window nothing.
+  if (el.bar.dataset.more === "open") {
+    toggleTray(false);
+    el.barMore.focus();
+    return;
+  }
+
+  if (el.roster.dataset.people === "open") {
+    togglePeople(false);
+    el.peopleToggle.focus();
     return;
   }
 
@@ -1037,6 +1126,21 @@ function onKeydown(event) {
 }
 
 function onPointerDown(event) {
+  // The tray survives a press inside the menu it opens: the menu is a sheet
+  // over the bar, and closing the tray under it would leave the button the
+  // menu hands focus back to laid out away.
+  if (
+    el.bar.dataset.more === "open" &&
+    !el.bar.contains(event.target) &&
+    !el.audioMenu.contains(event.target)
+  ) {
+    toggleTray(false);
+  }
+
+  if (el.roster.dataset.people === "open" && !el.roster.contains(event.target)) {
+    togglePeople(false);
+  }
+
   if (el.audioMenu.hidden) return;
   if (el.audioMenu.contains(event.target) || el.audioSettings.contains(event.target)) return;
   toggleMenu(false);
@@ -1299,6 +1403,7 @@ function render() {
   );
   el.roomCount.textContent =
     people.length === 1 ? "Just you so far." : `${people.length} people in the room.`;
+  paintPeople();
 
   const shares = screenShares(people, labels);
   const step = nextShare(pinnedShare, shares, { link: linkState(), now: performance.now() });

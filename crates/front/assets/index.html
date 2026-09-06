@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0c0f" />
     <title>MediaCore</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
@@ -74,6 +75,11 @@
         <rect x="3" y="5" width="11" height="14" rx="2" />
         <rect x="16" y="5" width="5" height="6" rx="1.5" />
         <rect x="16" y="13" width="5" height="6" rx="1.5" />
+      </symbol>
+      <symbol id="icon-more" viewBox="0 0 24 24">
+        <path d="M5 12h.01" stroke-width="2.4" />
+        <path d="M12 12h.01" stroke-width="2.4" />
+        <path d="M19 12h.01" stroke-width="2.4" />
       </symbol>
       <symbol id="icon-grid" viewBox="0 0 24 24">
         <rect x="3" y="4" width="8" height="7" rx="1.5" />
@@ -148,23 +154,35 @@
       </section>
 
       <div id="room" class="shell" data-fullscreen="off" hidden>
-        <aside class="roster" aria-label="People in the room">
+        <aside id="roster" class="roster" aria-label="People in the room" data-people="shut">
           <header class="roster-head">
             <div class="roster-title">
               <h1 id="room-name">&hellip;</h1>
               <p id="room-count" class="lede">&hellip;</p>
             </div>
             <span id="room-state" class="pill">connecting</span>
+            <button
+              id="people-toggle"
+              class="people-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="participants"
+            >
+              <span id="people-count" class="people-count">&hellip;</span>
+              <svg class="icon" aria-hidden="true"><use href="#icon-chevron" /></svg>
+            </button>
           </header>
 
-          <ul id="participants" class="participants"></ul>
+          <div class="roster-sheet">
+            <ul id="participants" class="participants"></ul>
 
-          <footer class="foot">
-            <span id="foot-url"></span>
-            <a class="foot-notice" href="/NOTICE.txt" target="_blank" rel="noopener"
-              >third-party notices</a
-            >
-          </footer>
+            <footer class="foot">
+              <span id="foot-url"></span>
+              <a class="foot-notice" href="/NOTICE.txt" target="_blank" rel="noopener"
+                >third-party notices</a
+              >
+            </footer>
+          </div>
         </aside>
 
         <div class="main">
@@ -319,7 +337,7 @@
               </div>
             </div>
 
-            <div class="bar" role="group" aria-label="Call controls">
+            <div class="bar" id="bar" role="group" aria-label="Call controls" data-more="shut">
               <button id="mute" class="control" type="button" aria-pressed="false">
                 <svg class="icon" aria-hidden="true"><use href="#icon-mic" /></svg>
                 <span class="control-label" id="mute-label">Mute</span>
@@ -362,6 +380,18 @@
               >
                 <svg class="icon" aria-hidden="true"><use href="#icon-gauge" /></svg>
                 <span class="control-label">Bench</span>
+              </button>
+
+              <button
+                id="bar-more"
+                class="control more"
+                type="button"
+                aria-expanded="false"
+                aria-controls="audio-settings noise share-screen bench-toggle"
+                aria-label="The rest of the call controls"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-more" /></svg>
+                <span class="control-label">More</span>
               </button>
 
               <button id="leave" class="control danger" type="button" aria-label="Leave the room">
