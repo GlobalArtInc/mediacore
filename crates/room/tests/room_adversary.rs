@@ -3,14 +3,14 @@
 //! first; they assert the fixed behaviour now, and the messages say what a
 //! person loses when one of them goes red again.
 
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_room::*;
 
 fn spec(identity: &str) -> ParticipantSpec {
     ParticipantSpec {
         identity: identity.to_owned(),
         name: identity.to_owned(),
-        permission: livekit::ParticipantPermission {
+        permission: mediacore::ParticipantPermission {
             can_subscribe: true,
             can_publish: true,
             ..Default::default()
@@ -19,20 +19,20 @@ fn spec(identity: &str) -> ParticipantSpec {
     }
 }
 
-fn leaves(rx: &mut SignalRx) -> Vec<livekit::LeaveRequest> {
+fn leaves(rx: &mut SignalRx) -> Vec<mediacore::LeaveRequest> {
     let mut requests = Vec::new();
     while let Ok(response) = rx.try_recv() {
-        if let Some(livekit::signal_response::Message::Leave(request)) = response.message {
+        if let Some(mediacore::signal_response::Message::Leave(request)) = response.message {
             requests.push(request);
         }
     }
     requests
 }
 
-fn updates(rx: &mut SignalRx) -> Vec<livekit::ParticipantInfo> {
+fn updates(rx: &mut SignalRx) -> Vec<mediacore::ParticipantInfo> {
     let mut infos = Vec::new();
     while let Ok(response) = rx.try_recv() {
-        if let Some(livekit::signal_response::Message::Update(update)) = response.message {
+        if let Some(mediacore::signal_response::Message::Update(update)) = response.message {
             infos.extend(update.participants);
         }
     }
@@ -157,7 +157,7 @@ fn a_participant_hidden_by_the_api_leaves_everybody_elses_roster() {
         .update_participant(
             "bob",
             ProfileUpdate {
-                permission: Some(livekit::ParticipantPermission {
+                permission: Some(mediacore::ParticipantPermission {
                     can_subscribe: true,
                     can_publish: true,
                     hidden: true,
@@ -177,7 +177,7 @@ fn a_participant_hidden_by_the_api_leaves_everybody_elses_roster() {
     assert_eq!(told[0].identity, "bob");
     assert_eq!(
         told[0].state,
-        livekit::participant_info::State::Disconnected as i32,
+        mediacore::participant_info::State::Disconnected as i32,
         "a roster only ever loses somebody on a DISCONNECTED update; anything else leaves a tile \
          on the screen for a participant the room is not supposed to show"
     );

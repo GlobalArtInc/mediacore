@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -11,7 +11,7 @@ pub enum ClientError {
     #[error("signalling connection is closed")]
     Closed,
     #[error("server disconnected us: {0:?}")]
-    Disconnected(livekit::DisconnectReason),
+    Disconnected(mediacore::DisconnectReason),
     #[error("undecodable signal response: {0}")]
     Decode(#[from] prost::DecodeError),
     #[error("timed out waiting for {0}")]

@@ -1,4 +1,4 @@
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use str0m::media::MediaKind;
 
 use crate::media::MediaProfile;
@@ -18,10 +18,10 @@ impl TrackKind {
         }
     }
 
-    pub(crate) fn track_type(self) -> livekit::TrackType {
+    pub(crate) fn track_type(self) -> mediacore::TrackType {
         match self {
-            TrackKind::Audio => livekit::TrackType::Audio,
-            TrackKind::Video => livekit::TrackType::Video,
+            TrackKind::Audio => mediacore::TrackType::Audio,
+            TrackKind::Video => mediacore::TrackType::Video,
         }
     }
 }
@@ -31,7 +31,7 @@ pub struct TrackSpec {
     pub cid: String,
     pub name: String,
     pub kind: TrackKind,
-    pub source: livekit::TrackSource,
+    pub source: mediacore::TrackSource,
     pub stream_id: String,
     pub profile: MediaProfile,
     pub layers: Vec<LayerSpec>,
@@ -45,7 +45,7 @@ impl TrackSpec {
             stream_id: new_stream_id(),
             name,
             kind: TrackKind::Audio,
-            source: livekit::TrackSource::Microphone,
+            source: mediacore::TrackSource::Microphone,
             profile: MediaProfile::opus(),
             layers: Vec::new(),
         }
@@ -58,7 +58,7 @@ impl TrackSpec {
             stream_id: new_stream_id(),
             name,
             kind: TrackKind::Video,
-            source: livekit::TrackSource::Camera,
+            source: mediacore::TrackSource::Camera,
             profile: MediaProfile::vp8(),
             layers: Vec::new(),
         }
@@ -98,7 +98,7 @@ impl TrackSpec {
         self
     }
 
-    pub fn with_source(mut self, source: livekit::TrackSource) -> Self {
+    pub fn with_source(mut self, source: mediacore::TrackSource) -> Self {
         self.source = source;
         self
     }
@@ -108,22 +108,22 @@ impl TrackSpec {
         self
     }
 
-    pub fn to_request(&self) -> livekit::AddTrackRequest {
+    pub fn to_request(&self) -> mediacore::AddTrackRequest {
         let layers = match self.kind {
             TrackKind::Audio => Vec::new(),
             TrackKind::Video if self.is_simulcast() => {
                 self.layers.iter().map(LayerSpec::to_video_layer).collect()
             }
-            TrackKind::Video => vec![livekit::VideoLayer {
-                quality: livekit::VideoQuality::High as i32,
+            TrackKind::Video => vec![mediacore::VideoLayer {
+                quality: mediacore::VideoQuality::High as i32,
                 width: self.profile.width,
                 height: self.profile.height,
                 bitrate: 0,
-                ..livekit::VideoLayer::default()
+                ..mediacore::VideoLayer::default()
             }],
         };
 
-        livekit::AddTrackRequest {
+        mediacore::AddTrackRequest {
             cid: self.cid.clone(),
             name: self.name.clone(),
             r#type: self.kind.track_type() as i32,
@@ -132,12 +132,12 @@ impl TrackSpec {
             source: self.source as i32,
             layers,
             stream: self.stream_id.clone(),
-            simulcast_codecs: vec![livekit::SimulcastCodec {
+            simulcast_codecs: vec![mediacore::SimulcastCodec {
                 codec: self.profile.codec.name().to_owned(),
                 cid: self.cid.clone(),
-                ..livekit::SimulcastCodec::default()
+                ..mediacore::SimulcastCodec::default()
             }],
-            ..livekit::AddTrackRequest::default()
+            ..mediacore::AddTrackRequest::default()
         }
     }
 }
@@ -162,8 +162,8 @@ mod tests {
 
         assert_eq!(request.cid, "TR_fixed");
         assert_eq!(request.name, "mic");
-        assert_eq!(request.r#type, livekit::TrackType::Audio as i32);
-        assert_eq!(request.source, livekit::TrackSource::Microphone as i32);
+        assert_eq!(request.r#type, mediacore::TrackType::Audio as i32);
+        assert_eq!(request.source, mediacore::TrackSource::Microphone as i32);
         assert!(request.layers.is_empty());
         assert_eq!(request.simulcast_codecs[0].codec, "opus");
     }
@@ -172,14 +172,14 @@ mod tests {
     fn a_video_spec_declares_one_layer_with_its_dimensions() {
         let request = TrackSpec::video("cam").to_request();
 
-        assert_eq!(request.r#type, livekit::TrackType::Video as i32);
-        assert_eq!(request.source, livekit::TrackSource::Camera as i32);
+        assert_eq!(request.r#type, mediacore::TrackType::Video as i32);
+        assert_eq!(request.source, mediacore::TrackSource::Camera as i32);
         assert_eq!(request.width, 320);
         assert_eq!(request.height, 240);
         assert_eq!(request.layers.len(), 1);
         assert_eq!(
             request.layers[0].quality,
-            livekit::VideoQuality::High as i32
+            mediacore::VideoQuality::High as i32
         );
         assert_eq!(request.simulcast_codecs[0].codec, "vp8");
     }
@@ -192,16 +192,19 @@ mod tests {
         assert_eq!(spec.rids(), vec!["q", "h", "f"]);
         assert_eq!(request.layers.len(), 3);
         assert_eq!(request.layers[0].rid, "q");
-        assert_eq!(request.layers[0].quality, livekit::VideoQuality::Low as i32);
+        assert_eq!(
+            request.layers[0].quality,
+            mediacore::VideoQuality::Low as i32
+        );
         assert_eq!(request.layers[1].rid, "h");
         assert_eq!(
             request.layers[1].quality,
-            livekit::VideoQuality::Medium as i32
+            mediacore::VideoQuality::Medium as i32
         );
         assert_eq!(request.layers[2].rid, "f");
         assert_eq!(
             request.layers[2].quality,
-            livekit::VideoQuality::High as i32
+            mediacore::VideoQuality::High as i32
         );
         assert_eq!(request.layers[2].bitrate, 1_700_000);
     }
@@ -232,15 +235,17 @@ mod tests {
     #[test]
     fn an_add_track_request_survives_a_protobuf_round_trip() {
         let request = TrackSpec::video("cam").with_cid("TR_fixed").to_request();
-        let frame = livekit::SignalRequest {
-            message: Some(livekit::signal_request::Message::AddTrack(request.clone())),
+        let frame = mediacore::SignalRequest {
+            message: Some(mediacore::signal_request::Message::AddTrack(
+                request.clone(),
+            )),
         };
 
         let bytes = frame.encode_to_vec();
-        let decoded = livekit::SignalRequest::decode(bytes.as_slice()).unwrap();
+        let decoded = mediacore::SignalRequest::decode(bytes.as_slice()).unwrap();
 
         match decoded.message.unwrap() {
-            livekit::signal_request::Message::AddTrack(decoded) => {
+            mediacore::signal_request::Message::AddTrack(decoded) => {
                 assert_eq!(decoded.cid, request.cid);
                 assert_eq!(decoded.r#type, request.r#type);
                 assert_eq!(decoded.layers, request.layers);

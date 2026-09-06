@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use mediacore_proto::livekit::{self, signal_request};
+use mediacore_proto::mediacore::{self, signal_request};
 use str0m::change::SdpOffer;
 use str0m::media::MediaKind;
 use str0m::net::{Protocol, Receive};
@@ -19,7 +19,7 @@ use crate::transport::dtls_cert;
 use crate::udp::{self, Datagram};
 
 pub(crate) enum SubCommand {
-    Offer(Box<livekit::SessionDescription>),
+    Offer(Box<mediacore::SessionDescription>),
     RemoteCandidate(String),
     Connected(oneshot::Sender<()>),
     Reports(oneshot::Sender<Vec<TrackReport>>),
@@ -337,7 +337,7 @@ impl Subscriber {
         true
     }
 
-    fn on_offer(&mut self, offer: &livekit::SessionDescription) {
+    fn on_offer(&mut self, offer: &mediacore::SessionDescription) {
         let sdp = match answer_offer(&mut self.rtc, &offer.sdp) {
             Ok(sdp) => sdp,
             Err(error) => {
@@ -346,11 +346,11 @@ impl Subscriber {
             }
         };
 
-        let answer = signal_request::Message::Answer(livekit::SessionDescription {
+        let answer = signal_request::Message::Answer(mediacore::SessionDescription {
             r#type: "answer".to_owned(),
             sdp,
             id: offer.id,
-            ..livekit::SessionDescription::default()
+            ..mediacore::SessionDescription::default()
         });
 
         if let Err(error) = self.signal.send(answer) {
@@ -366,7 +366,7 @@ impl Subscriber {
         }
     }
 
-    fn describe_tracks(&mut self, offer: &livekit::SessionDescription) {
+    fn describe_tracks(&mut self, offer: &mediacore::SessionDescription) {
         let window = self.window;
 
         for section in media_sections(&offer.sdp) {
@@ -390,9 +390,9 @@ impl Subscriber {
             "sdpMLineIndex": 0,
         });
 
-        let candidate = signal_request::Message::Trickle(livekit::TrickleRequest {
+        let candidate = signal_request::Message::Trickle(mediacore::TrickleRequest {
             candidate_init: init.to_string(),
-            target: livekit::SignalTarget::Subscriber as i32,
+            target: mediacore::SignalTarget::Subscriber as i32,
             r#final: false,
         });
 
@@ -401,9 +401,9 @@ impl Subscriber {
             return;
         }
 
-        let end = signal_request::Message::Trickle(livekit::TrickleRequest {
+        let end = signal_request::Message::Trickle(mediacore::TrickleRequest {
             candidate_init: String::new(),
-            target: livekit::SignalTarget::Subscriber as i32,
+            target: mediacore::SignalTarget::Subscriber as i32,
             r#final: true,
         });
 

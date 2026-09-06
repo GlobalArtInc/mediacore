@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use mediacore_proto::livekit::{self, signal_request};
+use mediacore_proto::mediacore::{self, signal_request};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::config::DtlsCert;
 use str0m::crypto::CryptoProvider;
@@ -508,11 +508,11 @@ impl Transport {
         self.next_offer_id = self.next_offer_id.wrapping_add(1);
         let offer_id = self.next_offer_id;
 
-        let request = signal_request::Message::Offer(livekit::SessionDescription {
+        let request = signal_request::Message::Offer(mediacore::SessionDescription {
             r#type: "offer".to_owned(),
             sdp: offer.to_sdp_string(),
             id: offer_id,
-            ..livekit::SessionDescription::default()
+            ..mediacore::SessionDescription::default()
         });
 
         if let Err(error) = self.signal.send(request) {
@@ -536,9 +536,9 @@ impl Transport {
             "sdpMLineIndex": 0,
         });
 
-        let candidate = signal_request::Message::Trickle(livekit::TrickleRequest {
+        let candidate = signal_request::Message::Trickle(mediacore::TrickleRequest {
             candidate_init: init.to_string(),
-            target: livekit::SignalTarget::Publisher as i32,
+            target: mediacore::SignalTarget::Publisher as i32,
             r#final: false,
         });
 
@@ -547,9 +547,9 @@ impl Transport {
             return;
         }
 
-        let end = signal_request::Message::Trickle(livekit::TrickleRequest {
+        let end = signal_request::Message::Trickle(mediacore::TrickleRequest {
             candidate_init: String::new(),
-            target: livekit::SignalTarget::Publisher as i32,
+            target: mediacore::SignalTarget::Publisher as i32,
             r#final: true,
         });
 

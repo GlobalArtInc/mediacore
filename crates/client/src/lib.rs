@@ -13,7 +13,7 @@ mod udp;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use mediacore_proto::livekit::{self, signal_request, signal_response};
+use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use str0m::media::{Mid, Rid};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -34,7 +34,7 @@ pub use crate::simulcast::{
 pub use crate::subscription::{SubscriptionRequest, TrackSettings};
 pub use crate::track::{TrackKind, TrackSpec};
 pub use crate::transport::{LayerStats, TrackStats};
-pub use mediacore_proto::livekit as proto;
+pub use mediacore_proto::mediacore as proto;
 
 use crate::signal::SignalHandle;
 use crate::subscriber::SubCommand;
@@ -74,7 +74,7 @@ pub struct Client {
     signal: SignalHandle,
     commands: mpsc::Sender<Command>,
     subscriber: mpsc::Sender<SubCommand>,
-    join: livekit::JoinResponse,
+    join: mediacore::JoinResponse,
     options: ClientOptions,
     local_addr: SocketAddr,
     subscriber_addr: SocketAddr,
@@ -151,7 +151,7 @@ impl Client {
         })
     }
 
-    pub fn join(&self) -> &livekit::JoinResponse {
+    pub fn join(&self) -> &mediacore::JoinResponse {
         &self.join
     }
 
@@ -171,11 +171,11 @@ impl Client {
             .unwrap_or_default()
     }
 
-    pub fn participants(&self) -> Vec<livekit::ParticipantInfo> {
+    pub fn participants(&self) -> Vec<mediacore::ParticipantInfo> {
         self.signal.participants()
     }
 
-    pub fn disconnect_reason(&self) -> Option<livekit::DisconnectReason> {
+    pub fn disconnect_reason(&self) -> Option<mediacore::DisconnectReason> {
         self.signal.disconnect_reason()
     }
 
@@ -306,7 +306,7 @@ impl Client {
     pub fn request_quality<I, S>(
         &self,
         track_sids: I,
-        quality: livekit::VideoQuality,
+        quality: mediacore::VideoQuality,
     ) -> Result<(), ClientError>
     where
         I: IntoIterator<Item = S>,
@@ -373,10 +373,10 @@ impl Client {
     }
 
     pub async fn leave(mut self) -> Result<(), ClientError> {
-        let leave = signal_request::Message::Leave(livekit::LeaveRequest {
-            reason: livekit::DisconnectReason::ClientInitiated as i32,
-            action: livekit::leave_request::Action::Disconnect as i32,
-            ..livekit::LeaveRequest::default()
+        let leave = signal_request::Message::Leave(mediacore::LeaveRequest {
+            reason: mediacore::DisconnectReason::ClientInitiated as i32,
+            action: mediacore::leave_request::Action::Disconnect as i32,
+            ..mediacore::LeaveRequest::default()
         });
         let sent = self.signal.send(leave);
         let flushed = self.signal.flush(Duration::from_secs(1)).await;
@@ -455,7 +455,7 @@ fn publish_sources(spec: &TrackSpec) -> Vec<PublishSource> {
 
 pub struct PublishedTrack {
     spec: TrackSpec,
-    info: Option<livekit::TrackInfo>,
+    info: Option<mediacore::TrackInfo>,
     mid: Mid,
     commands: mpsc::Sender<Command>,
     response_timeout: Duration,
@@ -476,7 +476,7 @@ impl PublishedTrack {
         &self.spec
     }
 
-    pub fn info(&self) -> Option<&livekit::TrackInfo> {
+    pub fn info(&self) -> Option<&mediacore::TrackInfo> {
         self.info.as_ref()
     }
 

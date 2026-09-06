@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use mediacore_proto::livekit::{self, signal_response};
+use mediacore_proto::mediacore::{self, signal_response};
 use mediacore_room::{Joined, TrackKind};
 use mediacore_sfu::{Allowance, Grant};
 use mediacore_transport::str0m::format::{Codec, PayloadParams};
@@ -56,7 +56,7 @@ pub struct SubscriberSession {
     task: Option<JoinHandle<()>>,
     queued_candidates: Vec<String>,
     subscriptions: HashMap<String, Subscription>,
-    settings: HashMap<String, livekit::UpdateTrackSettings>,
+    settings: HashMap<String, mediacore::UpdateTrackSettings>,
     tracks_by_mid: HashMap<Mid, String>,
     pending: Option<Pending>,
     auto_subscribe: bool,
@@ -350,7 +350,7 @@ impl SubscriberSession {
         &mut self,
         state: &AppState,
         joined: &Joined,
-        answer: livekit::SessionDescription,
+        answer: mediacore::SessionDescription,
     ) {
         let Some(pending) = self.pending.take() else {
             tracing::debug!(
@@ -392,7 +392,7 @@ impl SubscriberSession {
         self.reconcile(state, joined).await;
     }
 
-    pub async fn on_trickle(&mut self, joined: &Joined, request: livekit::TrickleRequest) {
+    pub async fn on_trickle(&mut self, joined: &Joined, request: mediacore::TrickleRequest) {
         let Some(candidate) = candidate_from_init(&request.candidate_init) else {
             return;
         };
@@ -419,7 +419,7 @@ impl SubscriberSession {
         &mut self,
         state: &AppState,
         joined: &Joined,
-        settings: &livekit::UpdateTrackSettings,
+        settings: &mediacore::UpdateTrackSettings,
     ) {
         for track_sid in &settings.track_sids {
             if joined.room.track(track_sid).is_none() {
@@ -653,7 +653,7 @@ impl SubscriberSession {
         );
 
         joined.participant.send(mediacore_room::reconnect(
-            livekit::DisconnectReason::StateMismatch,
+            mediacore::DisconnectReason::StateMismatch,
         ));
     }
 
@@ -723,7 +723,7 @@ impl SubscriberSession {
             refuse(
                 joined,
                 track_sid,
-                livekit::SubscriptionError::SeTrackNotfound,
+                mediacore::SubscriptionError::SeTrackNotfound,
             );
             return Step::Refused;
         };
@@ -906,7 +906,7 @@ impl SubscriberSession {
             refuse(
                 joined,
                 &pending.track_sid,
-                livekit::SubscriptionError::SeCodecUnsupported,
+                mediacore::SubscriptionError::SeCodecUnsupported,
             );
             self.tracks_by_mid.remove(&pending.mid);
             return;
@@ -1022,7 +1022,7 @@ impl SubscriberSession {
             };
 
             publisher.send(signal_response::Message::TrackSubscribed(
-                livekit::TrackSubscribed {
+                mediacore::TrackSubscribed {
                     track_sid: track_sid.to_owned(),
                 },
             ));
@@ -1085,7 +1085,7 @@ impl SubscriberSession {
             .collect();
 
         joined.participant.send(signal_response::Message::Offer(
-            livekit::SessionDescription {
+            mediacore::SessionDescription {
                 r#type: "offer".to_owned(),
                 sdp,
                 id,
@@ -1121,18 +1121,18 @@ impl SubscriberSession {
 }
 
 fn trickle(candidate_init: String, final_candidate: bool) -> signal_response::Message {
-    signal_response::Message::Trickle(livekit::TrickleRequest {
+    signal_response::Message::Trickle(mediacore::TrickleRequest {
         candidate_init,
-        target: livekit::SignalTarget::Subscriber as i32,
+        target: mediacore::SignalTarget::Subscriber as i32,
         r#final: final_candidate,
     })
 }
 
-fn refuse(joined: &Joined, track_sid: &str, error: livekit::SubscriptionError) {
+fn refuse(joined: &Joined, track_sid: &str, error: mediacore::SubscriptionError) {
     joined
         .participant
         .send(signal_response::Message::SubscriptionResponse(
-            livekit::SubscriptionResponse {
+            mediacore::SubscriptionResponse {
                 track_sid: track_sid.to_owned(),
                 err: error as i32,
             },
@@ -1141,16 +1141,16 @@ fn refuse(joined: &Joined, track_sid: &str, error: livekit::SubscriptionError) {
 
 fn stream_state(joined: &Joined, publisher_sid: &str, track_sid: &str, paused: bool) {
     let state = if paused {
-        livekit::StreamState::Paused
+        mediacore::StreamState::Paused
     } else {
-        livekit::StreamState::Active
+        mediacore::StreamState::Active
     };
 
     joined
         .participant
         .send(signal_response::Message::StreamStateUpdate(
-            livekit::StreamStateUpdate {
-                stream_states: vec![livekit::StreamStateInfo {
+            mediacore::StreamStateUpdate {
+                stream_states: vec![mediacore::StreamStateInfo {
                     participant_sid: publisher_sid.to_owned(),
                     track_sid: track_sid.to_owned(),
                     state: state as i32,
@@ -1233,7 +1233,7 @@ mod tests {
         ParticipantSpec {
             identity: identity.to_owned(),
             name: identity.to_owned(),
-            permission: livekit::ParticipantPermission {
+            permission: mediacore::ParticipantPermission {
                 can_subscribe: true,
                 can_publish: true,
                 ..Default::default()
@@ -1242,12 +1242,12 @@ mod tests {
         }
     }
 
-    fn add_track(cid: &str) -> livekit::AddTrackRequest {
-        livekit::AddTrackRequest {
+    fn add_track(cid: &str) -> mediacore::AddTrackRequest {
+        mediacore::AddTrackRequest {
             cid: cid.to_owned(),
             name: cid.to_owned(),
-            r#type: livekit::TrackType::Video as i32,
-            source: livekit::TrackSource::Camera as i32,
+            r#type: mediacore::TrackType::Video as i32,
+            source: mediacore::TrackSource::Camera as i32,
             ..Default::default()
         }
     }
@@ -1256,7 +1256,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
     }
 
-    fn offers(rx: &mut SignalRx) -> Vec<livekit::SessionDescription> {
+    fn offers(rx: &mut SignalRx) -> Vec<mediacore::SessionDescription> {
         let mut offers = Vec::new();
 
         while let Ok(response) = rx.try_recv() {
@@ -1426,11 +1426,11 @@ mod tests {
                 assert!(request.can_reconnect);
                 assert_eq!(
                     request.action,
-                    livekit::leave_request::Action::Reconnect as i32
+                    mediacore::leave_request::Action::Reconnect as i32
                 );
                 assert_eq!(
                     request.reason,
-                    livekit::DisconnectReason::StateMismatch as i32
+                    mediacore::DisconnectReason::StateMismatch as i32
                 );
             }
             other => panic!("expected a leave request, got {other:?}"),

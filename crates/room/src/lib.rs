@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use tokio::sync::mpsc;
 
 mod subscription;
@@ -18,8 +18,8 @@ use track::generate_track_sid;
 
 pub const SIGNAL_CHANNEL_CAPACITY: usize = 256;
 
-pub type SignalTx = mpsc::Sender<livekit::SignalResponse>;
-pub type SignalRx = mpsc::Receiver<livekit::SignalResponse>;
+pub type SignalTx = mpsc::Sender<mediacore::SignalResponse>;
+pub type SignalRx = mpsc::Receiver<mediacore::SignalResponse>;
 
 pub fn signal_channel() -> (SignalTx, SignalRx) {
     mpsc::channel(SIGNAL_CHANNEL_CAPACITY)
@@ -34,8 +34,8 @@ pub enum JoinError {
 }
 
 impl JoinError {
-    pub fn disconnect_reason(&self) -> livekit::DisconnectReason {
-        livekit::DisconnectReason::JoinFailure
+    pub fn disconnect_reason(&self) -> mediacore::DisconnectReason {
+        mediacore::DisconnectReason::JoinFailure
     }
 }
 
@@ -57,11 +57,11 @@ pub enum ParticipantKind {
 }
 
 impl ParticipantKind {
-    pub fn to_proto(self) -> livekit::participant_info::Kind {
+    pub fn to_proto(self) -> mediacore::participant_info::Kind {
         match self {
-            Self::Standard => livekit::participant_info::Kind::Standard,
-            Self::Egress => livekit::participant_info::Kind::Egress,
-            Self::Agent => livekit::participant_info::Kind::Agent,
+            Self::Standard => mediacore::participant_info::Kind::Standard,
+            Self::Egress => mediacore::participant_info::Kind::Egress,
+            Self::Agent => mediacore::participant_info::Kind::Agent,
         }
     }
 
@@ -142,7 +142,7 @@ pub struct ParticipantSpec {
     pub name: String,
     pub metadata: String,
     pub attributes: HashMap<String, String>,
-    pub permission: livekit::ParticipantPermission,
+    pub permission: mediacore::ParticipantPermission,
     pub kind: ParticipantKind,
     pub replaces: Option<String>,
 }
@@ -152,7 +152,7 @@ struct Profile {
     name: String,
     metadata: String,
     attributes: HashMap<String, String>,
-    permission: livekit::ParticipantPermission,
+    permission: mediacore::ParticipantPermission,
 }
 
 /// A change to what a participant is called and what they are allowed to do.
@@ -166,7 +166,7 @@ pub struct ProfileUpdate {
     pub name: Option<String>,
     pub metadata: Option<String>,
     pub attributes: HashMap<String, String>,
-    pub permission: Option<livekit::ParticipantPermission>,
+    pub permission: Option<mediacore::ParticipantPermission>,
 }
 
 pub struct Participant {
@@ -190,14 +190,17 @@ pub struct Participant {
     tracks: Mutex<Vec<PublishedTrack>>,
     subscriptions: Mutex<Subscriptions>,
     tx: Mutex<Option<SignalTx>>,
-    close_reason: Mutex<Option<livekit::DisconnectReason>>,
+    close_reason: Mutex<Option<mediacore::DisconnectReason>>,
 }
 
 impl Participant {
-    pub fn to_proto(&self, state: livekit::participant_info::State) -> livekit::ParticipantInfo {
+    pub fn to_proto(
+        &self,
+        state: mediacore::participant_info::State,
+    ) -> mediacore::ParticipantInfo {
         let profile = self.profile.lock().expect("profile lock").clone();
 
-        livekit::ParticipantInfo {
+        mediacore::ParticipantInfo {
             sid: self.sid.clone(),
             identity: self.identity.clone(),
             state: state as i32,
@@ -230,7 +233,7 @@ impl Participant {
             .clone()
     }
 
-    pub fn permission(&self) -> livekit::ParticipantPermission {
+    pub fn permission(&self) -> mediacore::ParticipantPermission {
         self.profile
             .lock()
             .expect("profile lock")
@@ -250,7 +253,7 @@ impl Participant {
             .can_subscribe
     }
 
-    pub fn can_publish_source(&self, source: livekit::TrackSource) -> bool {
+    pub fn can_publish_source(&self, source: mediacore::TrackSource) -> bool {
         let profile = self.profile.lock().expect("profile lock");
 
         if !profile.permission.can_publish {
@@ -314,7 +317,7 @@ impl Participant {
         self.tracks.lock().expect("track lock").clone()
     }
 
-    pub fn track_infos(&self) -> Vec<livekit::TrackInfo> {
+    pub fn track_infos(&self) -> Vec<mediacore::TrackInfo> {
         self.tracks
             .lock()
             .expect("track lock")
@@ -343,13 +346,13 @@ impl Participant {
 
     pub fn publish_track(
         &self,
-        request: &livekit::AddTrackRequest,
+        request: &mediacore::AddTrackRequest,
     ) -> Result<PublishedTrack, PublishError> {
         let Some(kind) = TrackKind::from_proto(request.r#type) else {
             return Err(PublishError::UnsupportedKind(request.r#type));
         };
-        let source =
-            livekit::TrackSource::try_from(request.source).unwrap_or(livekit::TrackSource::Unknown);
+        let source = mediacore::TrackSource::try_from(request.source)
+            .unwrap_or(mediacore::TrackSource::Unknown);
 
         if !self.can_publish_source(source) {
             return Err(PublishError::NotAllowed(source));
@@ -432,7 +435,7 @@ impl Participant {
     pub fn set_track_live_layers(
         &self,
         track_sid: &str,
-        layers: Vec<livekit::VideoLayer>,
+        layers: Vec<mediacore::VideoLayer>,
     ) -> Option<PublishedTrack> {
         let track = {
             let mut tracks = self.tracks.lock().expect("track lock");
@@ -576,10 +579,10 @@ impl Participant {
         Some(track)
     }
 
-    pub fn send(&self, message: livekit::signal_response::Message) -> bool {
+    pub fn send(&self, message: mediacore::signal_response::Message) -> bool {
         let droppable = is_droppable(&message);
         let name = message_name(&message);
-        let response = livekit::SignalResponse {
+        let response = mediacore::SignalResponse {
             message: Some(message),
         };
 
@@ -610,13 +613,13 @@ impl Participant {
                     message = name,
                     "signal queue is full on a control message, closing the session"
                 );
-                self.close_signal(livekit::DisconnectReason::SignalClose);
+                self.close_signal(mediacore::DisconnectReason::SignalClose);
                 false
             }
         }
     }
 
-    pub fn close_signal(&self, reason: livekit::DisconnectReason) {
+    pub fn close_signal(&self, reason: mediacore::DisconnectReason) {
         let closed = self.tx.lock().expect("signal lock").take().is_some();
 
         if !closed {
@@ -626,11 +629,11 @@ impl Participant {
         *self.close_reason.lock().expect("close reason lock") = Some(reason);
     }
 
-    pub fn close_reason(&self) -> Option<livekit::DisconnectReason> {
+    pub fn close_reason(&self) -> Option<mediacore::DisconnectReason> {
         *self.close_reason.lock().expect("close reason lock")
     }
 
-    pub fn disconnect(&self, reason: livekit::DisconnectReason) {
+    pub fn disconnect(&self, reason: mediacore::DisconnectReason) {
         self.send(leave(reason));
     }
 
@@ -697,7 +700,7 @@ impl Room {
 
         tracing::info!(room = %self.name, "room metadata updated");
         self.broadcast(
-            livekit::signal_response::Message::RoomUpdate(livekit::RoomUpdate {
+            mediacore::signal_response::Message::RoomUpdate(mediacore::RoomUpdate {
                 room: Some(self.to_proto()),
             }),
             None,
@@ -736,7 +739,7 @@ impl Room {
                 "a room that was created by its first arrival is now a room that was asked for"
             );
             self.broadcast(
-                livekit::signal_response::Message::RoomUpdate(livekit::RoomUpdate {
+                mediacore::signal_response::Message::RoomUpdate(mediacore::RoomUpdate {
                     room: Some(self.to_proto()),
                 }),
                 None,
@@ -766,11 +769,11 @@ impl Room {
         self.reassess(now_ms());
     }
 
-    pub fn to_proto(&self) -> livekit::Room {
+    pub fn to_proto(&self) -> mediacore::Room {
         let settings = self.settings();
         let participants = self.participants();
 
-        livekit::Room {
+        mediacore::Room {
             sid: self.sid.clone(),
             name: self.name.clone(),
             empty_timeout: settings.empty_timeout,
@@ -1067,7 +1070,7 @@ impl Room {
         }
 
         let hidden = participant.is_hidden();
-        let info = participant.to_proto(livekit::participant_info::State::Active);
+        let info = participant.to_proto(mediacore::participant_info::State::Active);
 
         if hidden {
             participant.send(participant_update(vec![info]));
@@ -1111,7 +1114,7 @@ impl Room {
             }
         }
 
-        let info = participant.to_proto(livekit::participant_info::State::Disconnected);
+        let info = participant.to_proto(mediacore::participant_info::State::Disconnected);
         self.broadcast(participant_update(vec![info]), Some(&participant.sid));
     }
 
@@ -1135,8 +1138,8 @@ impl Room {
                 track = %track_sid,
                 "taking away a track the participant may no longer publish"
             );
-            participant.send(livekit::signal_response::Message::TrackUnpublished(
-                livekit::TrackUnpublishedResponse {
+            participant.send(mediacore::signal_response::Message::TrackUnpublished(
+                mediacore::TrackUnpublishedResponse {
                     track_sid: track_sid.clone(),
                 },
             ));
@@ -1155,7 +1158,7 @@ impl Room {
     pub fn publish_track(
         &self,
         publisher_sid: &str,
-        request: &livekit::AddTrackRequest,
+        request: &mediacore::AddTrackRequest,
     ) -> Result<PublishedTrack, PublishError> {
         let publisher = self
             .participant_by_sid(publisher_sid)
@@ -1196,7 +1199,7 @@ impl Room {
         &self,
         publisher_sid: &str,
         track_sid: &str,
-        layers: Vec<livekit::VideoLayer>,
+        layers: Vec<mediacore::VideoLayer>,
     ) -> Option<PublishedTrack> {
         let publisher = self.participant_by_sid(publisher_sid)?;
         let track = publisher.set_track_live_layers(track_sid, layers)?;
@@ -1244,7 +1247,7 @@ impl Room {
     pub fn update_subscriptions(
         &self,
         subscriber_sid: &str,
-        request: &livekit::UpdateSubscription,
+        request: &mediacore::UpdateSubscription,
     ) -> Vec<String> {
         let mut requested = request.track_sids.clone();
         for tracks in &request.participant_tracks {
@@ -1283,11 +1286,11 @@ impl Room {
             return;
         }
 
-        let info = publisher.to_proto(livekit::participant_info::State::Active);
+        let info = publisher.to_proto(mediacore::participant_info::State::Active);
         self.broadcast(participant_update(vec![info]), Some(&publisher.sid));
     }
 
-    pub fn broadcast(&self, message: livekit::signal_response::Message, except: Option<&str>) {
+    pub fn broadcast(&self, message: mediacore::signal_response::Message, except: Option<&str>) {
         for participant in self.participants() {
             if Some(participant.sid.as_str()) == except {
                 continue;
@@ -1300,7 +1303,7 @@ impl Room {
 pub struct Joined {
     pub room: Arc<Room>,
     pub participant: Arc<Participant>,
-    pub others: Vec<livekit::ParticipantInfo>,
+    pub others: Vec<mediacore::ParticipantInfo>,
 }
 
 /// What an `UpdateParticipant` did, for a caller that has to finish the job.
@@ -1417,7 +1420,7 @@ impl Registry {
 
     pub fn delete(&self, name: &str) -> Option<Arc<Room>> {
         let room = self.rooms.lock().expect("registry lock").remove(name)?;
-        end_session(&room, livekit::DisconnectReason::RoomDeleted);
+        end_session(&room, mediacore::DisconnectReason::RoomDeleted);
 
         Some(room)
     }
@@ -1444,11 +1447,11 @@ impl Registry {
             "participant removed"
         );
 
-        removed.disconnect(livekit::DisconnectReason::ParticipantRemoved);
+        removed.disconnect(mediacore::DisconnectReason::ParticipantRemoved);
         depart(
             &room,
             &removed,
-            livekit::DisconnectReason::ParticipantRemoved,
+            mediacore::DisconnectReason::ParticipantRemoved,
             None,
         );
         room.reassess(now_ms());
@@ -1487,7 +1490,7 @@ impl Registry {
         };
 
         for room in &ended {
-            end_session(room, livekit::DisconnectReason::RoomClosed);
+            end_session(room, mediacore::DisconnectReason::RoomClosed);
         }
         for room in &closed {
             tracing::info!(
@@ -1594,11 +1597,11 @@ impl Registry {
                 sid = %displaced.sid,
                 "displacing an earlier session with the same identity"
             );
-            displaced.disconnect(livekit::DisconnectReason::DuplicateIdentity);
+            displaced.disconnect(mediacore::DisconnectReason::DuplicateIdentity);
             depart(
                 &room,
                 &displaced,
-                livekit::DisconnectReason::DuplicateIdentity,
+                mediacore::DisconnectReason::DuplicateIdentity,
                 Some(&participant.sid),
             );
         }
@@ -1608,13 +1611,13 @@ impl Registry {
             .into_iter()
             .filter(|other| other.sid != participant.sid)
             .filter(|other| !other.is_hidden())
-            .map(|other| other.to_proto(livekit::participant_info::State::Active))
+            .map(|other| other.to_proto(mediacore::participant_info::State::Active))
             .collect();
 
         if !participant.is_hidden() {
             room.broadcast(
                 participant_update(vec![
-                    participant.to_proto(livekit::participant_info::State::Joined),
+                    participant.to_proto(mediacore::participant_info::State::Joined),
                 ]),
                 Some(&participant.sid),
             );
@@ -1658,7 +1661,7 @@ impl Registry {
         depart(
             &room,
             &departed,
-            livekit::DisconnectReason::ClientInitiated,
+            mediacore::DisconnectReason::ClientInitiated,
             None,
         );
         room.reassess(now_ms());
@@ -1694,7 +1697,7 @@ fn distinct_identity(participants: &HashMap<String, Arc<Participant>>, requested
     format!("{requested}{DUPLICATE_IDENTITY_SEPARATOR}{}", random_id())
 }
 
-fn end_session(room: &Room, reason: livekit::DisconnectReason) {
+fn end_session(room: &Room, reason: mediacore::DisconnectReason) {
     let participants = room.take_participants();
 
     tracing::info!(
@@ -1713,7 +1716,7 @@ fn end_session(room: &Room, reason: livekit::DisconnectReason) {
 fn depart(
     room: &Room,
     departed: &Participant,
-    reason: livekit::DisconnectReason,
+    reason: mediacore::DisconnectReason,
     except: Option<&str>,
 ) {
     let orphaned: Vec<String> = departed
@@ -1732,19 +1735,19 @@ fn depart(
         return;
     }
 
-    let mut info = departed.to_proto(livekit::participant_info::State::Disconnected);
+    let mut info = departed.to_proto(mediacore::participant_info::State::Disconnected);
     info.disconnect_reason = reason as i32;
     room.broadcast(participant_update(vec![info]), except);
 }
 
 pub fn participant_update(
-    participants: Vec<livekit::ParticipantInfo>,
-) -> livekit::signal_response::Message {
-    livekit::signal_response::Message::Update(livekit::ParticipantUpdate { participants })
+    participants: Vec<mediacore::ParticipantInfo>,
+) -> mediacore::signal_response::Message {
+    mediacore::signal_response::Message::Update(mediacore::ParticipantUpdate { participants })
 }
 
-fn is_droppable(message: &livekit::signal_response::Message) -> bool {
-    use livekit::signal_response::Message;
+fn is_droppable(message: &mediacore::signal_response::Message) -> bool {
+    use mediacore::signal_response::Message;
 
     matches!(
         message,
@@ -1757,8 +1760,8 @@ fn is_droppable(message: &livekit::signal_response::Message) -> bool {
     )
 }
 
-fn message_name(message: &livekit::signal_response::Message) -> &'static str {
-    use livekit::signal_response::Message;
+fn message_name(message: &mediacore::signal_response::Message) -> &'static str {
+    use mediacore::signal_response::Message;
 
     match message {
         Message::Join(_) => "join",
@@ -1781,20 +1784,20 @@ fn message_name(message: &livekit::signal_response::Message) -> &'static str {
     }
 }
 
-pub fn leave(reason: livekit::DisconnectReason) -> livekit::signal_response::Message {
-    livekit::signal_response::Message::Leave(livekit::LeaveRequest {
+pub fn leave(reason: mediacore::DisconnectReason) -> mediacore::signal_response::Message {
+    mediacore::signal_response::Message::Leave(mediacore::LeaveRequest {
         can_reconnect: false,
         reason: reason as i32,
-        action: livekit::leave_request::Action::Disconnect as i32,
+        action: mediacore::leave_request::Action::Disconnect as i32,
         regions: None,
     })
 }
 
-pub fn reconnect(reason: livekit::DisconnectReason) -> livekit::signal_response::Message {
-    livekit::signal_response::Message::Leave(livekit::LeaveRequest {
+pub fn reconnect(reason: mediacore::DisconnectReason) -> mediacore::signal_response::Message {
+    mediacore::signal_response::Message::Leave(mediacore::LeaveRequest {
         can_reconnect: true,
         reason: reason as i32,
-        action: livekit::leave_request::Action::Reconnect as i32,
+        action: mediacore::leave_request::Action::Reconnect as i32,
         regions: None,
     })
 }
@@ -1840,11 +1843,11 @@ mod tests {
         }
     }
 
-    fn leaves(rx: &mut SignalRx) -> Vec<livekit::LeaveRequest> {
+    fn leaves(rx: &mut SignalRx) -> Vec<mediacore::LeaveRequest> {
         let mut requests = Vec::new();
 
         while let Ok(response) = rx.try_recv() {
-            if let Some(livekit::signal_response::Message::Leave(request)) = response.message {
+            if let Some(mediacore::signal_response::Message::Leave(request)) = response.message {
                 requests.push(request);
             }
         }
@@ -1852,7 +1855,7 @@ mod tests {
         requests
     }
 
-    fn expect_leave(rx: &mut SignalRx) -> livekit::LeaveRequest {
+    fn expect_leave(rx: &mut SignalRx) -> mediacore::LeaveRequest {
         let mut requests = leaves(rx);
         assert_eq!(
             requests.len(),
@@ -1867,7 +1870,7 @@ mod tests {
         ParticipantSpec {
             identity: identity.to_owned(),
             name: identity.to_owned(),
-            permission: livekit::ParticipantPermission {
+            permission: mediacore::ParticipantPermission {
                 can_subscribe: true,
                 can_publish: true,
                 can_publish_data: true,
@@ -1879,10 +1882,10 @@ mod tests {
 
     fn add_track(
         cid: &str,
-        kind: livekit::TrackType,
-        source: livekit::TrackSource,
-    ) -> livekit::AddTrackRequest {
-        livekit::AddTrackRequest {
+        kind: mediacore::TrackType,
+        source: mediacore::TrackSource,
+    ) -> mediacore::AddTrackRequest {
+        mediacore::AddTrackRequest {
             cid: cid.to_owned(),
             name: cid.to_owned(),
             r#type: kind as i32,
@@ -1891,8 +1894,12 @@ mod tests {
         }
     }
 
-    fn camera(cid: &str) -> livekit::AddTrackRequest {
-        add_track(cid, livekit::TrackType::Video, livekit::TrackSource::Camera)
+    fn camera(cid: &str) -> mediacore::AddTrackRequest {
+        add_track(
+            cid,
+            mediacore::TrackType::Video,
+            mediacore::TrackSource::Camera,
+        )
     }
 
     fn drain(rx: &mut SignalRx) {
@@ -1903,7 +1910,7 @@ mod tests {
         let mut track_sids = Vec::new();
 
         while let Ok(response) = rx.try_recv() {
-            if let Some(livekit::signal_response::Message::TrackUnpublished(message)) =
+            if let Some(mediacore::signal_response::Message::TrackUnpublished(message)) =
                 response.message
             {
                 track_sids.push(message.track_sid);
@@ -1913,9 +1920,9 @@ mod tests {
         track_sids
     }
 
-    fn expect_update(rx: &mut SignalRx) -> livekit::ParticipantUpdate {
+    fn expect_update(rx: &mut SignalRx) -> mediacore::ParticipantUpdate {
         match rx.try_recv().expect("a signal was queued").message {
-            Some(livekit::signal_response::Message::Update(update)) => update,
+            Some(mediacore::signal_response::Message::Update(update)) => update,
             other => panic!("expected a participant update, got {other:?}"),
         }
     }
@@ -1950,7 +1957,7 @@ mod tests {
         let update = expect_update(&mut alice_rx);
         assert_eq!(
             update.participants[0].state,
-            livekit::participant_info::State::Disconnected as i32
+            mediacore::participant_info::State::Disconnected as i32
         );
 
         registry.leave("demo", &alice.participant.sid);
@@ -1970,10 +1977,10 @@ mod tests {
         assert_eq!(second.room.participant_count(), 1);
 
         match first_rx.try_recv().expect("a signal was queued").message {
-            Some(livekit::signal_response::Message::Leave(request)) => {
+            Some(mediacore::signal_response::Message::Leave(request)) => {
                 assert_eq!(
                     request.reason,
-                    livekit::DisconnectReason::DuplicateIdentity as i32
+                    mediacore::DisconnectReason::DuplicateIdentity as i32
                 );
             }
             other => panic!("expected a leave request, got {other:?}"),
@@ -1990,19 +1997,19 @@ mod tests {
         let second = registry.join("demo", spec("alice"), second_tx).unwrap();
 
         while let Ok(response) = second_rx.try_recv() {
-            let Some(livekit::signal_response::Message::Update(update)) = response.message else {
+            let Some(mediacore::signal_response::Message::Update(update)) = response.message else {
                 continue;
             };
 
             for info in update.participants {
                 assert!(
-                    info.state != livekit::participant_info::State::Disconnected as i32
+                    info.state != mediacore::participant_info::State::Disconnected as i32
                         || info.sid != second.participant.sid,
                     "the new session was told that it had disconnected"
                 );
                 assert_ne!(
                     info.disconnect_reason,
-                    livekit::DisconnectReason::DuplicateIdentity as i32,
+                    mediacore::DisconnectReason::DuplicateIdentity as i32,
                     "the new session was handed the displacement notice meant for the room"
                 );
             }
@@ -2047,11 +2054,11 @@ mod tests {
         assert_eq!(update.participants[0].sid, alice.participant.sid);
         assert_eq!(
             update.participants[0].state,
-            livekit::participant_info::State::Disconnected as i32
+            mediacore::participant_info::State::Disconnected as i32
         );
         assert_eq!(
             update.participants[0].disconnect_reason,
-            livekit::DisconnectReason::DuplicateIdentity as i32
+            mediacore::DisconnectReason::DuplicateIdentity as i32
         );
     }
 
@@ -2158,7 +2165,7 @@ mod tests {
         assert_eq!(update.participants[0].tracks[0].name, "cid-1");
         assert_eq!(
             update.participants[0].tracks[0].r#type,
-            livekit::TrackType::Video as i32
+            mediacore::TrackType::Video as i32
         );
 
         assert_eq!(
@@ -2181,9 +2188,9 @@ mod tests {
 
         let mut request = camera("cid-1");
         request.layers = vec![
-            layer(livekit::VideoQuality::Low, "q", 320, 180),
-            layer(livekit::VideoQuality::Medium, "h", 640, 360),
-            layer(livekit::VideoQuality::High, "f", 1280, 720),
+            layer(mediacore::VideoQuality::Low, "q", 320, 180),
+            layer(mediacore::VideoQuality::Medium, "h", 640, 360),
+            layer(mediacore::VideoQuality::High, "f", 1280, 720),
         ];
 
         let published = bob
@@ -2200,8 +2207,8 @@ mod tests {
                 &bob.participant.sid,
                 &published.sid,
                 vec![
-                    layer(livekit::VideoQuality::Low, "q", 320, 180),
-                    layer(livekit::VideoQuality::Medium, "h", 640, 360),
+                    layer(mediacore::VideoQuality::Low, "q", 320, 180),
+                    layer(mediacore::VideoQuality::Medium, "h", 640, 360),
                 ],
             )
             .expect("the live layers are recorded");
@@ -2225,8 +2232,8 @@ mod tests {
                     &bob.participant.sid,
                     &published.sid,
                     vec![
-                        layer(livekit::VideoQuality::Low, "q", 320, 180),
-                        layer(livekit::VideoQuality::Medium, "h", 640, 360),
+                        layer(mediacore::VideoQuality::Low, "q", 320, 180),
+                        layer(mediacore::VideoQuality::Medium, "h", 640, 360),
                     ],
                 )
                 .is_none(),
@@ -2237,12 +2244,12 @@ mod tests {
     }
 
     fn layer(
-        quality: livekit::VideoQuality,
+        quality: mediacore::VideoQuality,
         rid: &str,
         width: u32,
         height: u32,
-    ) -> livekit::VideoLayer {
-        livekit::VideoLayer {
+    ) -> mediacore::VideoLayer {
+        mediacore::VideoLayer {
             quality: quality as i32,
             rid: rid.to_owned(),
             width,
@@ -2436,12 +2443,13 @@ mod tests {
         assert!(matches!(refused, PublishError::NotAllowed(_)));
         assert_eq!(
             refused.reason(),
-            livekit::request_response::Reason::NotAllowed
+            mediacore::request_response::Reason::NotAllowed
         );
         assert!(bob.participant.tracks().is_empty());
 
         let mut screen_only = spec("carol");
-        screen_only.permission.can_publish_sources = vec![livekit::TrackSource::ScreenShare as i32];
+        screen_only.permission.can_publish_sources =
+            vec![mediacore::TrackSource::ScreenShare as i32];
         let (carol_tx, _carol_rx) = signal_channel();
         let carol = registry.join("demo", screen_only, carol_tx).unwrap();
 
@@ -2454,16 +2462,16 @@ mod tests {
                 .participant
                 .publish_track(&add_track(
                     "cid-3",
-                    livekit::TrackType::Video,
-                    livekit::TrackSource::ScreenShare
+                    mediacore::TrackType::Video,
+                    mediacore::TrackSource::ScreenShare
                 ))
                 .is_ok()
         );
 
         let data = add_track(
             "cid-4",
-            livekit::TrackType::Data,
-            livekit::TrackSource::Unknown,
+            mediacore::TrackType::Data,
+            mediacore::TrackSource::Unknown,
         );
         assert!(matches!(
             alice.participant.publish_track(&data),
@@ -2490,8 +2498,8 @@ mod tests {
                 &bob.participant.sid,
                 &add_track(
                     "cid-2",
-                    livekit::TrackType::Audio,
-                    livekit::TrackSource::Microphone,
+                    mediacore::TrackType::Audio,
+                    mediacore::TrackSource::Microphone,
                 ),
             )
             .unwrap();
@@ -2602,10 +2610,10 @@ mod tests {
                 .is_empty()
         );
 
-        let request = livekit::UpdateSubscription {
+        let request = mediacore::UpdateSubscription {
             track_sids: vec![track.sid.clone()],
             subscribe: true,
-            participant_tracks: vec![livekit::ParticipantTracks {
+            participant_tracks: vec![mediacore::ParticipantTracks {
                 participant_sid: alice.participant.sid.clone(),
                 track_sids: vec![track.sid.clone()],
             }],
@@ -2633,7 +2641,7 @@ mod tests {
             .publish_track(&alice.participant.sid, &camera("cid-1"))
             .unwrap();
 
-        let subscribe = livekit::UpdateSubscription {
+        let subscribe = mediacore::UpdateSubscription {
             track_sids: vec![track.sid.clone(), "TR_VCmissing".to_owned()],
             subscribe: true,
             participant_tracks: Vec::new(),
@@ -2649,7 +2657,7 @@ mod tests {
             vec![track.sid.clone()]
         );
 
-        let unsubscribe = livekit::UpdateSubscription {
+        let unsubscribe = mediacore::UpdateSubscription {
             track_sids: vec![track.sid.clone()],
             subscribe: false,
             participant_tracks: Vec::new(),
@@ -2663,12 +2671,12 @@ mod tests {
         assert!(bob.participant.desired_subscriptions().is_empty());
     }
 
-    fn pong() -> livekit::signal_response::Message {
-        livekit::signal_response::Message::Pong(1)
+    fn pong() -> mediacore::signal_response::Message {
+        mediacore::signal_response::Message::Pong(1)
     }
 
-    fn answer() -> livekit::signal_response::Message {
-        livekit::signal_response::Message::Answer(livekit::SessionDescription {
+    fn answer() -> mediacore::signal_response::Message {
+        mediacore::signal_response::Message::Answer(mediacore::SessionDescription {
             r#type: "answer".to_owned(),
             sdp: "v=0\r\n".to_owned(),
             ..Default::default()
@@ -2703,7 +2711,7 @@ mod tests {
         assert!(!alice.participant.send(answer()));
         assert_eq!(
             alice.participant.close_reason(),
-            Some(livekit::DisconnectReason::SignalClose)
+            Some(mediacore::DisconnectReason::SignalClose)
         );
 
         assert!(!alice.participant.send(answer()));
@@ -2803,7 +2811,7 @@ mod tests {
 
         room.set_metadata("{\"minHumans\":3}");
         match alice_rx.try_recv().expect("a signal was queued").message {
-            Some(livekit::signal_response::Message::RoomUpdate(update)) => {
+            Some(mediacore::signal_response::Message::RoomUpdate(update)) => {
                 assert_eq!(update.room.unwrap().metadata, "{\"minHumans\":3}");
             }
             other => panic!("expected a room update, got {other:?}"),
@@ -2961,7 +2969,7 @@ mod tests {
             let leave = expect_leave(rx);
             assert_eq!(
                 leave.reason,
-                livekit::DisconnectReason::RoomDeleted as i32,
+                mediacore::DisconnectReason::RoomDeleted as i32,
                 "{who} was cut off without being told the room was deleted"
             );
             assert!(
@@ -3001,7 +3009,7 @@ mod tests {
         assert_eq!(removed.sid, bob.participant.sid);
         assert_eq!(
             expect_leave(&mut bob_rx).reason,
-            livekit::DisconnectReason::ParticipantRemoved as i32,
+            mediacore::DisconnectReason::ParticipantRemoved as i32,
             "bob was dropped without being told why"
         );
 
@@ -3009,11 +3017,11 @@ mod tests {
         assert_eq!(update.participants[0].sid, bob.participant.sid);
         assert_eq!(
             update.participants[0].state,
-            livekit::participant_info::State::Disconnected as i32
+            mediacore::participant_info::State::Disconnected as i32
         );
         assert_eq!(
             update.participants[0].disconnect_reason,
-            livekit::DisconnectReason::ParticipantRemoved as i32
+            mediacore::DisconnectReason::ParticipantRemoved as i32
         );
 
         assert!(
@@ -3059,7 +3067,7 @@ mod tests {
         assert!(registry.room("demo").is_none());
         assert_eq!(
             expect_leave(&mut alice_rx).reason,
-            livekit::DisconnectReason::RoomClosed as i32,
+            mediacore::DisconnectReason::RoomClosed as i32,
             "the last person left in the room was cut off without being told the session was over"
         );
         assert_eq!(alice.room.participant_count(), 0);
@@ -3117,9 +3125,9 @@ mod tests {
         assert_eq!(
             scribe
                 .participant
-                .to_proto(livekit::participant_info::State::Active)
+                .to_proto(mediacore::participant_info::State::Active)
                 .kind,
-            livekit::participant_info::Kind::Egress as i32
+            mediacore::participant_info::Kind::Egress as i32
         );
 
         let ends_at = alice
@@ -3142,11 +3150,11 @@ mod tests {
         );
         assert_eq!(
             expect_leave(&mut alice_rx).reason,
-            livekit::DisconnectReason::RoomClosed as i32
+            mediacore::DisconnectReason::RoomClosed as i32
         );
         assert_eq!(
             expect_leave(&mut recorder_rx).reason,
-            livekit::DisconnectReason::RoomClosed as i32
+            mediacore::DisconnectReason::RoomClosed as i32
         );
     }
 
@@ -3199,7 +3207,7 @@ mod tests {
         assert_eq!(update.participants[0].name, "Alice");
         assert_eq!(
             update.participants[0].state,
-            livekit::participant_info::State::Joined as i32,
+            mediacore::participant_info::State::Joined as i32,
             "the first tab was told its own person had left"
         );
         assert!(
@@ -3256,7 +3264,7 @@ mod tests {
         );
         assert_eq!(
             expect_leave(&mut second_rx).reason,
-            livekit::DisconnectReason::DuplicateIdentity as i32
+            mediacore::DisconnectReason::DuplicateIdentity as i32
         );
         assert_eq!(
             registry
@@ -3334,7 +3342,7 @@ mod tests {
         assert_eq!(room.metadata(), "the daily");
 
         match alice_rx.try_recv().expect("a signal was queued").message {
-            Some(livekit::signal_response::Message::RoomUpdate(update)) => {
+            Some(mediacore::signal_response::Message::RoomUpdate(update)) => {
                 assert_eq!(update.room.unwrap().metadata, "the daily")
             }
             other => panic!("expected a room update, got {other:?}"),
@@ -3408,7 +3416,7 @@ mod tests {
             .update_participant(
                 "alice",
                 ProfileUpdate {
-                    permission: Some(livekit::ParticipantPermission {
+                    permission: Some(mediacore::ParticipantPermission {
                         can_subscribe: true,
                         can_publish: false,
                         ..Default::default()
@@ -3457,7 +3465,7 @@ mod tests {
         alice.room.update_participant(
             "bob",
             ProfileUpdate {
-                permission: Some(livekit::ParticipantPermission {
+                permission: Some(mediacore::ParticipantPermission {
                     can_subscribe: false,
                     can_publish: true,
                     ..Default::default()
@@ -3543,7 +3551,7 @@ mod tests {
 
         let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
         let ghost = ParticipantSpec {
-            permission: livekit::ParticipantPermission {
+            permission: mediacore::ParticipantPermission {
                 hidden: true,
                 can_subscribe: true,
                 ..Default::default()
@@ -3601,7 +3609,7 @@ mod tests {
         assert_eq!(registry.sweep(now_ms()).ended, vec!["standup"]);
         assert_eq!(
             expect_leave(&mut alice_rx).reason,
-            livekit::DisconnectReason::RoomClosed as i32
+            mediacore::DisconnectReason::RoomClosed as i32
         );
         assert!(registry.rooms().is_empty());
         let _ = alice;

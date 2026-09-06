@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use mediacore_config::{BweConfig, Config, DuplicateIdentity};
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_room::{Registry, RoomDefaults};
 
 use mediacore_sfu::SelectorConfig;
@@ -64,7 +64,7 @@ impl AppState {
         &self.config.video.bwe
     }
 
-    pub fn source_config(&self, source: livekit::TrackSource) -> SourceConfig {
+    pub fn source_config(&self, source: mediacore::TrackSource) -> SourceConfig {
         SourceConfig {
             pause_delay: self.config.video.dynacast_pause_delay(),
             tracker: tracker_config(source),

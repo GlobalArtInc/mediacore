@@ -6,7 +6,7 @@ use mediacore_client::{
     Client, ClientEvent, ClientOptions, PublishedTrack, TrackReport, TrackSpec,
 };
 use mediacore_config::Config;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_server::forward::SubscriptionSnapshot;
 use mediacore_server::http;
 use mediacore_server::state::AppState;
@@ -122,9 +122,10 @@ fn admin_token() -> String {
 async fn room_service(server: &Server, method: &str, body: serde_json::Value) -> u16 {
     let body = body.to_string();
     let request = format!(
-        "POST /twirp/livekit.RoomService/{method} HTTP/1.1\r\nHost: {}\r\n\
+        "POST {}{method} HTTP/1.1\r\nHost: {}\r\n\
          Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        mediacore_server::rooms::PATH_PREFIX,
         server.addr,
         admin_token(),
         body.len()
@@ -276,7 +277,7 @@ async fn two_participants_in_a_room_see_and_hear_each_other() {
 
     let subscribed = published
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::TrackSubscribed(subscribed) => {
+            mediacore::signal_response::Message::TrackSubscribed(subscribed) => {
                 Some(subscribed.track_sid.clone())
             }
             _ => None,
@@ -291,7 +292,7 @@ async fn two_participants_in_a_room_see_and_hear_each_other() {
     let camera_sid = camera.sid().to_owned();
     let quality = published
         .wait_for(PATIENCE, move |message| match message {
-            livekit::signal_response::Message::SubscribedQualityUpdate(update)
+            mediacore::signal_response::Message::SubscribedQualityUpdate(update)
                 if update.track_sid == camera_sid =>
             {
                 Some(update.clone())
@@ -314,7 +315,7 @@ async fn two_participants_in_a_room_see_and_hear_each_other() {
 
     let states = subscribed_states
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::StreamStateUpdate(update) => Some(update.clone()),
+            mediacore::signal_response::Message::StreamStateUpdate(update) => Some(update.clone()),
             _ => None,
         })
         .await
@@ -323,7 +324,7 @@ async fn two_participants_in_a_room_see_and_hear_each_other() {
     assert_eq!(states.stream_states.len(), 1);
     assert_eq!(
         states.stream_states[0].state,
-        livekit::StreamState::Active as i32
+        mediacore::StreamState::Active as i32
     );
     assert_eq!(states.stream_states[0].participant_sid, alice.sid());
 
@@ -447,7 +448,7 @@ async fn a_participant_without_the_subscribe_grant_is_refused_and_receives_nothi
 
     let refusal = responses
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::SubscriptionResponse(response) => {
+            mediacore::signal_response::Message::SubscriptionResponse(response) => {
                 Some(response.clone())
             }
             _ => None,
@@ -458,7 +459,7 @@ async fn a_participant_without_the_subscribe_grant_is_refused_and_receives_nothi
     assert_eq!(refusal.track_sid, mic.sid());
     assert_eq!(
         refusal.err,
-        livekit::SubscriptionError::SeUnknown as i32,
+        mediacore::SubscriptionError::SeUnknown as i32,
         "a track that exists but may not be received is not a missing track"
     );
 

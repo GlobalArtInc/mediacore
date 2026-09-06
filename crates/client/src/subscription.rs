@@ -1,4 +1,4 @@
-use mediacore_proto::livekit::{self, signal_request};
+use mediacore_proto::mediacore::{self, signal_request};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubscriptionRequest {
@@ -60,17 +60,19 @@ impl SubscriptionRequest {
         &self.track_sids
     }
 
-    pub fn to_proto(&self) -> livekit::UpdateSubscription {
-        livekit::UpdateSubscription {
+    pub fn to_proto(&self) -> mediacore::UpdateSubscription {
+        mediacore::UpdateSubscription {
             track_sids: self.track_sids.clone(),
             subscribe: self.subscribe,
             participant_tracks: self
                 .participant_tracks
                 .iter()
-                .map(|(participant_sid, track_sids)| livekit::ParticipantTracks {
-                    participant_sid: participant_sid.clone(),
-                    track_sids: track_sids.clone(),
-                })
+                .map(
+                    |(participant_sid, track_sids)| mediacore::ParticipantTracks {
+                        participant_sid: participant_sid.clone(),
+                        track_sids: track_sids.clone(),
+                    },
+                )
                 .collect(),
         }
     }
@@ -84,7 +86,7 @@ impl SubscriptionRequest {
 pub struct TrackSettings {
     track_sids: Vec<String>,
     disabled: bool,
-    quality: Option<livekit::VideoQuality>,
+    quality: Option<mediacore::VideoQuality>,
     width: u32,
     height: u32,
     fps: u32,
@@ -108,7 +110,7 @@ impl TrackSettings {
         self
     }
 
-    pub fn with_quality(mut self, quality: livekit::VideoQuality) -> Self {
+    pub fn with_quality(mut self, quality: mediacore::VideoQuality) -> Self {
         self.quality = Some(quality);
         self
     }
@@ -129,11 +131,11 @@ impl TrackSettings {
         self
     }
 
-    pub fn to_proto(&self) -> livekit::UpdateTrackSettings {
-        livekit::UpdateTrackSettings {
+    pub fn to_proto(&self) -> mediacore::UpdateTrackSettings {
+        mediacore::UpdateTrackSettings {
             track_sids: self.track_sids.clone(),
             disabled: self.disabled,
-            quality: self.quality.unwrap_or(livekit::VideoQuality::High) as i32,
+            quality: self.quality.unwrap_or(mediacore::VideoQuality::High) as i32,
             width: self.width,
             height: self.height,
             fps: self.fps,
@@ -152,11 +154,11 @@ mod tests {
     use prost::Message as _;
 
     fn encoded(message: signal_request::Message) -> signal_request::Message {
-        let frame = livekit::SignalRequest {
+        let frame = mediacore::SignalRequest {
             message: Some(message),
         };
         let bytes = frame.encode_to_vec();
-        livekit::SignalRequest::decode(bytes.as_slice())
+        mediacore::SignalRequest::decode(bytes.as_slice())
             .expect("a decodable request")
             .message
             .expect("a message")
@@ -225,23 +227,23 @@ mod tests {
         let settings = TrackSettings::for_tracks(["TR_a"]);
         assert_eq!(
             settings.to_proto().quality,
-            livekit::VideoQuality::High as i32
+            mediacore::VideoQuality::High as i32
         );
 
-        let low = settings.with_quality(livekit::VideoQuality::Low);
-        assert_eq!(low.to_proto().quality, livekit::VideoQuality::Low as i32);
+        let low = settings.with_quality(mediacore::VideoQuality::Low);
+        assert_eq!(low.to_proto().quality, mediacore::VideoQuality::Low as i32);
     }
 
     #[test]
     fn asking_for_a_quality_and_asking_for_a_size_are_both_carried() {
         let message = TrackSettings::for_tracks(["TR_a"])
-            .with_quality(livekit::VideoQuality::Medium)
+            .with_quality(mediacore::VideoQuality::Medium)
             .with_size(640, 360)
             .to_message();
 
         match encoded(message) {
             signal_request::Message::TrackSetting(settings) => {
-                assert_eq!(settings.quality, livekit::VideoQuality::Medium as i32);
+                assert_eq!(settings.quality, mediacore::VideoQuality::Medium as i32);
                 assert_eq!(settings.width, 640);
                 assert_eq!(settings.height, 360);
             }

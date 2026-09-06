@@ -298,6 +298,21 @@ async fn the_specification_is_served_and_parses() {
         !document["paths"].as_object().unwrap().is_empty(),
         "a specification with no paths in it describes nothing"
     );
+
+    let description = document["info"]["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains(rooms::PATH_PREFIX),
+        "the page never says where to post, so a reader has to infer the Twirp path from the \
+         operation ids"
+    );
+    assert!(
+        description.contains(rooms::ALIAS_PREFIX),
+        "the page does not mention that `{}` answers the same calls. Somebody integrating with a \
+         LiveKit server SDK reads this page, sees only the canonical path, and concludes their \
+         SDK cannot be used against this server -- which is the one thing the alias exists to \
+         make untrue.",
+        rooms::ALIAS_SERVICE
+    );
 }
 
 #[tokio::test]
@@ -513,7 +528,7 @@ async fn the_table_and_the_service_name_the_same_methods() {
     let pool = pool();
     let service = pool
         .get_service_by_name(rooms::SERVICE)
-        .expect("livekit.RoomService is in the descriptor set");
+        .unwrap_or_else(|| panic!("{} is in the descriptor set", rooms::SERVICE));
 
     let declared = service
         .methods()
@@ -594,7 +609,7 @@ async fn every_schema_on_the_page_is_the_descriptor_field_for_field() {
 async fn a_sixty_four_bit_field_is_documented_as_the_string_it_travels_as() {
     let addr = spawn_server().await;
     let document = specification(addr).await;
-    let room = &document["components"]["schemas"]["livekit.Room"]["properties"];
+    let room = &document["components"]["schemas"]["mediacore.Room"]["properties"];
 
     assert_eq!(
         room["creationTime"]["type"],
@@ -663,8 +678,8 @@ async fn the_error_body_on_the_page_is_the_error_body_on_the_wire() {
 async fn the_create_room_tables_account_for_every_field_of_the_request() {
     let pool = pool();
     let request = pool
-        .get_message_by_name("livekit.CreateRoomRequest")
-        .expect("livekit.CreateRoomRequest is in the descriptor set");
+        .get_message_by_name("mediacore.CreateRoomRequest")
+        .expect("mediacore.CreateRoomRequest is in the descriptor set");
 
     let mut described = Vec::new();
     for (field, _) in rooms::CREATE_HONOURED
@@ -701,8 +716,8 @@ async fn every_field_the_page_says_we_refuse_is_really_refused() {
     let addr = spawn_server().await;
     let pool = pool();
     let request = pool
-        .get_message_by_name("livekit.CreateRoomRequest")
-        .expect("livekit.CreateRoomRequest is in the descriptor set");
+        .get_message_by_name("mediacore.CreateRoomRequest")
+        .expect("mediacore.CreateRoomRequest is in the descriptor set");
 
     for (field, _) in rooms::CREATE_REFUSED {
         let descriptor = request

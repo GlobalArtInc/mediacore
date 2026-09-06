@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
-use mediacore_client::proto::{self as livekit, signal_request, signal_response};
+use mediacore_client::proto::{self as mediacore, signal_request, signal_response};
 use mediacore_client::{
     Client, ClientOptions, LayerId, MediaProfile, PublishedTrack, SyntheticSource, TrackReport,
     TrackSpec, layer_tag,
@@ -43,7 +43,7 @@ struct LayerCount {
 struct Seen {
     published: BTreeMap<u8, LayerCount>,
     unlabelled: u64,
-    settings: Vec<livekit::UpdateTrackSettings>,
+    settings: Vec<mediacore::UpdateTrackSettings>,
 }
 
 impl Seen {
@@ -51,10 +51,10 @@ impl Seen {
         self.published.get(&tag).copied().unwrap_or_default()
     }
 
-    fn quality_asked(&self) -> Option<livekit::VideoQuality> {
+    fn quality_asked(&self) -> Option<mediacore::VideoQuality> {
         self.settings
             .last()
-            .and_then(|settings| livekit::VideoQuality::try_from(settings.quality).ok())
+            .and_then(|settings| mediacore::VideoQuality::try_from(settings.quality).ok())
     }
 }
 
@@ -276,7 +276,7 @@ async fn run_peer(
         tokio::select! {
             frame = stream.next() => {
                 let Some(Ok(Message::Binary(data))) = frame else { return };
-                let Ok(request) = livekit::SignalRequest::decode(data.as_ref()) else { continue };
+                let Ok(request) = mediacore::SignalRequest::decode(data.as_ref()) else { continue };
                 let Some(message) = request.message else { continue };
                 if !on_request(&mut up, &mut down, &mut stream_out, &seen, &mut sink, message).await
                 {
@@ -366,7 +366,7 @@ async fn on_request(
     match message {
         signal_request::Message::AddTrack(add) => {
             let published =
-                signal_response::Message::TrackPublished(livekit::TrackPublishedResponse {
+                signal_response::Message::TrackPublished(mediacore::TrackPublishedResponse {
                     cid: add.cid.clone(),
                     track: Some(published_track(add)),
                 });
@@ -376,11 +376,11 @@ async fn on_request(
             let offer_id = offer.id;
             let offer = SdpOffer::from_sdp_string(&offer.sdp).expect("a parseable offer");
             let answer = up.rtc.sdp_api().accept_offer(offer).expect("an answer");
-            let answer = signal_response::Message::Answer(livekit::SessionDescription {
+            let answer = signal_response::Message::Answer(mediacore::SessionDescription {
                 r#type: "answer".to_owned(),
                 sdp: answer.to_sdp_string(),
                 id: offer_id,
-                ..livekit::SessionDescription::default()
+                ..mediacore::SessionDescription::default()
             });
             send(sink, answer).await;
         }
@@ -424,14 +424,14 @@ async fn on_request(
                 return true;
             };
 
-            if trickle.target == livekit::SignalTarget::Subscriber as i32 {
+            if trickle.target == mediacore::SignalTarget::Subscriber as i32 {
                 down.rtc.add_remote_candidate(candidate);
             } else {
                 up.rtc.add_remote_candidate(candidate);
             }
         }
         signal_request::Message::PingReq(ping) => {
-            let pong = signal_response::Message::PongResp(livekit::Pong {
+            let pong = signal_response::Message::PongResp(mediacore::Pong {
                 last_ping_timestamp: ping.timestamp,
                 timestamp: 0,
             });
@@ -445,8 +445,8 @@ async fn on_request(
 }
 
 #[allow(deprecated)]
-fn published_track(add: livekit::AddTrackRequest) -> livekit::TrackInfo {
-    livekit::TrackInfo {
+fn published_track(add: mediacore::AddTrackRequest) -> mediacore::TrackInfo {
+    mediacore::TrackInfo {
         sid: format!("TR_{}", add.cid),
         r#type: add.r#type,
         name: add.name,
@@ -456,18 +456,18 @@ fn published_track(add: livekit::AddTrackRequest) -> livekit::TrackInfo {
         mime_type: "video/vp8".to_owned(),
         simulcast: add.layers.len() > 1,
         layers: add.layers,
-        ..livekit::TrackInfo::default()
+        ..mediacore::TrackInfo::default()
     }
 }
 
 #[allow(deprecated)]
-fn bob_camera() -> livekit::TrackInfo {
-    livekit::TrackInfo {
+fn bob_camera() -> mediacore::TrackInfo {
+    mediacore::TrackInfo {
         sid: BOB_TRACK.to_owned(),
         name: "cam".to_owned(),
-        r#type: livekit::TrackType::Video as i32,
+        r#type: mediacore::TrackType::Video as i32,
         simulcast: true,
-        ..livekit::TrackInfo::default()
+        ..mediacore::TrackInfo::default()
     }
 }
 
@@ -485,7 +485,7 @@ async fn offer_track(down: &mut Endpoint, state: &mut Downstream, sink: &mut Sin
     state.mid = Some(mid);
     state.pending = Some(pending);
 
-    let offer = signal_response::Message::Offer(livekit::SessionDescription {
+    let offer = signal_response::Message::Offer(mediacore::SessionDescription {
         r#type: "offer".to_owned(),
         sdp: offer.to_sdp_string(),
         id: 11,
@@ -510,7 +510,7 @@ fn vp8_pt(rtc: &Rtc, mid: Mid) -> Pt {
 }
 
 async fn send(sink: &mut Sink, message: signal_response::Message) {
-    let response = livekit::SignalResponse {
+    let response = mediacore::SignalResponse {
         message: Some(message),
     };
     let _ = sink
@@ -518,28 +518,28 @@ async fn send(sink: &mut Sink, message: signal_response::Message) {
         .await;
 }
 
-fn join_response() -> livekit::JoinResponse {
-    livekit::JoinResponse {
-        room: Some(livekit::Room {
+fn join_response() -> mediacore::JoinResponse {
+    mediacore::JoinResponse {
+        room: Some(mediacore::Room {
             sid: "RM_test".to_owned(),
             name: ROOM.to_owned(),
-            ..livekit::Room::default()
+            ..mediacore::Room::default()
         }),
-        participant: Some(livekit::ParticipantInfo {
+        participant: Some(mediacore::ParticipantInfo {
             sid: "PA_test".to_owned(),
             identity: IDENTITY.to_owned(),
-            ..livekit::ParticipantInfo::default()
+            ..mediacore::ParticipantInfo::default()
         }),
-        other_participants: vec![livekit::ParticipantInfo {
+        other_participants: vec![mediacore::ParticipantInfo {
             sid: BOB_SID.to_owned(),
             identity: "bob".to_owned(),
             tracks: vec![bob_camera()],
-            ..livekit::ParticipantInfo::default()
+            ..mediacore::ParticipantInfo::default()
         }],
         subscriber_primary: true,
         ping_interval: 15,
         ping_timeout: 60,
-        ..livekit::JoinResponse::default()
+        ..mediacore::JoinResponse::default()
     }
 }
 
@@ -746,11 +746,11 @@ async fn asking_for_a_higher_quality_switches_the_incoming_stream() {
     assert_eq!(before.current_layer(), Some(LayerId::Tag(b'q')));
 
     client
-        .request_quality([BOB_TRACK], livekit::VideoQuality::High)
+        .request_quality([BOB_TRACK], mediacore::VideoQuality::High)
         .expect("a quality request");
 
     peer.wait_until(PATIENCE, |seen| {
-        seen.quality_asked() == Some(livekit::VideoQuality::High)
+        seen.quality_asked() == Some(mediacore::VideoQuality::High)
     })
     .await;
     peer.switch_to(b'f');
@@ -810,22 +810,22 @@ async fn a_subscribed_quality_update_reaches_the_application() {
     let mut events = client.events();
 
     peer.push(signal_response::Message::SubscribedQualityUpdate(
-        livekit::SubscribedQualityUpdate {
+        mediacore::SubscribedQualityUpdate {
             track_sid: BOB_TRACK.to_owned(),
-            subscribed_codecs: vec![livekit::SubscribedCodec {
+            subscribed_codecs: vec![mediacore::SubscribedCodec {
                 codec: "vp8".to_owned(),
                 qualities: vec![
-                    livekit::SubscribedQuality {
-                        quality: livekit::VideoQuality::Low as i32,
+                    mediacore::SubscribedQuality {
+                        quality: mediacore::VideoQuality::Low as i32,
                         enabled: true,
                     },
-                    livekit::SubscribedQuality {
-                        quality: livekit::VideoQuality::High as i32,
+                    mediacore::SubscribedQuality {
+                        quality: mediacore::VideoQuality::High as i32,
                         enabled: false,
                     },
                 ],
             }],
-            ..livekit::SubscribedQualityUpdate::default()
+            ..mediacore::SubscribedQualityUpdate::default()
         },
     ));
 

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use mediacore_proto::livekit::{self, signal_response};
+use mediacore_proto::mediacore::{self, signal_response};
 use mediacore_room::TrackKind;
 use mediacore_sfu::{
     Allowance, Bitrate, DropReason, ForwardedPacket, ForwarderConfig, Forwarding, InboundPacket,
@@ -80,14 +80,14 @@ impl Default for SourceConfig {
     }
 }
 
-pub fn tracker_config(source: livekit::TrackSource) -> TrackerConfig {
+pub fn tracker_config(source: mediacore::TrackSource) -> TrackerConfig {
     match source {
-        livekit::TrackSource::ScreenShare | livekit::TrackSource::ScreenShareAudio => {
+        mediacore::TrackSource::ScreenShare | mediacore::TrackSource::ScreenShareAudio => {
             TrackerConfig::screenshare()
         }
-        livekit::TrackSource::Camera
-        | livekit::TrackSource::Microphone
-        | livekit::TrackSource::Unknown => TrackerConfig::video(),
+        mediacore::TrackSource::Camera
+        | mediacore::TrackSource::Microphone
+        | mediacore::TrackSource::Unknown => TrackerConfig::video(),
     }
 }
 
@@ -154,7 +154,7 @@ struct SourceState {
     pli: [Option<Instant>; LAYER_COUNT],
     demand: TrackDemand<String>,
     dynacast: Dynacast,
-    reported: Option<Vec<livekit::VideoLayer>>,
+    reported: Option<Vec<mediacore::VideoLayer>>,
 }
 
 pub struct TrackSource {
@@ -316,7 +316,7 @@ impl TrackSource {
         self.state().demand.remove(&subscriber_sid.to_owned())
     }
 
-    fn reported_layers(&self) -> Option<Vec<livekit::VideoLayer>> {
+    fn reported_layers(&self) -> Option<Vec<mediacore::VideoLayer>> {
         let mut state = self.state();
         let layers = self.layers.video_layers(state.active, &state.ssrcs);
 
@@ -977,7 +977,7 @@ impl MediaRouter {
         effects
     }
 
-    pub fn live_layers(&self, track_sid: &str) -> Option<Vec<livekit::VideoLayer>> {
+    pub fn live_layers(&self, track_sid: &str) -> Option<Vec<mediacore::VideoLayer>> {
         self.source(track_sid)?.reported_layers()
     }
 
@@ -1648,20 +1648,20 @@ mod tests {
     #[tokio::test]
     async fn a_screen_share_is_not_judged_by_camera_thresholds() {
         assert_eq!(
-            tracker_config(livekit::TrackSource::ScreenShare),
+            tracker_config(mediacore::TrackSource::ScreenShare),
             TrackerConfig::screenshare(),
             "a still screen share stops sending by design and would be declared gone"
         );
         assert_eq!(
-            tracker_config(livekit::TrackSource::ScreenShareAudio),
+            tracker_config(mediacore::TrackSource::ScreenShareAudio),
             TrackerConfig::screenshare()
         );
         assert_eq!(
-            tracker_config(livekit::TrackSource::Camera),
+            tracker_config(mediacore::TrackSource::Camera),
             TrackerConfig::video()
         );
         assert_eq!(
-            tracker_config(livekit::TrackSource::Unknown),
+            tracker_config(mediacore::TrackSource::Unknown),
             TrackerConfig::video()
         );
 
@@ -1669,12 +1669,12 @@ mod tests {
 
         assert_eq!(
             state
-                .source_config(livekit::TrackSource::ScreenShare)
+                .source_config(mediacore::TrackSource::ScreenShare)
                 .tracker,
             TrackerConfig::screenshare()
         );
         assert_eq!(
-            state.source_config(livekit::TrackSource::Camera).tracker,
+            state.source_config(mediacore::TrackSource::Camera).tracker,
             TrackerConfig::video()
         );
     }

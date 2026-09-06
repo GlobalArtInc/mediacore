@@ -35,6 +35,37 @@ pub struct Config {
     pub room: RoomConfig,
     pub rtc: RtcConfig,
     pub video: VideoConfig,
+    pub twirp: TwirpConfig,
+}
+
+/// How the room API answers, as distinct from what it does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TwirpConfig {
+    /// Also answer the room API at `/twirp/livekit.RoomService/<Method>`.
+    ///
+    /// The protobuf package is `mediacore`, so the service's own path is
+    /// `/twirp/mediacore.RoomService/<Method>`. LiveKit's server SDKs do not
+    /// take a path: they build it in generated code out of the package their
+    /// own `.proto` declares, and so does `lk`. Turning this off makes every
+    /// one of them answer `bad_route` against a server that is working
+    /// perfectly, and the caller has no setting to change -- they would have
+    /// to regenerate their client from our `.proto` or move to raw HTTP.
+    ///
+    /// So it is on, and it costs nothing to leave on: the alias is the same
+    /// handler, the same grant checks and the same error bodies, with the
+    /// service name in a `bad_route` message being the only thing that differs.
+    /// Turn it off when nothing built against LiveKit calls this server any
+    /// more and you would rather the old name stop working loudly than linger.
+    pub livekit_alias: bool,
+}
+
+impl Default for TwirpConfig {
+    fn default() -> Self {
+        Self {
+            livekit_alias: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +237,7 @@ impl Default for Config {
             room: RoomConfig::default(),
             rtc: RtcConfig::default(),
             video: VideoConfig::default(),
+            twirp: TwirpConfig::default(),
         }
     }
 }
@@ -364,6 +396,22 @@ mod tests {
         );
         assert_eq!(config.room.end_grace, DEFAULT_END_GRACE_SECONDS);
         assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
+    }
+
+    #[test]
+    fn the_livekit_twirp_alias_is_on_until_a_deployment_retires_it() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+
+        assert!(
+            config.twirp.livekit_alias,
+            "a deployment that upgrades without touching its config keeps answering \
+             /twirp/livekit.RoomService/ -- every LiveKit server SDK builds that path in \
+             generated code and cannot be pointed at another one"
+        );
+
+        let retired =
+            Config::parse("keys:\n  key1: secret1\ntwirp:\n  livekit_alias: false\n").unwrap();
+        assert!(!retired.twirp.livekit_alias);
     }
 
     #[test]

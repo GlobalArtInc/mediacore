@@ -7,7 +7,7 @@ use mediacore_client::{
     default_layers, proto,
 };
 use mediacore_config::Config;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_server::forward::SubscriptionSnapshot;
 use mediacore_server::http;
 use mediacore_server::state::AppState;
@@ -85,7 +85,7 @@ impl Server {
             .unwrap_or_default()
     }
 
-    fn reported_layers(&self, track_sid: &str) -> Vec<livekit::VideoLayer> {
+    fn reported_layers(&self, track_sid: &str) -> Vec<mediacore::VideoLayer> {
         self.state
             .registry
             .room(ROOM)
@@ -238,7 +238,7 @@ fn assert_only_layer(before: &TrackReport, after: &TrackReport, tag: u8, label: 
     );
 }
 
-fn qualities(update: &livekit::SubscribedQualityUpdate) -> Vec<(i32, bool)> {
+fn qualities(update: &mediacore::SubscribedQualityUpdate) -> Vec<(i32, bool)> {
     update
         .subscribed_codecs
         .first()
@@ -253,8 +253,8 @@ fn qualities(update: &livekit::SubscribedQualityUpdate) -> Vec<(i32, bool)> {
 }
 
 fn enabled_up_to(
-    update: &livekit::SubscribedQualityUpdate,
-    quality: livekit::VideoQuality,
+    update: &mediacore::SubscribedQualityUpdate,
+    quality: mediacore::VideoQuality,
 ) -> bool {
     qualities(update)
         .into_iter()
@@ -287,7 +287,7 @@ async fn every_subscriber_of_one_simulcast_track_gets_the_layer_it_asked_for() {
         vec!["q", "h", "f"],
         "the track carries the layers the publisher declared"
     );
-    assert_eq!(declared[0].quality, livekit::VideoQuality::Low as i32);
+    assert_eq!(declared[0].quality, mediacore::VideoQuality::Low as i32);
     assert_eq!(declared[2].width, 1280);
 
     bob.request_quality([sid.as_str()], proto::VideoQuality::Low)
@@ -464,9 +464,9 @@ async fn a_layer_nobody_wants_stops_being_sent_and_comes_back_before_it_is_neede
     let subscribed = sid.clone();
     let first = published
         .wait_for(PATIENCE, move |message| match message {
-            livekit::signal_response::Message::SubscribedQualityUpdate(update)
+            mediacore::signal_response::Message::SubscribedQualityUpdate(update)
                 if update.track_sid == subscribed
-                    && enabled_up_to(update, livekit::VideoQuality::High) =>
+                    && enabled_up_to(update, mediacore::VideoQuality::High) =>
             {
                 Some(update.clone())
             }
@@ -490,11 +490,11 @@ async fn a_layer_nobody_wants_stops_being_sent_and_comes_back_before_it_is_neede
     let subscribed = sid.clone();
     let stopped = published
         .wait_for(PATIENCE, move |message| match message {
-            livekit::signal_response::Message::SubscribedQualityUpdate(update)
+            mediacore::signal_response::Message::SubscribedQualityUpdate(update)
                 if update.track_sid == subscribed
                     && !qualities(update).is_empty()
                     && qualities(update).iter().any(|(quality, enabled)| {
-                        *quality == livekit::VideoQuality::High as i32 && !*enabled
+                        *quality == mediacore::VideoQuality::High as i32 && !*enabled
                     }) =>
             {
                 Some(update.clone())
@@ -510,7 +510,7 @@ async fn a_layer_nobody_wants_stops_being_sent_and_comes_back_before_it_is_neede
         asked_at.elapsed()
     );
     assert!(
-        enabled_up_to(&stopped, livekit::VideoQuality::Low),
+        enabled_up_to(&stopped, mediacore::VideoQuality::Low),
         "only the layer bob wants may stay on: {:?}",
         qualities(&stopped)
     );
@@ -524,10 +524,10 @@ async fn a_layer_nobody_wants_stops_being_sent_and_comes_back_before_it_is_neede
     let subscribed = sid.clone();
     let resumed = published
         .wait_for(PATIENCE, move |message| match message {
-            livekit::signal_response::Message::SubscribedQualityUpdate(update)
+            mediacore::signal_response::Message::SubscribedQualityUpdate(update)
                 if update.track_sid == subscribed
                     && qualities(update).iter().any(|(quality, enabled)| {
-                        *quality == livekit::VideoQuality::High as i32 && *enabled
+                        *quality == mediacore::VideoQuality::High as i32 && *enabled
                     }) =>
             {
                 Some(update.clone())
@@ -537,7 +537,7 @@ async fn a_layer_nobody_wants_stops_being_sent_and_comes_back_before_it_is_neede
         .await
         .expect("the publisher is told to send the top layer again");
 
-    assert!(enabled_up_to(&resumed, livekit::VideoQuality::High));
+    assert!(enabled_up_to(&resumed, mediacore::VideoQuality::High));
 
     let back = on_layer(&bob, &sid, HIGH, "bob").await;
     let after = grew(&bob, &sid, 20).await;
@@ -598,11 +598,11 @@ async fn a_disabled_track_stops_arriving_and_resumes_where_it_left_off() {
 
     let paused = states
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::StreamStateUpdate(update)
+            mediacore::signal_response::Message::StreamStateUpdate(update)
                 if update
                     .stream_states
                     .iter()
-                    .any(|state| state.state == livekit::StreamState::Paused as i32) =>
+                    .any(|state| state.state == mediacore::StreamState::Paused as i32) =>
             {
                 Some(update.clone())
             }

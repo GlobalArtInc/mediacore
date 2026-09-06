@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::rooms::{self, Grant, Method, Support};
 use crate::twirp::Code;
 
-/// The OpenAPI document for `livekit.RoomService`, generated from the
+/// The OpenAPI document for `mediacore.RoomService`, generated from the
 /// protobuf descriptors the build keeps.
 ///
 /// Nothing here is written twice. The paths, the request and response bodies,
@@ -114,7 +114,7 @@ fn build() -> Value {
     json!({
         "openapi": OPENAPI_VERSION,
         "info": {
-            "title": "mediacore — livekit.RoomService",
+            "title": rooms::SERVICE,
             "version": mediacore_proto::SERVER_VERSION,
             "description": preamble(),
             "license": {
@@ -407,13 +407,23 @@ fn create_room_fields() -> String {
 /// JSON a reader expects.
 fn preamble() -> String {
     let mut text = String::from(
-        "`livekit.RoomService` as **mediacore** implements it: the API a backoffice uses to \
-         create rooms, moderate them and take them away again.\n\n\
+        "`mediacore.RoomService`: the API a backoffice uses to create rooms, moderate them and \
+         take them away again. It is LiveKit's room service, method for method, under \
+         mediacore's own protobuf package.\n\n\
          It is [Twirp](https://twitchtv.github.io/twirp/docs/spec_v7.html), not REST. Every \
-         method is a `POST` to `/twirp/livekit.RoomService/<Method>` with one request body and \
+         method is a `POST` to `/twirp/mediacore.RoomService/<Method>` with one request body and \
          one response body — no path parameters, no query strings, no other verbs. A `GET` to \
          one of these paths is not a 405, it is `bad_route`, because Twirp identifies a call by \
          its path *and* its content type together.\n\n",
+    );
+
+    text.push_str(
+        "Unless the deployment has set `twirp.livekit_alias: false`, every method also answers at \
+         `/twirp/livekit.RoomService/<Method>` — the path LiveKit's own server SDKs and `lk` \
+         build in generated code and cannot be pointed away from. It is the same handler, the \
+         same grants and the same error bodies; only a `bad_route` message names whichever \
+         service you posted to. Where it has been retired that path is not routed at all, so a \
+         call to it comes back as a bare 404 with no Twirp code in it.\n\n",
     );
 
     text.push_str(

@@ -109,9 +109,11 @@ people whose network is merely slow, so this is documented rather than closed;
 `room.duplicate_identity: displace` is there for a deployment that would rather have LiveKit's rule
 and its ghost-free rejoin.
 
-There is a server API as well as a signalling one. `livekit.RoomService` — the Twirp service LiveKit's
-own server SDKs and `lk` speak — answers at `POST /twirp/livekit.RoomService/<Method>` in JSON or
-protobuf, so a backoffice that already drives LiveKit drives this without a line changed. Rooms can
+There is a server API as well as a signalling one. `mediacore.RoomService` — LiveKit's room service,
+method for method, which its own server SDKs and `lk` speak — answers at
+`POST /twirp/mediacore.RoomService/<Method>` in JSON or protobuf, and also at
+`POST /twirp/livekit.RoomService/<Method>`, so a backoffice that already drives LiveKit drives this
+without a line changed. Rooms can
 be created, listed and deleted; participants can be listed, read, renamed, given or refused
 permission, muted, subscribed and unsubscribed on their behalf, and removed. The three methods that
 only make sense across several nodes — `ForwardParticipant`, `MoveParticipant`, `PerformRpc` — and
@@ -374,6 +376,18 @@ client that sends them stays connected. The vendored `.proto` files under
 `crates/proto/protobufs` are copied from `livekit/protocol` and are the single source of truth for
 the wire format.
 
+They are copied byte for byte, upstream's `package livekit;` included, and `crates/proto/build.rs`
+renames that package to `mediacore` on the compiled descriptors before a line of Rust is generated.
+So the types are `mediacore_proto::mediacore::ParticipantInfo` rather than `…::livekit::…`, and the
+room API is served at `/twirp/mediacore.RoomService/` — both because the descriptors say so, and
+neither because anything rewrites a name on the way out. Re-vendoring stays a straight copy with a
+diff against upstream that is honest, which is the whole reason the rename is not in the `.proto`
+text; `crates/proto/protobufs/README.md` says so where somebody dropping a new file in will see it.
+Nothing about the bytes changes: protobuf sends field numbers, not names, and the one construct that
+would put a fully-qualified type name on the wire, `google.protobuf.Any`, appears nowhere in the
+schema. The Twirp URL was the only place the package was ever visible outside the process, which is
+why that is the only place the old name survives.
+
 Both wires are generated from them. The signalling socket carries the types as protobuf; the server
 API carries the same types as protobuf or as protobuf's JSON mapping, whose serialisers are generated
 beside the Rust ones from the same descriptors. Neither wire is written by hand, so neither can drift
@@ -381,10 +395,33 @@ from the `.proto`.
 
 ## Server API
 
-`livekit.RoomService` is where a backoffice, a bot or `lk` talks to the server rather than to a room.
-It is Twirp: `POST /twirp/livekit.RoomService/<Method>`, one body in, one body out, no streaming.
-All of it is also a page with buttons on it, at [`/swagger`](#the-page-at-swagger), generated from
-the same protobuf descriptors the wire is.
+`mediacore.RoomService` is where a backoffice, a bot or `lk` talks to the server rather than to a
+room. It is Twirp: `POST /twirp/mediacore.RoomService/<Method>`, one body in, one body out, no
+streaming. All of it is also a page with buttons on it, at [`/swagger`](#the-page-at-swagger),
+generated from the same protobuf descriptors the wire is.
+
+**It answers to a second name, and that one is not optional for LiveKit's SDKs.** Twirp builds its
+path out of the protobuf package, and LiveKit's server SDKs and `lk` build it from *their* package,
+in generated code, with no setting to point them elsewhere. So every method also answers at
+`POST /twirp/livekit.RoomService/<Method>`. It is the same axum handler reading the same
+`rooms::METHODS` table, so the two paths cannot come to disagree about which methods exist, what
+grant each one wants or what a failure looks like; the only difference is that a `bad_route` names
+whichever service the caller posted to, because telling somebody about a path they did not use hides
+their typo behind a name they have never seen.
+
+The alias is on by default and costs nothing to leave on:
+
+```yaml
+twirp:
+  livekit_alias: true
+```
+
+Turn it off and `/twirp/livekit.RoomService/…` stops being routed at all — not refused with a Twirp
+error, but a bare 404 with no body, which an SDK reports as a transport failure rather than as a
+method that does not exist. Every LiveKit-generated client pointed at this server breaks at once and
+has no setting they can change to recover; they would have to regenerate against our `.proto` or
+drop to raw HTTP. Turn it off when nothing built against LiveKit calls this server any more and you
+would rather the old name stop working loudly than linger.
 
 A request carries `Content-Type: application/json` or `application/protobuf` and
 `Authorization: Bearer <token>`, and the answer comes back in whichever the request used. The JSON is
@@ -580,7 +617,7 @@ match the descriptor pool field for field, so a document that was edited by hand
 fails there.
 
 **The page is served by the SFU, on the same origin as the API.** Try-it-out posts to
-`/twirp/livekit.RoomService/…` on whatever origin served the page, so the two have to be one origin
+`/twirp/mediacore.RoomService/…` on whatever origin served the page, so the two have to be one origin
 or every button is a cross-origin call to another port. The front end deploys on its own schedule
 and does not have the descriptors; the SFU has both, which also means the page works unchanged over
 an SSH tunnel to `127.0.0.1:7880` with no proxy in front of it. `deploy/Caddyfile` routes `/swagger*`
@@ -675,8 +712,9 @@ Endpoints:
 - `GET /rtc/validate?access_token=…` — token check, returns the identity
 - `GET /rtc?access_token=…` — signalling WebSocket. `auto_subscribe=0` joins without subscribing
   to anything; it is on by default.
-- `POST /twirp/livekit.RoomService/<Method>` — the server API, described under
-  [Server API](#server-api)
+- `POST /twirp/mediacore.RoomService/<Method>` — the server API, described under
+  [Server API](#server-api). Also answered at `/twirp/livekit.RoomService/<Method>` unless
+  `twirp.livekit_alias` is turned off.
 
 Tokens are standard LiveKit access tokens: HS256, `iss` is the API key, `sub` is the participant
 identity, and the `video` claim carries the grants. Any LiveKit token generator works, including
@@ -718,7 +756,7 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/transport` | ICE, DTLS-SRTP, RTP intake and egress, one task per peer connection |
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
-| `crates/server` | HTTP and WebSocket endpoints, the `livekit.RoomService` server API and its `/swagger` page, binary |
+| `crates/server` | HTTP and WebSocket endpoints, the `mediacore.RoomService` server API and its `/swagger` page, binary |
 | `crates/front` | the browser front end: one page, an audio room, a token endpoint, and an optional OpenID Connect sign-in |
 
 `crates/room` owns all shared state and knows nothing about transport; `crates/transport` speaks

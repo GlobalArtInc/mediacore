@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use mediacore_proto::livekit::{self, signal_response};
+use mediacore_proto::mediacore::{self, signal_response};
 use mediacore_room::Joined;
 use mediacore_transport::str0m::format::{Codec, PayloadParams};
 use mediacore_transport::str0m::media::MediaKind;
@@ -50,7 +50,7 @@ impl PublisherSession {
         &mut self,
         state: &AppState,
         joined: &Joined,
-        offer: livekit::SessionDescription,
+        offer: mediacore::SessionDescription,
     ) {
         let handle = match self.ensure_peer(state, joined).await {
             Some(handle) => handle,
@@ -72,7 +72,7 @@ impl PublisherSession {
         let bundle = bundle_mid(&answer);
 
         joined.participant.send(signal_response::Message::Answer(
-            livekit::SessionDescription {
+            mediacore::SessionDescription {
                 r#type: "answer".to_owned(),
                 sdp: answer,
                 id: offer.id,
@@ -84,8 +84,8 @@ impl PublisherSession {
         self.bind_offered_tracks(state, joined, &offer);
     }
 
-    pub async fn on_trickle(&mut self, joined: &Joined, request: livekit::TrickleRequest) {
-        if request.target != livekit::SignalTarget::Publisher as i32 {
+    pub async fn on_trickle(&mut self, joined: &Joined, request: mediacore::TrickleRequest) {
+        if request.target != mediacore::SignalTarget::Publisher as i32 {
             tracing::debug!(
                 identity = %joined.participant.identity,
                 target = request.target,
@@ -274,7 +274,7 @@ impl PublisherSession {
                 );
                 joined
                     .participant
-                    .disconnect(livekit::DisconnectReason::UnknownReason);
+                    .disconnect(mediacore::DisconnectReason::UnknownReason);
                 return None;
             }
         };
@@ -327,7 +327,7 @@ impl PublisherSession {
         &mut self,
         state: &AppState,
         joined: &Joined,
-        offer: &livekit::SessionDescription,
+        offer: &mediacore::SessionDescription,
     ) {
         let mut bound = false;
         let sending = sending_sections(&offer.sdp);
@@ -502,7 +502,7 @@ fn unpublish(state: &AppState, joined: &Joined, track_sid: &str) {
     joined
         .participant
         .send(signal_response::Message::TrackUnpublished(
-            livekit::TrackUnpublishedResponse {
+            mediacore::TrackUnpublishedResponse {
                 track_sid: track_sid.to_owned(),
             },
         ));
@@ -553,7 +553,7 @@ fn announce(joined: &Joined) {
 
     let info = joined
         .participant
-        .to_proto(livekit::participant_info::State::Active);
+        .to_proto(mediacore::participant_info::State::Active);
 
     joined.room.broadcast(
         mediacore_room::participant_update(vec![info]),
@@ -562,9 +562,9 @@ fn announce(joined: &Joined) {
 }
 
 fn trickle(candidate_init: String, final_candidate: bool) -> signal_response::Message {
-    signal_response::Message::Trickle(livekit::TrickleRequest {
+    signal_response::Message::Trickle(mediacore::TrickleRequest {
         candidate_init,
-        target: livekit::SignalTarget::Publisher as i32,
+        target: mediacore::SignalTarget::Publisher as i32,
         r#final: final_candidate,
     })
 }
@@ -607,7 +607,7 @@ pub(crate) fn candidate_from_init(candidate_init: &str) -> Option<String> {
     (!parsed.candidate.trim().is_empty()).then_some(parsed.candidate)
 }
 
-pub fn offered_tracks(offer: &livekit::SessionDescription) -> Vec<(String, String)> {
+pub fn offered_tracks(offer: &mediacore::SessionDescription) -> Vec<(String, String)> {
     if !offer.mid_to_track_id.is_empty() {
         let mut pairs: Vec<(String, String)> = offer
             .mid_to_track_id
@@ -724,8 +724,8 @@ a=sendonly\r\n\
 a=ssrc:42 cname:x\r\n\
 a=ssrc:42 msid:stream-1 cid-video\r\n";
 
-    fn offer(sdp: &str) -> livekit::SessionDescription {
-        livekit::SessionDescription {
+    fn offer(sdp: &str) -> mediacore::SessionDescription {
+        mediacore::SessionDescription {
             r#type: "offer".to_owned(),
             sdp: sdp.to_owned(),
             ..Default::default()

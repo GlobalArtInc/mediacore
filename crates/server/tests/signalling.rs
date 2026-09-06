@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_config::Config;
-use mediacore_proto::livekit::{self, signal_request, signal_response};
+use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use mediacore_server::{http, state::AppState};
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,7 +78,7 @@ async fn next_signal(client: &mut Client) -> signal_response::Message {
             .expect("socket error");
 
         if let Message::Binary(data) = message {
-            let response = livekit::SignalResponse::decode(data.as_ref()).unwrap();
+            let response = mediacore::SignalResponse::decode(data.as_ref()).unwrap();
             if let Some(message) = response.message {
                 return message;
             }
@@ -125,7 +125,7 @@ async fn participants_learn_about_each_other() {
             assert_eq!(update.participants[0].identity, "bob");
             assert_eq!(
                 update.participants[0].state,
-                livekit::participant_info::State::Joined as i32
+                mediacore::participant_info::State::Joined as i32
             );
         }
         other => panic!("expected a participant update, got {other:?}"),
@@ -138,7 +138,7 @@ async fn participants_learn_about_each_other() {
             assert_eq!(update.participants[0].identity, "bob");
             assert_eq!(
                 update.participants[0].state,
-                livekit::participant_info::State::Disconnected as i32
+                mediacore::participant_info::State::Disconnected as i32
             );
         }
         other => panic!("expected a disconnect update, got {other:?}"),
@@ -151,8 +151,8 @@ async fn ping_is_answered_with_pong() {
     let mut alice = connect(addr, "alice", "demo").await;
     let _ = next_signal(&mut alice).await;
 
-    let request = livekit::SignalRequest {
-        message: Some(signal_request::Message::PingReq(livekit::Ping {
+    let request = mediacore::SignalRequest {
+        message: Some(signal_request::Message::PingReq(mediacore::Ping {
             timestamp: 1234,
             rtt: 0,
         })),
@@ -297,7 +297,7 @@ async fn connect_resuming(addr: SocketAddr, identity: &str, room: &str, sid: &st
     socket
 }
 
-async fn next_join(client: &mut Client) -> livekit::JoinResponse {
+async fn next_join(client: &mut Client) -> mediacore::JoinResponse {
     match next_signal(client).await {
         signal_response::Message::Join(join) => join,
         other => panic!("expected a join response, got {other:?}"),
@@ -330,7 +330,7 @@ async fn a_second_connection_from_one_person_is_told_which_one_it_is() {
             assert_eq!(update.participants[0].identity, "alice#2");
             assert_eq!(
                 update.participants[0].state,
-                livekit::participant_info::State::Joined as i32
+                mediacore::participant_info::State::Joined as i32
             );
         }
         other => panic!("the laptop was not told about the phone, it got {other:?}"),
@@ -356,7 +356,7 @@ async fn a_reconnecting_client_takes_back_the_session_it_names() {
     match next_signal(&mut first).await {
         signal_response::Message::Leave(leave) => assert_eq!(
             leave.reason,
-            livekit::DisconnectReason::DuplicateIdentity as i32
+            mediacore::DisconnectReason::DuplicateIdentity as i32
         ),
         other => panic!("the session that was taken over was left running, it got {other:?}"),
     }

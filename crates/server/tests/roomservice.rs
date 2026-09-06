@@ -4,7 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_config::Config;
-use mediacore_proto::livekit::{self, signal_request, signal_response};
+use mediacore_proto::mediacore::{self, signal_request, signal_response};
+use mediacore_server::rooms::{self, Grant, Support};
 use mediacore_server::{http, state::AppState};
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,12 +19,17 @@ const API_SECRET: &str = "devsecretdevsecretdevsecretdevsecret";
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn spawn_server() -> SocketAddr {
+    spawn_server_with(|_| {}).await
+}
+
+async fn spawn_server_with(adjust: impl FnOnce(&mut Config)) -> SocketAddr {
     let mut config = Config::parse(&format!("keys:\n  {API_KEY}: {API_SECRET}\n")).unwrap();
     config.port = 0;
     config.rtc.udp_port = 0;
     config.rtc.port_range_start = 0;
     config.rtc.port_range_end = 0;
     config.rtc.bind_address = "127.0.0.1".to_owned();
+    adjust(&mut config);
 
     let state = AppState::start(config).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -184,10 +190,36 @@ async fn call_with_verb(
     authorization: Option<&str>,
     body: &[u8],
 ) -> Answer {
+    call_at(
+        addr,
+        rooms::PATH_PREFIX,
+        verb,
+        method,
+        content_type,
+        authorization,
+        body,
+    )
+    .await
+}
+
+/// The same call, under whichever of the service's two names the caller picks.
+///
+/// The prefix is a parameter rather than a constant so that the compatibility
+/// alias is exercised by the same helper, and therefore by the same
+/// assertions, as the canonical path.
+async fn call_at(
+    addr: SocketAddr,
+    prefix: &str,
+    verb: &str,
+    method: &str,
+    content_type: &str,
+    authorization: Option<&str>,
+    body: &[u8],
+) -> Answer {
     let exchange = async {
         let mut socket = TcpStream::connect(addr).await.expect("connect");
         let mut head = format!(
-            "{verb} /twirp/livekit.RoomService/{method} HTTP/1.1\r\nHost: {addr}\r\n\
+            "{verb} {prefix}{method} HTTP/1.1\r\nHost: {addr}\r\n\
              Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
         );
@@ -267,7 +299,7 @@ async fn next_signal(client: &mut Client) -> signal_response::Message {
             .expect("socket error");
 
         if let Message::Binary(data) = message {
-            let response = livekit::SignalResponse::decode(data.as_ref()).unwrap();
+            let response = mediacore::SignalResponse::decode(data.as_ref()).unwrap();
             if let Some(message) = response.message {
                 return message;
             }
@@ -275,7 +307,7 @@ async fn next_signal(client: &mut Client) -> signal_response::Message {
     }
 }
 
-async fn join(addr: SocketAddr, identity: &str, room: &str) -> (Client, livekit::JoinResponse) {
+async fn join(addr: SocketAddr, identity: &str, room: &str) -> (Client, mediacore::JoinResponse) {
     let mut client = connect(addr, identity, room).await;
     match next_signal(&mut client).await {
         signal_response::Message::Join(join) => (client, join),
@@ -283,14 +315,14 @@ async fn join(addr: SocketAddr, identity: &str, room: &str) -> (Client, livekit:
     }
 }
 
-async fn publish(client: &mut Client, cid: &str) -> livekit::TrackInfo {
-    let request = livekit::SignalRequest {
+async fn publish(client: &mut Client, cid: &str) -> mediacore::TrackInfo {
+    let request = mediacore::SignalRequest {
         message: Some(signal_request::Message::AddTrack(
-            livekit::AddTrackRequest {
+            mediacore::AddTrackRequest {
                 cid: cid.to_owned(),
                 name: cid.to_owned(),
-                r#type: livekit::TrackType::Audio as i32,
-                source: livekit::TrackSource::Microphone as i32,
+                r#type: mediacore::TrackType::Audio as i32,
+                source: mediacore::TrackSource::Microphone as i32,
                 ..Default::default()
             },
         )),
@@ -351,7 +383,7 @@ async fn a_room_is_created_and_then_listed_over_json() {
 async fn the_same_call_in_protobuf_is_answered_in_protobuf() {
     let addr = spawn_server().await;
 
-    let request = livekit::CreateRoomRequest {
+    let request = mediacore::CreateRoomRequest {
         name: "board".to_owned(),
         max_participants: 8,
         ..Default::default()
@@ -368,7 +400,7 @@ async fn the_same_call_in_protobuf_is_answered_in_protobuf() {
     assert_eq!(created.status, 200);
     assert_eq!(created.content_type, "application/protobuf");
 
-    let room = livekit::Room::decode(created.body.as_slice()).expect("a protobuf room");
+    let room = mediacore::Room::decode(created.body.as_slice()).expect("a protobuf room");
     assert_eq!(room.name, "board");
     assert_eq!(room.max_participants, 8);
 }
@@ -544,10 +576,11 @@ async fn a_browser_may_preflight_a_room_service_call_that_carries_a_token() {
     let exchange = async {
         let mut socket = TcpStream::connect(addr).await.expect("connect");
         let request = format!(
-            "OPTIONS /twirp/livekit.RoomService/ListRooms HTTP/1.1\r\nHost: {addr}\r\n\
+            "OPTIONS {}ListRooms HTTP/1.1\r\nHost: {addr}\r\n\
              Origin: http://backoffice.test\r\nAccess-Control-Request-Method: POST\r\n\
              Access-Control-Request-Headers: authorization,content-type\r\n\
-             Connection: close\r\n\r\n"
+             Connection: close\r\n\r\n",
+            rooms::PATH_PREFIX
         );
         socket.write_all(request.as_bytes()).await.expect("request");
 
@@ -839,7 +872,7 @@ async fn deleting_a_room_disconnects_the_people_in_it() {
                 signal_response::Message::Leave(leave) => {
                     assert_eq!(
                         leave.reason,
-                        livekit::DisconnectReason::RoomDeleted as i32,
+                        mediacore::DisconnectReason::RoomDeleted as i32,
                         "{name} was cut off without being told the room was deleted, so their \
                          client cannot tell this from a network failure and will try to reconnect"
                     );
@@ -1067,7 +1100,7 @@ async fn removing_a_person_takes_every_connection_they_have() {
             if let signal_response::Message::Leave(leave) = next_signal(client).await {
                 assert_eq!(
                     leave.reason,
-                    livekit::DisconnectReason::ParticipantRemoved as i32,
+                    mediacore::DisconnectReason::ParticipantRemoved as i32,
                     "{name} stayed in the room after a moderator removed the person holding it"
                 );
                 break;
@@ -1421,4 +1454,295 @@ async fn a_subscription_can_be_dropped_and_taken_back_from_outside() {
     )
     .await;
     assert_eq!(taken_back.status, 200);
+}
+
+// The compatibility alias
+
+/// The room the alias calls below name, so that a scoped `roomAdmin` token can
+/// be minted for it.
+const ALIAS_ROOM: &str = "standup";
+
+/// A token carrying exactly one grant, scoped where the grant is scoped.
+fn token_for(grant: Grant, room: &str) -> String {
+    match grant {
+        Grant::Create => scoped_creator(room),
+        Grant::List => lister(),
+        Grant::Admin => admin(room),
+    }
+}
+
+/// A request body carrying exactly the fields the table says the method
+/// insists on, so the call gets past argument checking and as far as the parts
+/// the two paths share.
+fn required_body(method: &rooms::Method) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+
+    for field in method.requires {
+        let value = match *field {
+            "name" | "room" => ALIAS_ROOM,
+            "identity" => "alice",
+            "trackSid" => "TR_nothing",
+            other => panic!(
+                "rooms::METHODS says `{}` requires `{other}`, and this test does not know what a \
+                 plausible value for it looks like -- teach it here rather than dropping the field",
+                method.name
+            ),
+        };
+        body.insert((*field).to_owned(), serde_json::json!(value));
+    }
+
+    serde_json::Value::Object(body)
+}
+
+/// The top-level fields of a successful answer, which is as much of the body
+/// as two independent servers can be expected to agree on: room ids and
+/// creation times are theirs alone.
+fn shape(answer: &Answer) -> Vec<String> {
+    if answer.status != 200 {
+        return Vec::new();
+    }
+
+    let mut fields = answer
+        .json()
+        .as_object()
+        .map(|body| body.keys().cloned().collect::<Vec<String>>())
+        .unwrap_or_default();
+    fields.sort();
+    fields
+}
+
+/// The alias is the same service under an older name, not a second one.
+///
+/// Every method in the table, under every grant a caller might hold and under
+/// none at all, asked of both paths. The two servers are driven through the
+/// same sequence of calls, so their registries are in the same state at every
+/// step and any difference in an answer is the routing and nothing else.
+///
+/// This is the half of the API a paying integration depends on: LiveKit's
+/// server SDKs build `/twirp/livekit.RoomService/<Method>` in generated code,
+/// so a divergence here is a backoffice that stops working against a server
+/// whose own tests all pass.
+#[tokio::test]
+async fn the_alias_answers_every_method_exactly_as_the_canonical_path_does() {
+    let canonical = spawn_server().await;
+    let aliased = spawn_server().await;
+
+    for method in rooms::METHODS {
+        let body = required_body(method).to_string();
+
+        for holder in [
+            None,
+            Some(Grant::Create),
+            Some(Grant::List),
+            Some(Grant::Admin),
+        ] {
+            let token = holder.map(|grant| token_for(grant, ALIAS_ROOM));
+            let held = holder.map_or("no token", Grant::claim);
+
+            let straight = call_at(
+                canonical,
+                rooms::PATH_PREFIX,
+                "POST",
+                method.name,
+                "application/json",
+                token.as_deref(),
+                body.as_bytes(),
+            )
+            .await;
+            let through_alias = call_at(
+                aliased,
+                rooms::ALIAS_PREFIX,
+                "POST",
+                method.name,
+                "application/json",
+                token.as_deref(),
+                body.as_bytes(),
+            )
+            .await;
+
+            assert_eq!(
+                straight.status,
+                through_alias.status,
+                "`{}` with {held} answered {} on `{}` and {} on `{}`: an SDK reads the status \
+                 before it reads the body, so the two paths disagree about whether the call even \
+                 failed",
+                method.name,
+                straight.status,
+                rooms::SERVICE,
+                through_alias.status,
+                rooms::ALIAS_SERVICE
+            );
+            assert_ne!(
+                through_alias.code(),
+                "bad_route",
+                "`{}` is in rooms::METHODS and `{}` does not route it, so a LiveKit SDK calling \
+                 a method this server implements is told the method does not exist",
+                method.name,
+                rooms::ALIAS_SERVICE
+            );
+            assert_eq!(
+                straight.code(),
+                through_alias.code(),
+                "`{}` with {held} came back as `{}` on `{}` and `{}` on `{}`, and a caller turns \
+                 that code into a typed error",
+                method.name,
+                straight.code(),
+                rooms::SERVICE,
+                through_alias.code(),
+                rooms::ALIAS_SERVICE
+            );
+            assert_eq!(
+                straight.message(),
+                through_alias.message(),
+                "`{}` with {held} explained itself differently on the two paths, so whichever \
+                 name a caller uses decides what they are told went wrong",
+                method.name
+            );
+            assert_eq!(
+                shape(&straight),
+                shape(&through_alias),
+                "`{}` with {held} answered with different fields on the two paths, and a \
+                 generated client is built out of exactly those fields",
+                method.name
+            );
+        }
+    }
+}
+
+/// A grant is checked once, so the alias cannot be the loose door.
+#[tokio::test]
+async fn the_alias_refuses_a_token_the_canonical_path_would_refuse() {
+    let addr = spawn_server().await;
+
+    for method in rooms::METHODS {
+        let Support::Served(wanted) = method.support else {
+            continue;
+        };
+        let body = required_body(method).to_string();
+
+        for grant in [Grant::Create, Grant::List, Grant::Admin] {
+            if grant == wanted {
+                continue;
+            }
+
+            let answered = call_at(
+                addr,
+                rooms::ALIAS_PREFIX,
+                "POST",
+                method.name,
+                "application/json",
+                Some(&token_for(grant, ALIAS_ROOM)),
+                body.as_bytes(),
+            )
+            .await;
+
+            assert!(
+                !answered.body.is_empty(),
+                "`{}` is not routed under `{}` at all: the alias is gone, and a LiveKit SDK \
+                 pointed here gets a bare 404 with nothing in it to read",
+                method.name,
+                rooms::ALIAS_SERVICE
+            );
+            assert_eq!(
+                answered.code(),
+                "permission_denied",
+                "`{}` wants `{}` and a `{}` token got through the alias: the old path would be a \
+                 way around the grants, and it is the path every LiveKit SDK uses",
+                method.name,
+                wanted.claim(),
+                grant.claim()
+            );
+        }
+
+        if wanted.scoped() {
+            let elsewhere = call_at(
+                addr,
+                rooms::ALIAS_PREFIX,
+                "POST",
+                method.name,
+                "application/json",
+                Some(&token_for(wanted, "payroll")),
+                body.as_bytes(),
+            )
+            .await;
+
+            assert_eq!(
+                elsewhere.code(),
+                "permission_denied",
+                "`{}` is scoped by the token's `room` claim and a token for `payroll` moderated \
+                 `{ALIAS_ROOM}` through the alias, which makes every admin token a master key",
+                method.name
+            );
+        }
+    }
+}
+
+/// A `bad_route` names the service the caller used, not the other one.
+#[tokio::test]
+async fn a_bad_route_names_the_service_the_caller_posted_to() {
+    let addr = spawn_server().await;
+
+    let straight = post_json(addr, "DestroyEverything", &creator(), serde_json::json!({})).await;
+    let aliased = call_at(
+        addr,
+        rooms::ALIAS_PREFIX,
+        "POST",
+        "DestroyEverything",
+        "application/json",
+        Some(&creator()),
+        b"{}".as_slice(),
+    )
+    .await;
+
+    assert_eq!(straight.status, aliased.status);
+    assert_eq!(straight.code(), "bad_route");
+    assert_eq!(aliased.code(), "bad_route");
+
+    assert!(
+        straight.message().contains(rooms::SERVICE)
+            && !straight.message().contains(rooms::ALIAS_SERVICE),
+        "a call to `{}` was refused in the name of the other service: {}",
+        rooms::SERVICE,
+        straight.message()
+    );
+    assert!(
+        aliased.message().contains(rooms::ALIAS_SERVICE)
+            && !aliased.message().contains(rooms::SERVICE),
+        "somebody who posted to `{}` is told about `{}`, and goes looking for a path they never \
+         used while their typo stays invisible: {}",
+        rooms::ALIAS_SERVICE,
+        rooms::SERVICE,
+        aliased.message()
+    );
+}
+
+/// What turning the alias off actually costs.
+#[tokio::test]
+async fn the_alias_can_be_retired_and_takes_the_livekit_sdks_with_it() {
+    let addr = spawn_server_with(|config| config.twirp.livekit_alias = false).await;
+
+    let straight = post_json(addr, "ListRooms", &lister(), serde_json::json!({})).await;
+    assert_eq!(
+        straight.status, 200,
+        "retiring the old name must not disturb the service's own path"
+    );
+
+    let aliased = call_at(
+        addr,
+        rooms::ALIAS_PREFIX,
+        "POST",
+        "ListRooms",
+        "application/json",
+        Some(&lister()),
+        b"{}".as_slice(),
+    )
+    .await;
+
+    assert_eq!(aliased.status, 404);
+    assert!(
+        aliased.body.is_empty(),
+        "the route is gone rather than refusing, so there is no Twirp handler left to give the \
+         caller a code -- an SDK sees a bare 404 and reports a transport failure rather than a \
+         method that does not exist. That is what turning this off costs, and why it is on."
+    );
 }

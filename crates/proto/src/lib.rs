@@ -1,7 +1,18 @@
+/// The wire types, in mediacore's own package.
+///
+/// The vendored `.proto` files say `package livekit;` because they are copied
+/// from `livekit/protocol` unchanged. `build.rs` renames the package on the
+/// compiled descriptors, before a line of Rust is generated, so this module is
+/// `mediacore` and the room API is served at `/twirp/mediacore.RoomService/`
+/// -- both because the descriptors say so, not because anything rewrites a
+/// name on the way out. Nothing about the bytes on the wire changes: protobuf
+/// sends field numbers, and the only construct that would carry a
+/// fully-qualified type name, `google.protobuf.Any`, appears nowhere in the
+/// schema.
 #[allow(clippy::all)]
-pub mod livekit {
-    include!(concat!(env!("OUT_DIR"), "/livekit.rs"));
-    include!(concat!(env!("OUT_DIR"), "/livekit.serde.rs"));
+pub mod mediacore {
+    include!(concat!(env!("OUT_DIR"), "/mediacore.rs"));
+    include!(concat!(env!("OUT_DIR"), "/mediacore.serde.rs"));
 }
 
 #[allow(clippy::all)]

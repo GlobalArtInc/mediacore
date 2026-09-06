@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_client::{Client, ClientOptions, LayerId, PublishedTrack, TrackReport, TrackSpec};
 use mediacore_config::Config;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_server::forward::SubscriptionSnapshot;
 use mediacore_server::http;
 use mediacore_server::state::AppState;
@@ -306,10 +306,10 @@ async fn audio_keeps_flowing_while_video_is_paused_for_bandwidth() {
 
     let paused = states
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::StreamStateUpdate(update)
+            mediacore::signal_response::Message::StreamStateUpdate(update)
                 if update.stream_states.iter().any(|state| {
                     state.track_sid == video_sid
-                        && state.state == livekit::StreamState::Paused as i32
+                        && state.state == mediacore::StreamState::Paused as i32
                 }) =>
             {
                 Some(update.clone())
@@ -347,10 +347,10 @@ async fn audio_keeps_flowing_while_video_is_paused_for_bandwidth() {
 
     resumes
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::StreamStateUpdate(update)
+            mediacore::signal_response::Message::StreamStateUpdate(update)
                 if update.stream_states.iter().any(|state| {
                     state.track_sid == video_sid
-                        && state.state == livekit::StreamState::Active as i32
+                        && state.state == mediacore::StreamState::Active as i32
                 }) =>
             {
                 Some(())

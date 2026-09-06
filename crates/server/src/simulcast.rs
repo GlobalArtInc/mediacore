@@ -1,4 +1,4 @@
-use mediacore_proto::livekit::{self, signal_response};
+use mediacore_proto::mediacore::{self, signal_response};
 use mediacore_room::Room;
 use mediacore_sfu::{
     LAYER_COUNT, LayerLadder, LayerPreference, LayerSet, SpatialLayer, VideoQuality,
@@ -26,7 +26,7 @@ pub struct LayerMap {
 }
 
 impl LayerMap {
-    pub fn build(declared: &[livekit::VideoLayer], rids: &[Rid]) -> Self {
+    pub fn build(declared: &[mediacore::VideoLayer], rids: &[Rid]) -> Self {
         if rids.is_empty() {
             return Self::single(declared);
         }
@@ -86,7 +86,7 @@ impl LayerMap {
         }
     }
 
-    fn single(declared: &[livekit::VideoLayer]) -> Self {
+    fn single(declared: &[mediacore::VideoLayer]) -> Self {
         let ladder = ascending(declared);
 
         if ladder.len() > 1 {
@@ -176,14 +176,14 @@ impl LayerMap {
     pub fn subscribed_qualities(
         &self,
         highest: Option<SpatialLayer>,
-    ) -> Vec<livekit::SubscribedQuality> {
+    ) -> Vec<mediacore::SubscribedQuality> {
         let ceiling = highest
             .map(|layer| self.quality_of(layer))
             .and_then(VideoQuality::rank);
 
         [VideoQuality::Low, VideoQuality::Medium, VideoQuality::High]
             .into_iter()
-            .map(|quality| livekit::SubscribedQuality {
+            .map(|quality| mediacore::SubscribedQuality {
                 quality: proto_quality(quality) as i32,
                 enabled: quality
                     .rank()
@@ -197,11 +197,11 @@ impl LayerMap {
         &self,
         present: LayerSet,
         ssrcs: &[Option<u32>; LAYER_COUNT],
-    ) -> Vec<livekit::VideoLayer> {
+    ) -> Vec<mediacore::VideoLayer> {
         self.entries
             .iter()
             .filter(|entry| present.contains(entry.layer))
-            .map(|entry| livekit::VideoLayer {
+            .map(|entry| mediacore::VideoLayer {
                 quality: proto_quality(entry.quality) as i32,
                 width: entry.width,
                 height: entry.height,
@@ -215,13 +215,13 @@ impl LayerMap {
     }
 }
 
-fn ascending(declared: &[livekit::VideoLayer]) -> Vec<&livekit::VideoLayer> {
-    let mut ladder: Vec<&livekit::VideoLayer> = declared.iter().collect();
+fn ascending(declared: &[mediacore::VideoLayer]) -> Vec<&mediacore::VideoLayer> {
+    let mut ladder: Vec<&mediacore::VideoLayer> = declared.iter().collect();
     ladder.sort_by_key(|layer| quality_rank(layer.quality));
     ladder
 }
 
-fn named<'a>(rid: Rid, ladder: &[&'a livekit::VideoLayer]) -> Option<&'a livekit::VideoLayer> {
+fn named<'a>(rid: Rid, ladder: &[&'a mediacore::VideoLayer]) -> Option<&'a mediacore::VideoLayer> {
     let name = rid.to_string();
 
     ladder
@@ -230,7 +230,7 @@ fn named<'a>(rid: Rid, ladder: &[&'a livekit::VideoLayer]) -> Option<&'a livekit
         .find(|layer| !layer.rid.is_empty() && layer.rid == name)
 }
 
-fn ordered_rids(rids: &[Rid], ladder: &[&livekit::VideoLayer]) -> Vec<Rid> {
+fn ordered_rids(rids: &[Rid], ladder: &[&mediacore::VideoLayer]) -> Vec<Rid> {
     let mut ordered: Vec<(usize, usize, Rid)> = rids
         .iter()
         .enumerate()
@@ -241,7 +241,7 @@ fn ordered_rids(rids: &[Rid], ladder: &[&livekit::VideoLayer]) -> Vec<Rid> {
     ordered.into_iter().map(|(_, _, rid)| rid).collect()
 }
 
-fn rank(rid: Rid, index: usize, ladder: &[&livekit::VideoLayer]) -> usize {
+fn rank(rid: Rid, index: usize, ladder: &[&mediacore::VideoLayer]) -> usize {
     if let Some(layer) = named(rid, ladder) {
         return quality_rank(layer.quality);
     }
@@ -261,11 +261,11 @@ fn fallback_quality(layer: SpatialLayer) -> VideoQuality {
 }
 
 fn requested_quality(quality: i32) -> VideoQuality {
-    match livekit::VideoQuality::try_from(quality).unwrap_or(livekit::VideoQuality::High) {
-        livekit::VideoQuality::Low => VideoQuality::Low,
-        livekit::VideoQuality::Medium => VideoQuality::Medium,
-        livekit::VideoQuality::High => VideoQuality::High,
-        livekit::VideoQuality::Off => VideoQuality::Off,
+    match mediacore::VideoQuality::try_from(quality).unwrap_or(mediacore::VideoQuality::High) {
+        mediacore::VideoQuality::Low => VideoQuality::Low,
+        mediacore::VideoQuality::Medium => VideoQuality::Medium,
+        mediacore::VideoQuality::High => VideoQuality::High,
+        mediacore::VideoQuality::Off => VideoQuality::Off,
     }
 }
 
@@ -280,16 +280,16 @@ fn quality_rank(quality: i32) -> usize {
     declared_quality(quality).rank().unwrap_or_default() as usize
 }
 
-fn proto_quality(quality: VideoQuality) -> livekit::VideoQuality {
+fn proto_quality(quality: VideoQuality) -> mediacore::VideoQuality {
     match quality {
-        VideoQuality::Low => livekit::VideoQuality::Low,
-        VideoQuality::Medium => livekit::VideoQuality::Medium,
-        VideoQuality::High => livekit::VideoQuality::High,
-        VideoQuality::Off => livekit::VideoQuality::Off,
+        VideoQuality::Low => mediacore::VideoQuality::Low,
+        VideoQuality::Medium => mediacore::VideoQuality::Medium,
+        VideoQuality::High => mediacore::VideoQuality::High,
+        VideoQuality::Off => mediacore::VideoQuality::Off,
     }
 }
 
-pub fn preference_of(settings: &livekit::UpdateTrackSettings) -> LayerPreference {
+pub fn preference_of(settings: &mediacore::UpdateTrackSettings) -> LayerPreference {
     if settings.width > 0 && settings.height > 0 {
         return LayerPreference::Size {
             width: settings.width,
@@ -311,12 +311,12 @@ pub struct QualityUpdate {
 pub fn quality_message(
     track_sid: &str,
     codec: &str,
-    qualities: Vec<livekit::SubscribedQuality>,
+    qualities: Vec<mediacore::SubscribedQuality>,
 ) -> signal_response::Message {
-    signal_response::Message::SubscribedQualityUpdate(livekit::SubscribedQualityUpdate {
+    signal_response::Message::SubscribedQualityUpdate(mediacore::SubscribedQualityUpdate {
         track_sid: track_sid.to_owned(),
         subscribed_qualities: qualities.clone(),
-        subscribed_codecs: vec![livekit::SubscribedCodec {
+        subscribed_codecs: vec![mediacore::SubscribedCodec {
             codec: codec.to_owned(),
             qualities,
         }],
@@ -359,10 +359,12 @@ pub fn keyframe_kind() -> KeyframeRequestKind {
 mod tests {
     use super::*;
 
-    fn declared(entries: &[(livekit::VideoQuality, &str, u32, u32)]) -> Vec<livekit::VideoLayer> {
+    fn declared(
+        entries: &[(mediacore::VideoQuality, &str, u32, u32)],
+    ) -> Vec<mediacore::VideoLayer> {
         entries
             .iter()
-            .map(|(quality, rid, width, height)| livekit::VideoLayer {
+            .map(|(quality, rid, width, height)| mediacore::VideoLayer {
                 quality: *quality as i32,
                 rid: (*rid).to_owned(),
                 width: *width,
@@ -376,19 +378,19 @@ mod tests {
         names.iter().map(|name| Rid::from(*name)).collect()
     }
 
-    fn ladder() -> Vec<livekit::VideoLayer> {
+    fn ladder() -> Vec<mediacore::VideoLayer> {
         declared(&[
-            (livekit::VideoQuality::Low, "q", 320, 180),
-            (livekit::VideoQuality::Medium, "h", 640, 360),
-            (livekit::VideoQuality::High, "f", 1280, 720),
+            (mediacore::VideoQuality::Low, "q", 320, 180),
+            (mediacore::VideoQuality::Medium, "h", 640, 360),
+            (mediacore::VideoQuality::High, "f", 1280, 720),
         ])
     }
 
-    fn nameless_ladder() -> Vec<livekit::VideoLayer> {
+    fn nameless_ladder() -> Vec<mediacore::VideoLayer> {
         declared(&[
-            (livekit::VideoQuality::Low, "", 320, 180),
-            (livekit::VideoQuality::Medium, "", 640, 360),
-            (livekit::VideoQuality::High, "", 1280, 720),
+            (mediacore::VideoQuality::Low, "", 320, 180),
+            (mediacore::VideoQuality::Medium, "", 640, 360),
+            (mediacore::VideoQuality::High, "", 1280, 720),
         ])
     }
 
@@ -527,7 +529,7 @@ mod tests {
     #[test]
     fn a_track_without_rids_is_one_layer_and_answers_for_every_packet() {
         let map = LayerMap::build(
-            &declared(&[(livekit::VideoQuality::High, "", 1280, 720)]),
+            &declared(&[(mediacore::VideoQuality::High, "", 1280, 720)]),
             &[],
         );
 
@@ -553,7 +555,7 @@ mod tests {
         assert_eq!(layers[0].rid, "q");
         assert_eq!(layers[0].ssrc, 11);
         assert_eq!(layers[0].width, 320);
-        assert_eq!(layers[0].quality, livekit::VideoQuality::Low as i32);
+        assert_eq!(layers[0].quality, mediacore::VideoQuality::Low as i32);
         assert_eq!(layers[1].ssrc, 22);
         assert_eq!(layers[1].spatial_layer, 1);
     }
@@ -569,8 +571,8 @@ mod tests {
 
     #[test]
     fn a_size_request_wins_over_the_quality_field() {
-        let settings = livekit::UpdateTrackSettings {
-            quality: livekit::VideoQuality::High as i32,
+        let settings = mediacore::UpdateTrackSettings {
+            quality: mediacore::VideoQuality::High as i32,
             width: 640,
             height: 360,
             ..Default::default()
@@ -584,8 +586,8 @@ mod tests {
             }
         );
 
-        let settings = livekit::UpdateTrackSettings {
-            quality: livekit::VideoQuality::Low as i32,
+        let settings = mediacore::UpdateTrackSettings {
+            quality: mediacore::VideoQuality::Low as i32,
             ..Default::default()
         };
         assert_eq!(
@@ -613,19 +615,19 @@ mod tests {
     fn the_layer_a_quality_asks_for_is_the_layer_that_reports_that_quality() {
         let map = LayerMap::build(
             &declared(&[
-                (livekit::VideoQuality::Medium, "", 640, 360),
-                (livekit::VideoQuality::High, "", 1280, 720),
+                (mediacore::VideoQuality::Medium, "", 640, 360),
+                (mediacore::VideoQuality::High, "", 1280, 720),
             ]),
             &rids(&["q", "h"]),
         );
         let ladder = map.ladder();
 
         for (asked, layer) in [
-            (livekit::VideoQuality::Low, SpatialLayer::BASE),
-            (livekit::VideoQuality::Medium, SpatialLayer::BASE),
-            (livekit::VideoQuality::High, SpatialLayer::new(1)),
+            (mediacore::VideoQuality::Low, SpatialLayer::BASE),
+            (mediacore::VideoQuality::Medium, SpatialLayer::BASE),
+            (mediacore::VideoQuality::High, SpatialLayer::new(1)),
         ] {
-            let settings = livekit::UpdateTrackSettings {
+            let settings = mediacore::UpdateTrackSettings {
                 quality: asked as i32,
                 ..Default::default()
             };
@@ -649,8 +651,8 @@ mod tests {
     fn the_publisher_keeps_the_encoding_its_subscribers_are_actually_on() {
         let map = LayerMap::build(
             &declared(&[
-                (livekit::VideoQuality::Medium, "", 640, 360),
-                (livekit::VideoQuality::High, "", 1280, 720),
+                (mediacore::VideoQuality::Medium, "", 640, 360),
+                (mediacore::VideoQuality::High, "", 1280, 720),
             ]),
             &rids(&["q", "h"]),
         );

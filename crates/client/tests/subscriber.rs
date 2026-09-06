@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
-use mediacore_client::proto::{self as livekit, signal_request, signal_response};
+use mediacore_client::proto::{self as mediacore, signal_request, signal_response};
 use mediacore_client::{
     Client, ClientEvent, ClientOptions, SubscriptionRequest, TrackKind, TrackSettings,
 };
@@ -180,7 +180,7 @@ async fn run_peer(
         tokio::select! {
             frame = stream.next() => {
                 let Some(Ok(Message::Binary(data))) = frame else { return };
-                let Ok(request) = livekit::SignalRequest::decode(data.as_ref()) else { continue };
+                let Ok(request) = mediacore::SignalRequest::decode(data.as_ref()) else { continue };
                 let Some(message) = request.message else { continue };
                 if !on_request(&mut state, &mut sink, &events, message).await {
                     return;
@@ -254,11 +254,12 @@ async fn on_request(
             }
 
             for sid in update.track_sids {
-                let response =
-                    signal_response::Message::SubscriptionResponse(livekit::SubscriptionResponse {
+                let response = signal_response::Message::SubscriptionResponse(
+                    mediacore::SubscriptionResponse {
                         track_sid: sid,
-                        err: livekit::SubscriptionError::SeUnknown as i32,
-                    });
+                        err: mediacore::SubscriptionError::SeUnknown as i32,
+                    },
+                );
                 send(sink, response).await;
             }
         }
@@ -302,7 +303,7 @@ async fn on_request(
             }
         }
         signal_request::Message::PingReq(ping) => {
-            let pong = signal_response::Message::PongResp(livekit::Pong {
+            let pong = signal_response::Message::PongResp(mediacore::Pong {
                 last_ping_timestamp: ping.timestamp,
                 timestamp: 0,
             });
@@ -332,7 +333,7 @@ async fn offer_track(state: &mut PeerState, sink: &mut Sink) {
     state.mid = Some(mid);
     state.pending = Some(pending);
 
-    let offer = signal_response::Message::Offer(livekit::SessionDescription {
+    let offer = signal_response::Message::Offer(mediacore::SessionDescription {
         r#type: "offer".to_owned(),
         sdp: offer.to_sdp_string(),
         id: 7,
@@ -357,7 +358,7 @@ fn opus_pt(rtc: &Rtc, mid: Mid) -> Pt {
 }
 
 async fn send(sink: &mut Sink, message: signal_response::Message) {
-    let response = livekit::SignalResponse {
+    let response = mediacore::SignalResponse {
         message: Some(message),
     };
     let _ = sink
@@ -365,43 +366,43 @@ async fn send(sink: &mut Sink, message: signal_response::Message) {
         .await;
 }
 
-fn bob(tracks: Vec<livekit::TrackInfo>) -> livekit::ParticipantInfo {
-    livekit::ParticipantInfo {
+fn bob(tracks: Vec<mediacore::TrackInfo>) -> mediacore::ParticipantInfo {
+    mediacore::ParticipantInfo {
         sid: BOB_SID.to_owned(),
         identity: "bob".to_owned(),
         tracks,
-        ..livekit::ParticipantInfo::default()
+        ..mediacore::ParticipantInfo::default()
     }
 }
 
-fn bob_track() -> livekit::TrackInfo {
-    livekit::TrackInfo {
+fn bob_track() -> mediacore::TrackInfo {
+    mediacore::TrackInfo {
         sid: BOB_TRACK.to_owned(),
         name: "mic".to_owned(),
-        r#type: livekit::TrackType::Audio as i32,
-        source: livekit::TrackSource::Microphone as i32,
+        r#type: mediacore::TrackType::Audio as i32,
+        source: mediacore::TrackSource::Microphone as i32,
         mime_type: "audio/opus".to_owned(),
-        ..livekit::TrackInfo::default()
+        ..mediacore::TrackInfo::default()
     }
 }
 
-fn join_response() -> livekit::JoinResponse {
-    livekit::JoinResponse {
-        room: Some(livekit::Room {
+fn join_response() -> mediacore::JoinResponse {
+    mediacore::JoinResponse {
+        room: Some(mediacore::Room {
             sid: "RM_test".to_owned(),
             name: ROOM.to_owned(),
-            ..livekit::Room::default()
+            ..mediacore::Room::default()
         }),
-        participant: Some(livekit::ParticipantInfo {
+        participant: Some(mediacore::ParticipantInfo {
             sid: "PA_alice".to_owned(),
             identity: IDENTITY.to_owned(),
-            ..livekit::ParticipantInfo::default()
+            ..mediacore::ParticipantInfo::default()
         }),
         other_participants: vec![bob(vec![bob_track()])],
         subscriber_primary: true,
         ping_interval: 15,
         ping_timeout: 60,
-        ..livekit::JoinResponse::default()
+        ..mediacore::JoinResponse::default()
     }
 }
 
@@ -428,7 +429,7 @@ async fn the_tracks_announced_at_join_are_listed() {
     assert_eq!(tracks[0].sid(), BOB_TRACK);
     assert_eq!(tracks[0].participant_sid, BOB_SID);
     assert_eq!(tracks[0].participant_identity, "bob");
-    assert_eq!(tracks[0].track_type(), livekit::TrackType::Audio);
+    assert_eq!(tracks[0].track_type(), mediacore::TrackType::Audio);
 }
 
 #[tokio::test]
@@ -653,9 +654,9 @@ async fn subscription_responses_are_surfaced() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::SubscriptionResponse(
-        livekit::SubscriptionResponse {
+        mediacore::SubscriptionResponse {
             track_sid: BOB_TRACK.to_owned(),
-            err: livekit::SubscriptionError::SeTrackNotfound as i32,
+            err: mediacore::SubscriptionError::SeTrackNotfound as i32,
         },
     ));
 
@@ -669,7 +670,7 @@ async fn subscription_responses_are_surfaced() {
         .await
         .expect("a subscription response");
 
-    assert_eq!(error, Some(livekit::SubscriptionError::SeTrackNotfound));
+    assert_eq!(error, Some(mediacore::SubscriptionError::SeTrackNotfound));
 }
 
 #[tokio::test]
@@ -699,15 +700,15 @@ async fn a_track_published_after_join_is_surfaced() {
     let client = connect(&peer).await;
 
     let mut events = client.events();
-    let second = livekit::TrackInfo {
+    let second = mediacore::TrackInfo {
         sid: "TR_bobcam".to_owned(),
         name: "cam".to_owned(),
-        r#type: livekit::TrackType::Video as i32,
-        ..livekit::TrackInfo::default()
+        r#type: mediacore::TrackType::Video as i32,
+        ..mediacore::TrackInfo::default()
     };
 
     peer.push(signal_response::Message::Update(
-        livekit::ParticipantUpdate {
+        mediacore::ParticipantUpdate {
             participants: vec![bob(vec![bob_track(), second])],
         },
     ));
@@ -732,7 +733,7 @@ async fn a_track_that_disappears_from_an_update_is_unpublished() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::Update(
-        livekit::ParticipantUpdate {
+        mediacore::ParticipantUpdate {
             participants: vec![bob(Vec::new())],
         },
     ));
@@ -756,9 +757,9 @@ async fn a_participant_that_leaves_takes_its_tracks_with_it() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::Update(
-        livekit::ParticipantUpdate {
-            participants: vec![livekit::ParticipantInfo {
-                state: livekit::participant_info::State::Disconnected as i32,
+        mediacore::ParticipantUpdate {
+            participants: vec![mediacore::ParticipantInfo {
+                state: mediacore::participant_info::State::Disconnected as i32,
                 ..bob(vec![bob_track()])
             }],
         },
@@ -785,11 +786,11 @@ async fn stream_state_and_permission_updates_are_surfaced() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::StreamStateUpdate(
-        livekit::StreamStateUpdate {
-            stream_states: vec![livekit::StreamStateInfo {
+        mediacore::StreamStateUpdate {
+            stream_states: vec![mediacore::StreamStateInfo {
                 participant_sid: BOB_SID.to_owned(),
                 track_sid: BOB_TRACK.to_owned(),
-                state: livekit::StreamState::Paused as i32,
+                state: mediacore::StreamState::Paused as i32,
             }],
         },
     ));
@@ -804,10 +805,10 @@ async fn stream_state_and_permission_updates_are_surfaced() {
 
     assert_eq!(states.len(), 1);
     assert_eq!(states[0].track_sid, BOB_TRACK);
-    assert_eq!(states[0].state, livekit::StreamState::Paused as i32);
+    assert_eq!(states[0].state, mediacore::StreamState::Paused as i32);
 
     peer.push(signal_response::Message::SubscriptionPermissionUpdate(
-        livekit::SubscriptionPermissionUpdate {
+        mediacore::SubscriptionPermissionUpdate {
             participant_sid: BOB_SID.to_owned(),
             track_sid: BOB_TRACK.to_owned(),
             allowed: false,
@@ -832,7 +833,7 @@ async fn a_server_side_unpublish_of_our_own_track_is_surfaced() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::TrackUnpublished(
-        livekit::TrackUnpublishedResponse {
+        mediacore::TrackUnpublishedResponse {
             track_sid: "TR_mine".to_owned(),
         },
     ));
@@ -855,7 +856,7 @@ async fn the_first_subscriber_of_our_track_is_surfaced() {
 
     let mut events = client.events();
     peer.push(signal_response::Message::TrackSubscribed(
-        livekit::TrackSubscribed {
+        mediacore::TrackSubscribed {
             track_sid: "TR_mine".to_owned(),
         },
     ));

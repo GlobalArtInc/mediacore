@@ -1,4 +1,4 @@
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 
 use crate::{now_ms, random_id};
 
@@ -13,17 +13,17 @@ pub enum TrackKind {
 
 impl TrackKind {
     pub fn from_proto(value: i32) -> Option<Self> {
-        match livekit::TrackType::try_from(value).ok()? {
-            livekit::TrackType::Audio => Some(Self::Audio),
-            livekit::TrackType::Video => Some(Self::Video),
-            livekit::TrackType::Data => None,
+        match mediacore::TrackType::try_from(value).ok()? {
+            mediacore::TrackType::Audio => Some(Self::Audio),
+            mediacore::TrackType::Video => Some(Self::Video),
+            mediacore::TrackType::Data => None,
         }
     }
 
-    pub fn to_proto(self) -> livekit::TrackType {
+    pub fn to_proto(self) -> mediacore::TrackType {
         match self {
-            Self::Audio => livekit::TrackType::Audio,
-            Self::Video => livekit::TrackType::Video,
+            Self::Audio => mediacore::TrackType::Audio,
+            Self::Video => mediacore::TrackType::Video,
         }
     }
 
@@ -40,7 +40,7 @@ pub enum PublishError {
     #[error("participant `{0}` is not in the room")]
     UnknownParticipant(String),
     #[error("no permission to publish a {0:?} track")]
-    NotAllowed(livekit::TrackSource),
+    NotAllowed(mediacore::TrackSource),
     #[error("track type `{0}` cannot be published")]
     UnsupportedKind(i32),
     #[error("already publishing {0} tracks")]
@@ -48,12 +48,12 @@ pub enum PublishError {
 }
 
 impl PublishError {
-    pub fn reason(&self) -> livekit::request_response::Reason {
+    pub fn reason(&self) -> mediacore::request_response::Reason {
         match self {
-            Self::UnknownParticipant(_) => livekit::request_response::Reason::NotFound,
-            Self::NotAllowed(_) => livekit::request_response::Reason::NotAllowed,
-            Self::UnsupportedKind(_) => livekit::request_response::Reason::UnsupportedType,
-            Self::TooManyTracks(_) => livekit::request_response::Reason::LimitExceeded,
+            Self::UnknownParticipant(_) => mediacore::request_response::Reason::NotFound,
+            Self::NotAllowed(_) => mediacore::request_response::Reason::NotAllowed,
+            Self::UnsupportedKind(_) => mediacore::request_response::Reason::UnsupportedType,
+            Self::TooManyTracks(_) => mediacore::request_response::Reason::LimitExceeded,
         }
     }
 }
@@ -80,8 +80,8 @@ impl TrackVersion {
         }
     }
 
-    pub fn to_proto(self) -> livekit::TimedVersion {
-        livekit::TimedVersion {
+    pub fn to_proto(self) -> mediacore::TimedVersion {
+        mediacore::TimedVersion {
             unix_micro: self.unix_micro,
             ticks: self.ticks,
         }
@@ -94,14 +94,14 @@ pub struct PublishedTrack {
     pub cid: String,
     pub name: String,
     pub kind: TrackKind,
-    pub source: livekit::TrackSource,
+    pub source: mediacore::TrackSource,
     pub muted: bool,
     pub width: u32,
     pub height: u32,
-    pub layers: Vec<livekit::VideoLayer>,
-    pub live_layers: Vec<livekit::VideoLayer>,
+    pub layers: Vec<mediacore::VideoLayer>,
+    pub live_layers: Vec<mediacore::VideoLayer>,
     pub stream: String,
-    pub encryption: livekit::encryption::Type,
+    pub encryption: mediacore::encryption::Type,
     pub audio_features: Vec<i32>,
     pub disable_red: bool,
     pub backup_codec_policy: i32,
@@ -116,8 +116,8 @@ impl PublishedTrack {
     pub(crate) fn new(
         sid: String,
         kind: TrackKind,
-        source: livekit::TrackSource,
-        request: &livekit::AddTrackRequest,
+        source: mediacore::TrackSource,
+        request: &mediacore::AddTrackRequest,
         publisher_sid: &str,
         publisher_identity: &str,
     ) -> Self {
@@ -139,8 +139,8 @@ impl PublishedTrack {
             layers: sorted_layers(&request.layers),
             live_layers: Vec::new(),
             stream,
-            encryption: livekit::encryption::Type::try_from(request.encryption)
-                .unwrap_or(livekit::encryption::Type::None),
+            encryption: mediacore::encryption::Type::try_from(request.encryption)
+                .unwrap_or(mediacore::encryption::Type::None),
             audio_features: audio_features(request),
             disable_red: request.disable_red,
             backup_codec_policy: request.backup_codec_policy,
@@ -164,7 +164,7 @@ impl PublishedTrack {
         self.layers.len() > 1
     }
 
-    pub fn reported_layers(&self) -> &[livekit::VideoLayer] {
+    pub fn reported_layers(&self) -> &[mediacore::VideoLayer] {
         if self.live_layers.is_empty() {
             &self.layers
         } else {
@@ -172,7 +172,7 @@ impl PublishedTrack {
         }
     }
 
-    pub(crate) fn set_live_layers(&mut self, layers: Vec<livekit::VideoLayer>) -> bool {
+    pub(crate) fn set_live_layers(&mut self, layers: Vec<mediacore::VideoLayer>) -> bool {
         let layers = sorted_layers(&layers);
 
         if self.live_layers == layers {
@@ -184,12 +184,12 @@ impl PublishedTrack {
     }
 
     #[allow(deprecated)]
-    pub fn to_proto(&self) -> livekit::TrackInfo {
+    pub fn to_proto(&self) -> mediacore::TrackInfo {
         let mime_type = self.mime_type.clone().unwrap_or_default();
         let mid = self.mid.clone().unwrap_or_default();
         let layers = self.reported_layers().to_vec();
 
-        livekit::TrackInfo {
+        mediacore::TrackInfo {
             sid: self.sid.clone(),
             r#type: self.kind.to_proto() as i32,
             name: self.name.clone(),
@@ -201,12 +201,12 @@ impl PublishedTrack {
             layers: layers.clone(),
             mime_type: mime_type.clone(),
             mid: mid.clone(),
-            codecs: vec![livekit::SimulcastCodecInfo {
+            codecs: vec![mediacore::SimulcastCodecInfo {
                 mime_type,
                 mid,
                 cid: self.cid.clone(),
                 layers,
-                video_layer_mode: livekit::video_layer::Mode::OneSpatialLayerPerStream as i32,
+                video_layer_mode: mediacore::video_layer::Mode::OneSpatialLayerPerStream as i32,
                 sdp_cid: String::new(),
             }],
             disable_red: self.disable_red,
@@ -220,7 +220,7 @@ impl PublishedTrack {
     }
 }
 
-pub(crate) fn generate_track_sid(kind: TrackKind, source: livekit::TrackSource) -> String {
+pub(crate) fn generate_track_sid(kind: TrackKind, source: mediacore::TrackSource) -> String {
     format!(
         "{TRACK_SID_PREFIX}{}{}{}",
         kind.tag(),
@@ -229,32 +229,32 @@ pub(crate) fn generate_track_sid(kind: TrackKind, source: livekit::TrackSource) 
     )
 }
 
-fn source_tag(source: livekit::TrackSource) -> char {
+fn source_tag(source: mediacore::TrackSource) -> char {
     match source {
-        livekit::TrackSource::Camera => 'C',
-        livekit::TrackSource::Microphone => 'M',
-        livekit::TrackSource::ScreenShare => 'S',
-        livekit::TrackSource::ScreenShareAudio => 's',
-        livekit::TrackSource::Unknown => 'U',
+        mediacore::TrackSource::Camera => 'C',
+        mediacore::TrackSource::Microphone => 'M',
+        mediacore::TrackSource::ScreenShare => 'S',
+        mediacore::TrackSource::ScreenShareAudio => 's',
+        mediacore::TrackSource::Unknown => 'U',
     }
 }
 
-fn stream_from_source(source: livekit::TrackSource) -> &'static str {
+fn stream_from_source(source: mediacore::TrackSource) -> &'static str {
     match source {
-        livekit::TrackSource::Camera | livekit::TrackSource::Microphone => "camera",
-        livekit::TrackSource::ScreenShare | livekit::TrackSource::ScreenShareAudio => "screen",
-        livekit::TrackSource::Unknown => "unknown",
+        mediacore::TrackSource::Camera | mediacore::TrackSource::Microphone => "camera",
+        mediacore::TrackSource::ScreenShare | mediacore::TrackSource::ScreenShareAudio => "screen",
+        mediacore::TrackSource::Unknown => "unknown",
     }
 }
 
-fn sorted_layers(layers: &[livekit::VideoLayer]) -> Vec<livekit::VideoLayer> {
+fn sorted_layers(layers: &[mediacore::VideoLayer]) -> Vec<mediacore::VideoLayer> {
     let mut layers = layers.to_vec();
     layers.sort_by_key(|layer| layer.quality);
     layers
 }
 
 #[allow(deprecated)]
-fn audio_features(request: &livekit::AddTrackRequest) -> Vec<i32> {
+fn audio_features(request: &mediacore::AddTrackRequest) -> Vec<i32> {
     let mut features: Vec<i32> = Vec::with_capacity(request.audio_features.len() + 2);
     let mut push = |feature: i32| {
         if !features.contains(&feature) {
@@ -266,10 +266,10 @@ fn audio_features(request: &livekit::AddTrackRequest) -> Vec<i32> {
         push(*feature);
     }
     if request.stereo {
-        push(livekit::AudioTrackFeature::TfStereo as i32);
+        push(mediacore::AudioTrackFeature::TfStereo as i32);
     }
     if request.disable_dtx {
-        push(livekit::AudioTrackFeature::TfNoDtx as i32);
+        push(mediacore::AudioTrackFeature::TfNoDtx as i32);
     }
 
     features
@@ -279,23 +279,23 @@ fn audio_features(request: &livekit::AddTrackRequest) -> Vec<i32> {
 mod tests {
     use super::*;
 
-    fn request() -> livekit::AddTrackRequest {
-        livekit::AddTrackRequest {
+    fn request() -> mediacore::AddTrackRequest {
+        mediacore::AddTrackRequest {
             cid: "cid-1".to_owned(),
             name: "camera".to_owned(),
-            r#type: livekit::TrackType::Video as i32,
-            source: livekit::TrackSource::Camera as i32,
+            r#type: mediacore::TrackType::Video as i32,
+            source: mediacore::TrackSource::Camera as i32,
             width: 1280,
             height: 720,
             layers: vec![
-                livekit::VideoLayer {
-                    quality: livekit::VideoQuality::High as i32,
+                mediacore::VideoLayer {
+                    quality: mediacore::VideoQuality::High as i32,
                     width: 1280,
                     height: 720,
                     ..Default::default()
                 },
-                livekit::VideoLayer {
-                    quality: livekit::VideoQuality::Low as i32,
+                mediacore::VideoLayer {
+                    quality: mediacore::VideoQuality::Low as i32,
                     width: 320,
                     height: 180,
                     ..Default::default()
@@ -307,17 +307,20 @@ mod tests {
 
     #[test]
     fn track_sid_carries_kind_and_source() {
-        let sid = generate_track_sid(TrackKind::Video, livekit::TrackSource::Camera);
+        let sid = generate_track_sid(TrackKind::Video, mediacore::TrackSource::Camera);
         assert!(sid.starts_with("TR_VC"), "unexpected sid {sid}");
     }
 
     #[test]
     fn data_tracks_are_not_a_media_kind() {
         assert_eq!(
-            TrackKind::from_proto(livekit::TrackType::Audio as i32),
+            TrackKind::from_proto(mediacore::TrackType::Audio as i32),
             Some(TrackKind::Audio)
         );
-        assert_eq!(TrackKind::from_proto(livekit::TrackType::Data as i32), None);
+        assert_eq!(
+            TrackKind::from_proto(mediacore::TrackType::Data as i32),
+            None
+        );
         assert_eq!(TrackKind::from_proto(42), None);
     }
 
@@ -327,7 +330,7 @@ mod tests {
         let mut track = PublishedTrack::new(
             "TR_VCabc".to_owned(),
             TrackKind::Video,
-            livekit::TrackSource::Camera,
+            mediacore::TrackSource::Camera,
             &request(),
             "PA_publisher",
             "alice",
@@ -337,14 +340,14 @@ mod tests {
 
         let info = track.to_proto();
         assert_eq!(info.sid, "TR_VCabc");
-        assert_eq!(info.r#type, livekit::TrackType::Video as i32);
-        assert_eq!(info.source, livekit::TrackSource::Camera as i32);
+        assert_eq!(info.r#type, mediacore::TrackType::Video as i32);
+        assert_eq!(info.source, mediacore::TrackSource::Camera as i32);
         assert_eq!(info.mid, "0");
         assert_eq!(info.stream, "camera");
         assert!(info.simulcast);
         assert_eq!(
             info.layers[0].quality,
-            livekit::VideoQuality::Low as i32,
+            mediacore::VideoQuality::Low as i32,
             "layers are ordered by ascending quality"
         );
         assert_eq!(info.codecs.len(), 1);
@@ -356,20 +359,20 @@ mod tests {
     #[test]
     fn stereo_and_dtx_become_audio_features() {
         #[allow(deprecated)]
-        let request = livekit::AddTrackRequest {
+        let request = mediacore::AddTrackRequest {
             cid: "cid-2".to_owned(),
-            r#type: livekit::TrackType::Audio as i32,
-            source: livekit::TrackSource::Microphone as i32,
+            r#type: mediacore::TrackType::Audio as i32,
+            source: mediacore::TrackSource::Microphone as i32,
             stereo: true,
             disable_dtx: true,
-            audio_features: vec![livekit::AudioTrackFeature::TfStereo as i32],
+            audio_features: vec![mediacore::AudioTrackFeature::TfStereo as i32],
             ..Default::default()
         };
 
         let track = PublishedTrack::new(
             "TR_AMabc".to_owned(),
             TrackKind::Audio,
-            livekit::TrackSource::Microphone,
+            mediacore::TrackSource::Microphone,
             &request,
             "PA_publisher",
             "alice",
@@ -378,8 +381,8 @@ mod tests {
         assert_eq!(
             track.audio_features,
             vec![
-                livekit::AudioTrackFeature::TfStereo as i32,
-                livekit::AudioTrackFeature::TfNoDtx as i32
+                mediacore::AudioTrackFeature::TfStereo as i32,
+                mediacore::AudioTrackFeature::TfNoDtx as i32
             ]
         );
     }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use mediacore_config::BweConfig;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_room::TrackKind;
 use mediacore_sfu::{
     AllocatorConfig, Allowance, AudioTrack, BandwidthAllocator, Bitrate, CAMERA_PRIORITY,
@@ -102,7 +102,7 @@ impl Subscribers {
 pub struct SubscribedTrack {
     pub track_sid: String,
     pub kind: TrackKind,
-    pub source: livekit::TrackSource,
+    pub source: mediacore::TrackSource,
     pub multi_layer: bool,
     pub carrying: bool,
     pub available: LayerSet,
@@ -443,7 +443,7 @@ fn enrol(track: &SubscribedTrack) -> VideoTrack {
         .with_declared(track.declared);
 
     match track.source {
-        livekit::TrackSource::ScreenShare | livekit::TrackSource::ScreenShareAudio => {
+        mediacore::TrackSource::ScreenShare | mediacore::TrackSource::ScreenShareAudio => {
             if track.multi_layer {
                 enrolled.with_priority(SCREENSHARE_PRIORITY)
             } else {
@@ -536,7 +536,7 @@ mod tests {
         SubscribedTrack {
             track_sid: TRACK.to_owned(),
             kind: TrackKind::Video,
-            source: livekit::TrackSource::Camera,
+            source: mediacore::TrackSource::Camera,
             multi_layer: true,
             carrying: true,
             available: LayerSet::all(),
@@ -821,7 +821,7 @@ mod tests {
         let audio = SubscribedTrack {
             track_sid: "TR_mic".to_owned(),
             kind: TrackKind::Audio,
-            source: livekit::TrackSource::Microphone,
+            source: mediacore::TrackSource::Microphone,
             multi_layer: false,
             carrying: true,
             available: LayerSet::all(),
@@ -846,12 +846,12 @@ mod tests {
     #[test]
     fn a_single_layer_screenshare_is_exempt_and_a_simulcast_one_outranks_a_camera() {
         let single = enrol(&SubscribedTrack {
-            source: livekit::TrackSource::ScreenShare,
+            source: mediacore::TrackSource::ScreenShare,
             multi_layer: false,
             ..camera([150, 500, 1_500])
         });
         let multi = enrol(&SubscribedTrack {
-            source: livekit::TrackSource::ScreenShare,
+            source: mediacore::TrackSource::ScreenShare,
             multi_layer: true,
             ..camera([150, 500, 1_500])
         });
@@ -1143,7 +1143,7 @@ mod tests {
             tracks.push(SubscribedTrack {
                 track_sid: format!("TR_cam_{publisher}"),
                 kind: TrackKind::Video,
-                source: livekit::TrackSource::Camera,
+                source: mediacore::TrackSource::Camera,
                 multi_layer: true,
                 carrying: true,
                 available: LayerSet::all(),
@@ -1154,7 +1154,7 @@ mod tests {
             tracks.push(SubscribedTrack {
                 track_sid: format!("TR_mic_{publisher}"),
                 kind: TrackKind::Audio,
-                source: livekit::TrackSource::Microphone,
+                source: mediacore::TrackSource::Microphone,
                 multi_layer: false,
                 carrying: true,
                 available: LayerSet::all(),

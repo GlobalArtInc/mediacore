@@ -1544,6 +1544,7 @@ dependencies = [
  "pbjson-types",
  "prost",
  "prost-build",
+ "prost-types",
  "protox",
  "serde",
 ]

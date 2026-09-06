@@ -19,6 +19,14 @@ room:
   departure_timeout: 20
   max_participants: 0
 
+twirp:
+  # Also answer the room API at /twirp/livekit.RoomService/<Method>, which is
+  # the path LiveKit's server SDKs build in generated code and cannot be
+  # pointed away from. Same handler as /twirp/mediacore.RoomService/, so it
+  # costs nothing; turning it off gives those callers a bare 404 with no Twirp
+  # code in it. config-sample.yaml has the rest.
+  livekit_alias: true
+
 rtc:
   # One UDP socket for all media. The compose file publishes this same port
   # number on the host, unchanged.

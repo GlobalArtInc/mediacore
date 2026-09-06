@@ -31,6 +31,7 @@ pbjson-types = "0.9"
 prost = "0.14"
 prost-build = "0.14"
 prost-reflect = "0.16"
+prost-types = "0.14"
 protox = "0.9"
 rand = "0.9"
 # The one thing in this workspace that opens an outbound connection: the front

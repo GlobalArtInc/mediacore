@@ -12,12 +12,25 @@ use crate::state::AppState;
 use crate::swagger;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let livekit_alias = state.config.twirp.livekit_alias;
+
+    let mut router = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/rtc", get(signal::handler))
         .route("/rtc/validate", get(validate))
-        .route(rooms::SERVICE_PATH, any(rooms::handler))
+        .route(rooms::SERVICE_PATH, any(rooms::handler));
+
+    // The compatibility route, on by default. It is the same handler, so it
+    // answers the same method set with the same grants and the same error
+    // bodies; adding it here rather than in `rooms` keeps the decision to serve
+    // it in one place and out of the dispatcher, which has no business knowing
+    // about configuration.
+    if livekit_alias {
+        router = router.route(rooms::ALIAS_PATH, any(rooms::handler));
+    }
+
+    router
         // Merged, not routed here, so the page carries a content security policy
         // and the signalling routes do not.
         .merge(swagger::router())

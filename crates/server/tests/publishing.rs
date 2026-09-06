@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_client::{Client, ClientOptions, TrackSpec};
 use mediacore_config::Config;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_server::http;
 use mediacore_server::publisher::{PublisherSnapshot, TrackSnapshot};
 use mediacore_server::state::AppState;
@@ -198,7 +198,7 @@ async fn a_published_audio_track_reaches_the_server_and_the_room() {
 
     assert_eq!(seen.sid, track.sid());
     assert_eq!(seen.name, "mic");
-    assert_eq!(seen.r#type, livekit::TrackType::Audio as i32);
+    assert_eq!(seen.r#type, mediacore::TrackType::Audio as i32);
     assert_eq!(seen.mime_type, "audio/opus");
 
     alice.leave().await.expect("alice leaves");
@@ -355,7 +355,7 @@ async fn every_trickled_candidate_is_a_candidate_a_client_can_parse() {
             .await
             .expect("the server keeps signalling");
 
-        if let livekit::signal_response::Message::Trickle(trickle) = message {
+        if let mediacore::signal_response::Message::Trickle(trickle) = message {
             let last = trickle.r#final;
             trickles.push(trickle);
             if last {
@@ -376,7 +376,7 @@ async fn every_trickled_candidate_is_a_candidate_a_client_can_parse() {
     );
 
     for trickle in &trickles {
-        assert_eq!(trickle.target, livekit::SignalTarget::Publisher as i32);
+        assert_eq!(trickle.target, mediacore::SignalTarget::Publisher as i32);
         assert!(
             !trickle.candidate_init.is_empty(),
             "an empty candidateInit is not parseable json"
@@ -409,8 +409,8 @@ async fn muting_a_published_track_is_seen_by_the_other_participants() {
         .expect("the track is published");
 
     alice
-        .send(livekit::signal_request::Message::Mute(
-            livekit::MuteTrackRequest {
+        .send(mediacore::signal_request::Message::Mute(
+            mediacore::MuteTrackRequest {
                 sid: track.sid().to_owned(),
                 muted: true,
             },
@@ -456,14 +456,16 @@ async fn a_participant_without_the_grant_is_told_why_it_cannot_publish() {
     let mut responses = client.responses();
     let spec = TrackSpec::audio("mic");
     client
-        .send(livekit::signal_request::Message::AddTrack(
+        .send(mediacore::signal_request::Message::AddTrack(
             spec.to_request(),
         ))
         .expect("the request is sent");
 
     let refusal = responses
         .wait_for(PATIENCE, |message| match message {
-            livekit::signal_response::Message::RequestResponse(response) => Some(response.clone()),
+            mediacore::signal_response::Message::RequestResponse(response) => {
+                Some(response.clone())
+            }
             _ => None,
         })
         .await
@@ -471,7 +473,7 @@ async fn a_participant_without_the_grant_is_told_why_it_cannot_publish() {
 
     assert_eq!(
         refusal.reason,
-        livekit::request_response::Reason::NotAllowed as i32
+        mediacore::request_response::Reason::NotAllowed as i32
     );
     assert!(server.participant("listener").tracks().is_empty());
 }

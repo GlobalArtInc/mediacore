@@ -1,7 +1,7 @@
 //! The page at `/swagger`, and everything it loads.
 //!
 //! It is served by the **SFU**, not by the front end, and that is the whole
-//! design. Try it out is a call to `/twirp/livekit.RoomService/...`, so the
+//! design. Try it out is a call to `/twirp/mediacore.RoomService/...`, so the
 //! page has to sit on the same origin as the API or every button is a
 //! cross-origin request to another port -- one the browser will preflight, the
 //! certificate may not cover, and an operator poking at `127.0.0.1:7880` has no

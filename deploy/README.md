@@ -111,7 +111,7 @@ speaks rather than the wire somebody once wrote down.
 Three things to know before sending anyone the link.
 
 **It is served by the SFU, not by the front end, and that is deliberate.** The
-Try-it-out button posts to `/twirp/livekit.RoomService/…` on whatever origin
+Try-it-out button posts to `/twirp/mediacore.RoomService/…` on whatever origin
 served the page. Serve the page from one service and the API from another and
 every button is a cross-origin call to a different port — preflighted, possibly
 on a certificate this host's does not cover, and failing in the browser with

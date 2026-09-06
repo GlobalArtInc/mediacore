@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::SinkExt;
-use mediacore_client::proto::{self as livekit, signal_response};
+use mediacore_client::proto::{self as mediacore, signal_response};
 use mediacore_client::{Client, ClientOptions};
 use prost::Message as _;
 use tokio::net::TcpListener;
@@ -11,13 +11,13 @@ use tokio_tungstenite::tungstenite::Message;
 const ATTEMPTS: usize = 100;
 
 fn join_frame() -> Message {
-    let join = livekit::JoinResponse {
-        room: Some(livekit::Room {
+    let join = mediacore::JoinResponse {
+        room: Some(mediacore::Room {
             sid: "RM_race".to_owned(),
             name: "demo".to_owned(),
             ..Default::default()
         }),
-        participant: Some(livekit::ParticipantInfo {
+        participant: Some(mediacore::ParticipantInfo {
             sid: "PA_race".to_owned(),
             identity: "alice".to_owned(),
             ..Default::default()
@@ -25,14 +25,14 @@ fn join_frame() -> Message {
         subscriber_primary: true,
         ping_timeout: 60,
         ping_interval: 15,
-        server_info: Some(livekit::ServerInfo {
+        server_info: Some(mediacore::ServerInfo {
             protocol: 17,
             ..Default::default()
         }),
         ..Default::default()
     };
 
-    let response = livekit::SignalResponse {
+    let response = mediacore::SignalResponse {
         message: Some(signal_response::Message::Join(join)),
     };
 

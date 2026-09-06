@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
-use mediacore_client::proto::{self as livekit, signal_request, signal_response};
+use mediacore_client::proto::{self as mediacore, signal_request, signal_response};
 use mediacore_client::{Client, ClientOptions, TrackSpec};
 use prost::Message as _;
 use str0m::change::SdpOffer;
@@ -140,7 +140,7 @@ async fn run_peer(socket: WebSocketStream<TcpStream>, events: mpsc::UnboundedSen
         tokio::select! {
             frame = stream.next() => {
                 let Some(Ok(Message::Binary(data))) = frame else { return };
-                let Ok(request) = livekit::SignalRequest::decode(data.as_ref()) else { continue };
+                let Ok(request) = mediacore::SignalRequest::decode(data.as_ref()) else { continue };
                 let Some(message) = request.message else { continue };
                 if !on_request(&mut rtc, &mut sink, &events, message).await {
                     return;
@@ -168,9 +168,9 @@ async fn on_request(
     match message {
         signal_request::Message::AddTrack(add) => {
             let published =
-                signal_response::Message::TrackPublished(livekit::TrackPublishedResponse {
+                signal_response::Message::TrackPublished(mediacore::TrackPublishedResponse {
                     cid: add.cid.clone(),
-                    track: Some(livekit::TrackInfo {
+                    track: Some(mediacore::TrackInfo {
                         sid: format!("TR_{}", add.cid),
                         r#type: add.r#type,
                         name: add.name,
@@ -178,7 +178,7 @@ async fn on_request(
                         width: add.width,
                         height: add.height,
                         mime_type: "audio/opus".to_owned(),
-                        ..livekit::TrackInfo::default()
+                        ..mediacore::TrackInfo::default()
                     }),
                 });
             send(sink, published).await;
@@ -187,11 +187,11 @@ async fn on_request(
             let offer_id = offer.id;
             let offer = SdpOffer::from_sdp_string(&offer.sdp).expect("a parseable offer");
             let answer = rtc.sdp_api().accept_offer(offer).expect("an answer");
-            let answer = signal_response::Message::Answer(livekit::SessionDescription {
+            let answer = signal_response::Message::Answer(mediacore::SessionDescription {
                 r#type: "answer".to_owned(),
                 sdp: answer.to_sdp_string(),
                 id: offer_id,
-                ..livekit::SessionDescription::default()
+                ..mediacore::SessionDescription::default()
             });
             send(sink, answer).await;
         }
@@ -201,7 +201,7 @@ async fn on_request(
             }
         }
         signal_request::Message::PingReq(ping) => {
-            let pong = signal_response::Message::PongResp(livekit::Pong {
+            let pong = signal_response::Message::PongResp(mediacore::Pong {
                 last_ping_timestamp: ping.timestamp,
                 timestamp: 0,
             });
@@ -218,7 +218,7 @@ async fn on_request(
 }
 
 async fn send(sink: &mut Sink, message: signal_response::Message) {
-    let response = livekit::SignalResponse {
+    let response = mediacore::SignalResponse {
         message: Some(message),
     };
     let _ = sink
@@ -226,27 +226,27 @@ async fn send(sink: &mut Sink, message: signal_response::Message) {
         .await;
 }
 
-fn join_response() -> livekit::JoinResponse {
-    livekit::JoinResponse {
-        room: Some(livekit::Room {
+fn join_response() -> mediacore::JoinResponse {
+    mediacore::JoinResponse {
+        room: Some(mediacore::Room {
             sid: "RM_test".to_owned(),
             name: ROOM.to_owned(),
-            ..livekit::Room::default()
+            ..mediacore::Room::default()
         }),
-        participant: Some(livekit::ParticipantInfo {
+        participant: Some(mediacore::ParticipantInfo {
             sid: "PA_test".to_owned(),
             identity: IDENTITY.to_owned(),
-            ..livekit::ParticipantInfo::default()
+            ..mediacore::ParticipantInfo::default()
         }),
-        other_participants: vec![livekit::ParticipantInfo {
+        other_participants: vec![mediacore::ParticipantInfo {
             sid: "PA_other".to_owned(),
             identity: "bob".to_owned(),
-            ..livekit::ParticipantInfo::default()
+            ..mediacore::ParticipantInfo::default()
         }],
         subscriber_primary: true,
         ping_interval: 15,
         ping_timeout: 60,
-        ..livekit::JoinResponse::default()
+        ..mediacore::JoinResponse::default()
     }
 }
 
@@ -434,7 +434,7 @@ async fn a_ping_is_answered_with_a_pong() {
 
     let mut responses = client.responses();
     client
-        .send(signal_request::Message::PingReq(livekit::Ping {
+        .send(signal_request::Message::PingReq(mediacore::Ping {
             timestamp: 1,
             rtt: 0,
         }))

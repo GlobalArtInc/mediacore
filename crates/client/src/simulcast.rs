@@ -1,4 +1,4 @@
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 
 use crate::error::ClientError;
 use crate::media::MediaProfile;
@@ -16,7 +16,7 @@ const MAX_PAYLOAD: usize = 1_100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerSpec {
     pub rid: String,
-    pub quality: livekit::VideoQuality,
+    pub quality: mediacore::VideoQuality,
     pub width: u32,
     pub height: u32,
     pub bitrate: u32,
@@ -26,7 +26,7 @@ pub struct LayerSpec {
 impl LayerSpec {
     pub fn new(
         rid: impl Into<String>,
-        quality: livekit::VideoQuality,
+        quality: mediacore::VideoQuality,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -48,15 +48,21 @@ impl LayerSpec {
     }
 
     pub fn quarter() -> Self {
-        Self::new(RID_QUARTER, livekit::VideoQuality::Low, 320, 180, 150_000)
+        Self::new(RID_QUARTER, mediacore::VideoQuality::Low, 320, 180, 150_000)
     }
 
     pub fn half() -> Self {
-        Self::new(RID_HALF, livekit::VideoQuality::Medium, 640, 360, 500_000)
+        Self::new(RID_HALF, mediacore::VideoQuality::Medium, 640, 360, 500_000)
     }
 
     pub fn full() -> Self {
-        Self::new(RID_FULL, livekit::VideoQuality::High, 1_280, 720, 1_700_000)
+        Self::new(
+            RID_FULL,
+            mediacore::VideoQuality::High,
+            1_280,
+            720,
+            1_700_000,
+        )
     }
 
     pub fn with_profile(mut self, profile: MediaProfile) -> Self {
@@ -68,14 +74,14 @@ impl LayerSpec {
         self.profile.layer_tag
     }
 
-    pub fn to_video_layer(&self) -> livekit::VideoLayer {
-        livekit::VideoLayer {
+    pub fn to_video_layer(&self) -> mediacore::VideoLayer {
+        mediacore::VideoLayer {
             quality: self.quality as i32,
             width: self.width,
             height: self.height,
             bitrate: self.bitrate,
             rid: self.rid.clone(),
-            ..livekit::VideoLayer::default()
+            ..mediacore::VideoLayer::default()
         }
     }
 
@@ -133,9 +139,9 @@ mod tests {
         assert_eq!(
             layers.iter().map(|l| l.quality).collect::<Vec<_>>(),
             vec![
-                livekit::VideoQuality::Low,
-                livekit::VideoQuality::Medium,
-                livekit::VideoQuality::High
+                mediacore::VideoQuality::Low,
+                mediacore::VideoQuality::Medium,
+                mediacore::VideoQuality::High
             ]
         );
         assert_eq!(layers[0].height, 180);
@@ -159,7 +165,7 @@ mod tests {
     fn a_layer_becomes_the_video_layer_the_server_reads() {
         let layer = LayerSpec::half().to_video_layer();
 
-        assert_eq!(layer.quality, livekit::VideoQuality::Medium as i32);
+        assert_eq!(layer.quality, mediacore::VideoQuality::Medium as i32);
         assert_eq!(layer.width, 640);
         assert_eq!(layer.height, 360);
         assert_eq!(layer.bitrate, 500_000);
@@ -176,19 +182,19 @@ mod tests {
     #[test]
     fn a_rid_str0m_would_silently_mangle_is_rejected() {
         assert!(matches!(
-            LayerSpec::new("", livekit::VideoQuality::Low, 320, 180, 1).validate(),
+            LayerSpec::new("", mediacore::VideoQuality::Low, 320, 180, 1).validate(),
             Err(ClientError::InvalidRid(_))
         ));
         assert!(matches!(
-            LayerSpec::new("far-too-long", livekit::VideoQuality::Low, 320, 180, 1).validate(),
+            LayerSpec::new("far-too-long", mediacore::VideoQuality::Low, 320, 180, 1).validate(),
             Err(ClientError::InvalidRid(_))
         ));
         assert!(matches!(
-            LayerSpec::new("a b", livekit::VideoQuality::Low, 320, 180, 1).validate(),
+            LayerSpec::new("a b", mediacore::VideoQuality::Low, 320, 180, 1).validate(),
             Err(ClientError::InvalidRid(_))
         ));
         assert!(
-            LayerSpec::new("hi720", livekit::VideoQuality::High, 1, 1, 1)
+            LayerSpec::new("hi720", mediacore::VideoQuality::High, 1, 1, 1)
                 .validate()
                 .is_ok()
         );

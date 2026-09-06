@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
 use mediacore_auth::{Claims, VideoGrant};
-use mediacore_proto::livekit::{self, signal_request, signal_response};
+use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use mediacore_proto::{PROTOCOL_VERSION, SERVER_VERSION};
 use mediacore_room::{Joined, ParticipantKind, ParticipantSpec};
 use prost::Message as _;
@@ -155,7 +155,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                 if !publisher.on_event(&state, &joined, event) {
                     let _ = send(
                         &mut sink,
-                        mediacore_room::leave(livekit::DisconnectReason::MediaFailure),
+                        mediacore_room::leave(mediacore::DisconnectReason::MediaFailure),
                     )
                     .await;
                     break;
@@ -169,7 +169,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                 if !subscriber.on_event(&state, &joined, event) {
                     let _ = send(
                         &mut sink,
-                        mediacore_room::leave(livekit::DisconnectReason::MediaFailure),
+                        mediacore_room::leave(mediacore::DisconnectReason::MediaFailure),
                     )
                     .await;
                     break;
@@ -196,7 +196,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
 
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
-                        match livekit::SignalRequest::decode(data.as_ref()) {
+                        match mediacore::SignalRequest::decode(data.as_ref()) {
                             Ok(request) => {
                                 let alive = handle_request(
                                     &state,
@@ -241,7 +241,7 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                     tracing::info!(%identity, %sid, "no signal traffic, closing the session");
                     let _ = send(
                         &mut sink,
-                        mediacore_room::leave(livekit::DisconnectReason::ConnectionTimeout),
+                        mediacore_room::leave(mediacore::DisconnectReason::ConnectionTimeout),
                     )
                     .await;
                     break;
@@ -261,7 +261,7 @@ async fn handle_request(
     joined: &Joined,
     publisher: &mut PublisherSession,
     subscriber: &mut SubscriberSession,
-    request: livekit::SignalRequest,
+    request: mediacore::SignalRequest,
 ) -> bool {
     let Some(message) = request.message else {
         return true;
@@ -281,7 +281,7 @@ async fn handle_request(
             true
         }
         signal_request::Message::Trickle(trickle) => {
-            if trickle.target == livekit::SignalTarget::Subscriber as i32 {
+            if trickle.target == mediacore::SignalTarget::Subscriber as i32 {
                 subscriber.on_trickle(joined, trickle).await;
             } else {
                 publisher.on_trickle(joined, trickle).await;
@@ -303,7 +303,7 @@ async fn handle_request(
         signal_request::Message::PingReq(ping) => {
             joined
                 .participant
-                .send(signal_response::Message::PongResp(livekit::Pong {
+                .send(signal_response::Message::PongResp(mediacore::Pong {
                     last_ping_timestamp: ping.timestamp,
                     timestamp: now_ms(),
                 }));
@@ -327,7 +327,7 @@ async fn handle_request(
     }
 }
 
-fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
+fn add_track_request(joined: &Joined, request: mediacore::AddTrackRequest) {
     match joined.room.publish_track(&joined.participant.sid, &request) {
         Ok(track) => {
             tracing::info!(
@@ -341,7 +341,7 @@ fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
             joined
                 .participant
                 .send(signal_response::Message::TrackPublished(
-                    livekit::TrackPublishedResponse {
+                    mediacore::TrackPublishedResponse {
                         cid: request.cid.clone(),
                         track: Some(track.to_proto()),
                     },
@@ -358,10 +358,10 @@ fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
             joined
                 .participant
                 .send(signal_response::Message::RequestResponse(
-                    livekit::RequestResponse {
+                    mediacore::RequestResponse {
                         reason: error.reason() as i32,
                         message: error.to_string(),
-                        request: Some(livekit::request_response::Request::AddTrack(request)),
+                        request: Some(mediacore::request_response::Request::AddTrack(request)),
                         ..Default::default()
                     },
                 ));
@@ -369,7 +369,7 @@ fn add_track_request(joined: &Joined, request: livekit::AddTrackRequest) {
     }
 }
 
-fn mute_request(state: &AppState, joined: &Joined, request: livekit::MuteTrackRequest) {
+fn mute_request(state: &AppState, joined: &Joined, request: mediacore::MuteTrackRequest) {
     if joined
         .room
         .set_track_muted(&joined.participant.sid, &request.sid, request.muted)
@@ -392,7 +392,7 @@ async fn subscription_request(
     state: &AppState,
     joined: &Joined,
     subscriber: &mut SubscriberSession,
-    update: livekit::UpdateSubscription,
+    update: mediacore::UpdateSubscription,
 ) {
     let refused = joined
         .room
@@ -400,8 +400,8 @@ async fn subscription_request(
 
     for track_sid in refused {
         let error = match joined.room.track(&track_sid) {
-            Some(_) => livekit::SubscriptionError::SeUnknown,
-            None => livekit::SubscriptionError::SeTrackNotfound,
+            Some(_) => mediacore::SubscriptionError::SeUnknown,
+            None => mediacore::SubscriptionError::SeTrackNotfound,
         };
 
         tracing::debug!(
@@ -414,7 +414,7 @@ async fn subscription_request(
         joined
             .participant
             .send(signal_response::Message::SubscriptionResponse(
-                livekit::SubscriptionResponse {
+                mediacore::SubscriptionResponse {
                     track_sid,
                     err: error as i32,
                 },
@@ -432,21 +432,21 @@ fn request_name(message: &signal_request::Message) -> &'static str {
     }
 }
 
-fn build_join_response(state: &AppState, joined: &Joined) -> livekit::JoinResponse {
-    livekit::JoinResponse {
+fn build_join_response(state: &AppState, joined: &Joined) -> mediacore::JoinResponse {
+    mediacore::JoinResponse {
         room: Some(joined.room.to_proto()),
         participant: Some(
             joined
                 .participant
-                .to_proto(livekit::participant_info::State::Joined),
+                .to_proto(mediacore::participant_info::State::Joined),
         ),
         other_participants: joined.others.clone(),
         server_version: SERVER_VERSION.to_owned(),
         subscriber_primary: false,
         ping_timeout: PING_TIMEOUT_SECONDS,
         ping_interval: PING_INTERVAL_SECONDS,
-        server_info: Some(livekit::ServerInfo {
-            edition: livekit::server_info::Edition::Standard as i32,
+        server_info: Some(mediacore::ServerInfo {
+            edition: mediacore::server_info::Edition::Standard as i32,
             version: SERVER_VERSION.to_owned(),
             protocol: PROTOCOL_VERSION,
             region: state.config.region.clone(),
@@ -457,8 +457,8 @@ fn build_join_response(state: &AppState, joined: &Joined) -> livekit::JoinRespon
     }
 }
 
-fn permission_from(grant: &VideoGrant) -> livekit::ParticipantPermission {
-    livekit::ParticipantPermission {
+fn permission_from(grant: &VideoGrant) -> mediacore::ParticipantPermission {
+    mediacore::ParticipantPermission {
         can_subscribe: grant.can_subscribe(),
         can_publish: grant.can_publish(),
         can_publish_data: grant.can_publish_data(),
@@ -492,10 +492,10 @@ fn publish_sources(grant: &VideoGrant) -> Vec<i32> {
         .can_publish_sources
         .iter()
         .map(|source| match source.as_str() {
-            "camera" => livekit::TrackSource::Camera as i32,
-            "microphone" => livekit::TrackSource::Microphone as i32,
-            "screen_share" => livekit::TrackSource::ScreenShare as i32,
-            "screen_share_audio" => livekit::TrackSource::ScreenShareAudio as i32,
+            "camera" => mediacore::TrackSource::Camera as i32,
+            "microphone" => mediacore::TrackSource::Microphone as i32,
+            "screen_share" => mediacore::TrackSource::ScreenShare as i32,
+            "screen_share_audio" => mediacore::TrackSource::ScreenShareAudio as i32,
             unknown => {
                 tracing::warn!(
                     source = %unknown,
@@ -522,7 +522,7 @@ async fn write(
 }
 
 fn encode(message: signal_response::Message) -> bytes::Bytes {
-    livekit::SignalResponse {
+    mediacore::SignalResponse {
         message: Some(message),
     }
     .encode_to_vec()
@@ -555,9 +555,9 @@ mod tests {
              restricts publishing into one that permits everything"
         );
         assert!(
-            !sources.contains(&(livekit::TrackSource::Camera as i32))
-                && !sources.contains(&(livekit::TrackSource::Microphone as i32))
-                && !sources.contains(&(livekit::TrackSource::ScreenShare as i32)),
+            !sources.contains(&(mediacore::TrackSource::Camera as i32))
+                && !sources.contains(&(mediacore::TrackSource::Microphone as i32))
+                && !sources.contains(&(mediacore::TrackSource::ScreenShare as i32)),
             "an unknown source must match nothing publishable"
         );
     }

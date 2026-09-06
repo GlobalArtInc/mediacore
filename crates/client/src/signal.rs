@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use mediacore_proto::livekit::{self, signal_request, signal_response};
+use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use prost::Message as _;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -22,13 +22,13 @@ pub(crate) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Debug, Default)]
 struct State {
     local_sid: String,
-    participants: HashMap<String, livekit::ParticipantInfo>,
+    participants: HashMap<String, mediacore::ParticipantInfo>,
     tracks: HashMap<String, RemoteTrack>,
-    closed: Option<livekit::DisconnectReason>,
+    closed: Option<mediacore::DisconnectReason>,
 }
 
 pub(crate) enum Outgoing {
-    Frame(Box<livekit::SignalRequest>),
+    Frame(Box<mediacore::SignalRequest>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -43,7 +43,7 @@ pub(crate) struct SignalHandle {
 impl SignalHandle {
     pub(crate) fn send(&self, message: signal_request::Message) -> Result<(), ClientError> {
         self.outgoing
-            .send(Outgoing::Frame(Box::new(livekit::SignalRequest {
+            .send(Outgoing::Frame(Box::new(mediacore::SignalRequest {
                 message: Some(message),
             })))
             .map_err(|_| ClientError::Closed)
@@ -71,7 +71,7 @@ impl SignalHandle {
         EventStream::new(self.events.subscribe())
     }
 
-    pub(crate) fn participants(&self) -> Vec<livekit::ParticipantInfo> {
+    pub(crate) fn participants(&self) -> Vec<mediacore::ParticipantInfo> {
         let state = self.state.lock().expect("signal state poisoned");
         let mut participants: Vec<_> = state.participants.values().cloned().collect();
         participants.sort_by(|a, b| a.identity.cmp(&b.identity));
@@ -85,7 +85,7 @@ impl SignalHandle {
         tracks
     }
 
-    pub(crate) fn disconnect_reason(&self) -> Option<livekit::DisconnectReason> {
+    pub(crate) fn disconnect_reason(&self) -> Option<mediacore::DisconnectReason> {
         self.state.lock().expect("signal state poisoned").closed
     }
 }
@@ -131,8 +131,8 @@ impl SignalStream {
             }
             if let signal_response::Message::Leave(leave) = &message {
                 return Err(ClientError::Disconnected(
-                    livekit::DisconnectReason::try_from(leave.reason)
-                        .unwrap_or(livekit::DisconnectReason::UnknownReason),
+                    mediacore::DisconnectReason::try_from(leave.reason)
+                        .unwrap_or(mediacore::DisconnectReason::UnknownReason),
                 ));
             }
         }
@@ -232,7 +232,7 @@ async fn read_loop(
             }
         };
 
-        let response = match livekit::SignalResponse::decode(data.as_ref()) {
+        let response = match mediacore::SignalResponse::decode(data.as_ref()) {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(%error, "undecodable signal response");
@@ -254,7 +254,7 @@ async fn read_loop(
 
     let mut state = state.lock().expect("signal state poisoned");
     if state.closed.is_none() {
-        state.closed = Some(livekit::DisconnectReason::UnknownReason);
+        state.closed = Some(mediacore::DisconnectReason::UnknownReason);
     }
 }
 
@@ -287,7 +287,7 @@ async fn dispatch(
         signal_response::Message::Update(update) => {
             let mut state = state.lock().expect("signal state poisoned");
             for participant in &update.participants {
-                if participant.state == livekit::participant_info::State::Disconnected as i32 {
+                if participant.state == mediacore::participant_info::State::Disconnected as i32 {
                     state.participants.remove(&participant.identity);
                     forget_tracks(&mut state, &participant.sid, &mut emitted);
                     emitted.push(ClientEvent::ParticipantLeft {
@@ -315,7 +315,7 @@ async fn dispatch(
                 .await;
         }
         signal_response::Message::Trickle(trickle) => {
-            if trickle.target == livekit::SignalTarget::Subscriber as i32 {
+            if trickle.target == mediacore::SignalTarget::Subscriber as i32 {
                 let _ = routes
                     .subscriber
                     .send(SubCommand::RemoteCandidate(trickle.candidate_init.clone()))
@@ -366,8 +366,8 @@ async fn dispatch(
         signal_response::Message::Leave(leave) => {
             let mut state = state.lock().expect("signal state poisoned");
             state.closed = Some(
-                livekit::DisconnectReason::try_from(leave.reason)
-                    .unwrap_or(livekit::DisconnectReason::UnknownReason),
+                mediacore::DisconnectReason::try_from(leave.reason)
+                    .unwrap_or(mediacore::DisconnectReason::UnknownReason),
             );
             closing = true;
         }
@@ -383,7 +383,7 @@ async fn dispatch(
 
 fn reconcile_tracks(
     state: &mut State,
-    participant: &livekit::ParticipantInfo,
+    participant: &mediacore::ParticipantInfo,
     emitted: &mut Vec<ClientEvent>,
 ) {
     if participant.sid == state.local_sid {
@@ -454,7 +454,7 @@ pub(crate) fn ping_loop(handle: SignalHandle, interval: Duration) -> tokio::task
         loop {
             ticker.tick().await;
             let now = now_ms();
-            let ping = signal_request::Message::PingReq(livekit::Ping {
+            let ping = signal_request::Message::PingReq(mediacore::Ping {
                 timestamp: now,
                 rtt: 0,
             });

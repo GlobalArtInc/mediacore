@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use tokio::sync::broadcast;
 
 use crate::error::ClientError;
@@ -9,7 +9,7 @@ use crate::error::ClientError;
 pub struct RemoteTrack {
     pub participant_sid: String,
     pub participant_identity: String,
-    pub info: livekit::TrackInfo,
+    pub info: mediacore::TrackInfo,
 }
 
 impl RemoteTrack {
@@ -21,8 +21,8 @@ impl RemoteTrack {
         &self.info.name
     }
 
-    pub fn track_type(&self) -> livekit::TrackType {
-        livekit::TrackType::try_from(self.info.r#type).unwrap_or(livekit::TrackType::Audio)
+    pub fn track_type(&self) -> mediacore::TrackType {
+        mediacore::TrackType::try_from(self.info.r#type).unwrap_or(mediacore::TrackType::Audio)
     }
 }
 
@@ -46,16 +46,16 @@ pub enum ClientEvent {
     },
     SubscriptionResponse {
         track_sid: String,
-        error: Option<livekit::SubscriptionError>,
+        error: Option<mediacore::SubscriptionError>,
     },
     TrackSubscribed {
         track_sid: String,
     },
-    StreamStateChanged(Vec<livekit::StreamStateInfo>),
+    StreamStateChanged(Vec<mediacore::StreamStateInfo>),
     SubscribedQualityChanged {
         track_sid: String,
-        codecs: Vec<livekit::SubscribedCodec>,
-        qualities: Vec<livekit::SubscribedQuality>,
+        codecs: Vec<mediacore::SubscribedCodec>,
+        qualities: Vec<mediacore::SubscribedQuality>,
     },
     SubscriptionPermissionChanged {
         participant_sid: String,
@@ -108,11 +108,11 @@ impl EventStream {
     }
 }
 
-pub(crate) fn subscription_error(code: i32) -> Option<livekit::SubscriptionError> {
-    match livekit::SubscriptionError::try_from(code) {
-        Ok(livekit::SubscriptionError::SeUnknown) => None,
+pub(crate) fn subscription_error(code: i32) -> Option<mediacore::SubscriptionError> {
+    match mediacore::SubscriptionError::try_from(code) {
+        Ok(mediacore::SubscriptionError::SeUnknown) => None,
         Ok(error) => Some(error),
-        Err(_) => Some(livekit::SubscriptionError::SeUnknown),
+        Err(_) => Some(mediacore::SubscriptionError::SeUnknown),
     }
 }
 
@@ -128,8 +128,8 @@ mod tests {
     #[test]
     fn a_known_subscription_code_is_reported() {
         assert_eq!(
-            subscription_error(livekit::SubscriptionError::SeTrackNotfound as i32),
-            Some(livekit::SubscriptionError::SeTrackNotfound)
+            subscription_error(mediacore::SubscriptionError::SeTrackNotfound as i32),
+            Some(mediacore::SubscriptionError::SeTrackNotfound)
         );
     }
 
@@ -137,7 +137,7 @@ mod tests {
     fn an_unmapped_subscription_code_falls_back_to_unknown() {
         assert_eq!(
             subscription_error(9_999),
-            Some(livekit::SubscriptionError::SeUnknown)
+            Some(mediacore::SubscriptionError::SeUnknown)
         );
     }
 
@@ -146,16 +146,16 @@ mod tests {
         let track = RemoteTrack {
             participant_sid: "PA_bob".to_owned(),
             participant_identity: "bob".to_owned(),
-            info: livekit::TrackInfo {
+            info: mediacore::TrackInfo {
                 sid: "TR_a".to_owned(),
                 name: "mic".to_owned(),
-                r#type: livekit::TrackType::Audio as i32,
-                ..livekit::TrackInfo::default()
+                r#type: mediacore::TrackType::Audio as i32,
+                ..mediacore::TrackInfo::default()
             },
         };
 
         assert_eq!(track.sid(), "TR_a");
         assert_eq!(track.name(), "mic");
-        assert_eq!(track.track_type(), livekit::TrackType::Audio);
+        assert_eq!(track.track_type(), mediacore::TrackType::Audio);
     }
 }

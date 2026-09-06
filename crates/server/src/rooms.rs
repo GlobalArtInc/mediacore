@@ -2,27 +2,51 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, Method as Verb};
+use axum::http::{HeaderMap, Method as Verb, Uri};
 use axum::response::{IntoResponse, Response};
 use mediacore_auth::Claims;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_room::{Adoption, Participant, ProfileUpdate, Room, RoomOptions};
 
 use crate::state::AppState;
 use crate::twirp::{self, Codec, Error};
 
-/// Where LiveKit's server SDKs post. The service name is part of the path, so
-/// this is not ours to choose: it is `/twirp/<proto package>.<service>/<Method>`.
-pub const SERVICE_PATH: &str = "/twirp/livekit.RoomService/{method}";
+/// Where a caller posts. Twirp derives the path from the schema rather than
+/// letting anyone choose it -- `/twirp/<proto package>.<service>/<Method>` --
+/// so this reads `mediacore` because `build.rs` renames the package on the
+/// descriptors, and for no other reason.
+pub const SERVICE_PATH: &str = "/twirp/mediacore.RoomService/{method}";
 
 /// The service name the descriptor pool knows, and half of the path above.
-pub const SERVICE: &str = "livekit.RoomService";
+pub const SERVICE: &str = "mediacore.RoomService";
 
 /// The same path with no placeholder in it. One axum route serves every
 /// method, but the OpenAPI document needs one path per method: a generated
 /// client built from `{method}` would have a single function that takes the
 /// method name as a string, which is not an API, it is a mailbox.
-pub const PATH_PREFIX: &str = "/twirp/livekit.RoomService/";
+pub const PATH_PREFIX: &str = "/twirp/mediacore.RoomService/";
+
+/// What the same service was called before the package was renamed.
+///
+/// LiveKit's server SDKs build this path inside generated code, from the
+/// package their own `.proto` declares, and MCN's backoffice points at us
+/// without a line changed. Renaming the package broke nothing on the
+/// signalling wire -- protobuf sends field numbers, not names -- but the Twirp
+/// URL is the one place the package was ever visible outside this process, so
+/// it is the one place the old name has to survive.
+///
+/// It is an alias, not a second implementation: [`handler`] serves both routes
+/// and reads the same [`METHODS`] table for both, so the two cannot come to
+/// disagree about which methods exist or what they need. The only thing the
+/// path decides is what a `bad_route` body calls the service.
+pub const ALIAS_SERVICE: &str = "livekit.RoomService";
+
+/// The alias route, registered when `twirp.livekit_alias` is on.
+pub const ALIAS_PATH: &str = "/twirp/livekit.RoomService/{method}";
+
+/// The alias path with no placeholder, which is how [`handler`] tells the two
+/// routes apart.
+pub const ALIAS_PREFIX: &str = "/twirp/livekit.RoomService/";
 
 /// The grant a token must carry for a method to be answered.
 ///
@@ -68,7 +92,7 @@ pub enum Support {
     Refused(&'static str),
 }
 
-/// One method of `livekit.RoomService`, as this server implements it.
+/// One method of `mediacore.RoomService`, as this server implements it.
 #[derive(Debug, Clone, Copy)]
 pub struct Method {
     pub name: &'static str,
@@ -83,7 +107,7 @@ pub struct Method {
     pub note: &'static str,
 }
 
-/// What this server does with `livekit.RoomService`, method by method.
+/// What this server does with `mediacore.RoomService`, method by method.
 ///
 /// The `.proto` describes the wire. It does not say which of these methods
 /// this server actually answers, which grant each one insists on, or which
@@ -305,23 +329,33 @@ fn refusal(method: &str) -> Option<&'static str> {
         })
 }
 
-/// The one entry point for every RoomService method.
+/// The one entry point for every RoomService method, under either name.
 ///
 /// Twirp routes on the path and the content type together, so a call that gets
 /// either wrong is `bad_route` rather than a 404 with no body or a 405 -- an
 /// SDK reads the code out of the body, and an empty body reads as a server
 /// that fell over rather than as a method that does not exist.
+///
+/// [`SERVICE_PATH`] and [`ALIAS_PATH`] both arrive here. Nothing downstream
+/// knows which one was used except the text of a `bad_route`, and that is the
+/// point: one dispatcher, one grant table, one set of error bodies, so the
+/// compatibility route cannot rot into something that behaves differently from
+/// the canonical one.
 pub async fn handler(
     State(state): State<AppState>,
     Path(method): Path<String>,
     verb: Verb,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match serve(&state, &method, &verb, &headers, &body) {
+    let service = service_for(uri.path());
+
+    match serve(&state, service, &method, &verb, &headers, &body) {
         Ok(response) => response,
         Err(error) => {
             tracing::info!(
+                %service,
                 %method,
                 code = error.code.as_str(),
                 message = %error.message,
@@ -332,8 +366,24 @@ pub async fn handler(
     }
 }
 
+/// Which of the two names the caller used.
+///
+/// A `bad_route` has to name the service the caller actually posted to. Told
+/// that `mediacore.RoomService` has no method `ListRoom`, somebody who posted
+/// to `/twirp/livekit.RoomService/ListRoom` goes looking for a path they never
+/// used, and the typo they made stays invisible behind a name they have never
+/// seen.
+fn service_for(path: &str) -> &'static str {
+    if path.starts_with(ALIAS_PREFIX) {
+        ALIAS_SERVICE
+    } else {
+        SERVICE
+    }
+}
+
 fn serve(
     state: &AppState,
+    service: &str,
     method: &str,
     verb: &Verb,
     headers: &HeaderMap,
@@ -384,7 +434,7 @@ fn serve(
         // the server from disagreeing about which is which.
         unknown => Err(match refusal(unknown) {
             Some(reason) => Error::unimplemented(reason),
-            None => Error::bad_route(format!("livekit.RoomService has no method `{unknown}`")),
+            None => Error::bad_route(format!("{service} has no method `{unknown}`")),
         }),
     }
 }
@@ -404,9 +454,9 @@ fn serve(
 fn create_room(
     state: &AppState,
     claims: &Claims,
-    request: livekit::CreateRoomRequest,
-) -> Result<livekit::Room, Error> {
-    let livekit::CreateRoomRequest {
+    request: mediacore::CreateRoomRequest,
+) -> Result<mediacore::Room, Error> {
+    let mediacore::CreateRoomRequest {
         name,
         room_preset,
         empty_timeout,
@@ -470,11 +520,11 @@ fn create_room(
 fn list_rooms(
     state: &AppState,
     claims: &Claims,
-    request: livekit::ListRoomsRequest,
-) -> Result<livekit::ListRoomsResponse, Error> {
+    request: mediacore::ListRoomsRequest,
+) -> Result<mediacore::ListRoomsResponse, Error> {
     ensure_list(claims)?;
 
-    let mut rooms: Vec<livekit::Room> = state
+    let mut rooms: Vec<mediacore::Room> = state
         .registry
         .rooms()
         .into_iter()
@@ -484,14 +534,14 @@ fn list_rooms(
 
     rooms.sort_by(|left, right| left.name.cmp(&right.name));
 
-    Ok(livekit::ListRoomsResponse { rooms })
+    Ok(mediacore::ListRoomsResponse { rooms })
 }
 
 fn delete_room(
     state: &AppState,
     claims: &Claims,
-    request: livekit::DeleteRoomRequest,
-) -> Result<livekit::DeleteRoomResponse, Error> {
+    request: mediacore::DeleteRoomRequest,
+) -> Result<mediacore::DeleteRoomResponse, Error> {
     require(&request.room, "room")?;
     ensure_create(claims)?;
 
@@ -503,14 +553,14 @@ fn delete_room(
         ),
     }
 
-    Ok(livekit::DeleteRoomResponse {})
+    Ok(mediacore::DeleteRoomResponse {})
 }
 
 fn list_participants(
     state: &AppState,
     claims: &Claims,
-    request: livekit::ListParticipantsRequest,
-) -> Result<livekit::ListParticipantsResponse, Error> {
+    request: mediacore::ListParticipantsRequest,
+) -> Result<mediacore::ListParticipantsResponse, Error> {
     require(&request.room, "room")?;
     ensure_admin(claims, &request.room)?;
 
@@ -523,10 +573,10 @@ fn list_participants(
     participants
         .sort_by_key(|participant| (participant.joined_at_ms, participant.identity.clone()));
 
-    Ok(livekit::ListParticipantsResponse {
+    Ok(mediacore::ListParticipantsResponse {
         participants: participants
             .iter()
-            .map(|participant| participant.to_proto(livekit::participant_info::State::Active))
+            .map(|participant| participant.to_proto(mediacore::participant_info::State::Active))
             .collect(),
     })
 }
@@ -534,8 +584,8 @@ fn list_participants(
 fn get_participant(
     state: &AppState,
     claims: &Claims,
-    request: livekit::RoomParticipantIdentity,
-) -> Result<livekit::ParticipantInfo, Error> {
+    request: mediacore::RoomParticipantIdentity,
+) -> Result<mediacore::ParticipantInfo, Error> {
     require(&request.room, "room")?;
     require(&request.identity, "identity")?;
     ensure_admin(claims, &request.room)?;
@@ -543,7 +593,7 @@ fn get_participant(
     let room = room_of(state, &request.room)?;
     let participant = participant_of(&room, &request.identity)?;
 
-    Ok(participant.to_proto(livekit::participant_info::State::Active))
+    Ok(participant.to_proto(mediacore::participant_info::State::Active))
 }
 
 /// Takes a person out of a room, every connection of theirs at once.
@@ -557,8 +607,8 @@ fn get_participant(
 fn remove_participant(
     state: &AppState,
     claims: &Claims,
-    request: livekit::RoomParticipantIdentity,
-) -> Result<livekit::RemoveParticipantResponse, Error> {
+    request: mediacore::RoomParticipantIdentity,
+) -> Result<mediacore::RemoveParticipantResponse, Error> {
     require(&request.room, "room")?;
     require(&request.identity, "identity")?;
     ensure_admin(claims, &request.room)?;
@@ -576,14 +626,14 @@ fn remove_participant(
             .remove_participant(&request.room, &connection.identity);
     }
 
-    Ok(livekit::RemoveParticipantResponse {})
+    Ok(mediacore::RemoveParticipantResponse {})
 }
 
 fn mute_track(
     state: &AppState,
     claims: &Claims,
-    request: livekit::MuteRoomTrackRequest,
-) -> Result<livekit::MuteRoomTrackResponse, Error> {
+    request: mediacore::MuteRoomTrackRequest,
+) -> Result<mediacore::MuteRoomTrackResponse, Error> {
     require(&request.room, "room")?;
     require(&request.identity, "identity")?;
     require(&request.track_sid, "track_sid")?;
@@ -603,8 +653,8 @@ fn mute_track(
     state
         .router
         .set_publisher_muted(&request.track_sid, request.muted);
-    participant.send(livekit::signal_response::Message::Mute(
-        livekit::MuteTrackRequest {
+    participant.send(mediacore::signal_response::Message::Mute(
+        mediacore::MuteTrackRequest {
             sid: request.track_sid.clone(),
             muted: request.muted,
         },
@@ -618,7 +668,7 @@ fn mute_track(
         "track muted by the room service"
     );
 
-    Ok(livekit::MuteRoomTrackResponse {
+    Ok(mediacore::MuteRoomTrackResponse {
         track: Some(track.to_proto()),
     })
 }
@@ -626,8 +676,8 @@ fn mute_track(
 fn update_participant(
     state: &AppState,
     claims: &Claims,
-    request: livekit::UpdateParticipantRequest,
-) -> Result<livekit::ParticipantInfo, Error> {
+    request: mediacore::UpdateParticipantRequest,
+) -> Result<mediacore::ParticipantInfo, Error> {
     require(&request.room, "room")?;
     require(&request.identity, "identity")?;
     ensure_admin(claims, &request.room)?;
@@ -663,7 +713,7 @@ fn update_participant(
 
     Ok(updated
         .participant
-        .to_proto(livekit::participant_info::State::Active))
+        .to_proto(mediacore::participant_info::State::Active))
 }
 
 /// Subscribes or unsubscribes somebody else's session on their behalf.
@@ -675,15 +725,15 @@ fn update_participant(
 fn update_subscriptions(
     state: &AppState,
     claims: &Claims,
-    request: livekit::UpdateSubscriptionsRequest,
-) -> Result<livekit::UpdateSubscriptionsResponse, Error> {
+    request: mediacore::UpdateSubscriptionsRequest,
+) -> Result<mediacore::UpdateSubscriptionsResponse, Error> {
     require(&request.room, "room")?;
     require(&request.identity, "identity")?;
     ensure_admin(claims, &request.room)?;
 
     let room = room_of(state, &request.room)?;
     let participant = participant_of(&room, &request.identity)?;
-    let update = livekit::UpdateSubscription {
+    let update = mediacore::UpdateSubscription {
         track_sids: request.track_sids,
         subscribe: request.subscribe,
         participant_tracks: request.participant_tracks,
@@ -726,14 +776,14 @@ fn update_subscriptions(
 
     room.update_subscriptions(&participant.sid, &update);
 
-    Ok(livekit::UpdateSubscriptionsResponse {})
+    Ok(mediacore::UpdateSubscriptionsResponse {})
 }
 
 fn update_room_metadata(
     state: &AppState,
     claims: &Claims,
-    request: livekit::UpdateRoomMetadataRequest,
-) -> Result<livekit::Room, Error> {
+    request: mediacore::UpdateRoomMetadataRequest,
+) -> Result<mediacore::Room, Error> {
     require(&request.room, "room")?;
     ensure_admin(claims, &request.room)?;
 

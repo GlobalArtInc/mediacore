@@ -42,8 +42,10 @@ https://{$MEDIACORE_PUBLIC_HOST} {
 		reverse_proxy sfu:7880
 	}
 
-	# The server API: livekit.RoomService over Twirp, for whatever creates and
-	# moderates rooms. It goes to the SFU, not the front end, and it is not the
+	# The server API: mediacore.RoomService over Twirp, for whatever creates and
+	# moderates rooms. The wildcard also carries the livekit.RoomService alias
+	# the SFU keeps for LiveKit's own server SDKs, so nothing here needs to know
+	# about it. It goes to the SFU, not the front end, and it is not the
 	# browser's to call -- every method needs a token carrying roomCreate,
 	# roomList or roomAdmin, which is an API-key-signed token that has no
 	# business in a page. It rides this origin because it is the only one
@@ -55,7 +57,7 @@ https://{$MEDIACORE_PUBLIC_HOST} {
 	# The documentation for that API, with a Try-it-out button on it.
 	#
 	# THE SAME UPSTREAM AS /twirp, AND THAT IS THE POINT. Every button on that
-	# page posts to /twirp/livekit.RoomService/... on whatever origin served
+	# page posts to /twirp/mediacore.RoomService/... on whatever origin served
 	# the page. Route the two to different services and every button becomes a
 	# cross-origin request to another port: preflighted, quite possibly on a
 	# certificate this host's does not cover, and answered by nothing an

@@ -56,6 +56,19 @@ room:
   # what the policy and the timeouts are counted in, so a second is enough.
   sweep_interval_ms: 1000
 
+twirp:
+  # The room API is mediacore.RoomService, so its own path is
+  # /twirp/mediacore.RoomService/<Method>. LiveKit's server SDKs and lk do not
+  # take a path: they build it in generated code from the package their own
+  # .proto declares, which is livekit.RoomService. This also answers there.
+  #
+  # It is the same handler -- same methods, same grants, same error bodies --
+  # so leaving it on costs nothing. Turning it off does not refuse those calls
+  # politely: the route stops existing, and a LiveKit SDK gets a bare 404 with
+  # no Twirp code in it and reports a transport failure. Turn it off when
+  # nothing built against LiveKit calls this server any more.
+  livekit_alias: true
+
 rtc:
   udp_port: 7882
   port_range_start: 50000

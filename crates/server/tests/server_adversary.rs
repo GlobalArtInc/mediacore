@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_config::Config;
-use mediacore_proto::livekit;
+use mediacore_proto::mediacore;
 use mediacore_room::{ParticipantSpec, ProfileUpdate};
 use mediacore_server::http;
 use mediacore_server::state::AppState;
@@ -72,9 +72,10 @@ async fn post(addr: SocketAddr, method: &str, token: &str, body: serde_json::Val
     let exchange = async {
         let mut socket = TcpStream::connect(addr).await.expect("connect");
         let head = format!(
-            "POST /twirp/livekit.RoomService/{method} HTTP/1.1\r\nHost: {addr}\r\n\
+            "POST {}{method} HTTP/1.1\r\nHost: {addr}\r\n\
              Content-Type: application/json\r\nAuthorization: Bearer {token}\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n",
+            mediacore_server::rooms::PATH_PREFIX,
             body.len()
         );
 
@@ -102,7 +103,7 @@ fn spec(identity: &str) -> ParticipantSpec {
     ParticipantSpec {
         identity: identity.to_owned(),
         name: identity.to_owned(),
-        permission: livekit::ParticipantPermission {
+        permission: mediacore::ParticipantPermission {
             can_subscribe: true,
             can_publish: true,
             ..Default::default()
@@ -111,20 +112,20 @@ fn spec(identity: &str) -> ParticipantSpec {
     }
 }
 
-fn permission(can_subscribe: bool) -> livekit::ParticipantPermission {
-    livekit::ParticipantPermission {
+fn permission(can_subscribe: bool) -> mediacore::ParticipantPermission {
+    mediacore::ParticipantPermission {
         can_subscribe,
         can_publish: true,
         ..Default::default()
     }
 }
 
-fn add_track(cid: &str) -> livekit::AddTrackRequest {
-    livekit::AddTrackRequest {
+fn add_track(cid: &str) -> mediacore::AddTrackRequest {
+    mediacore::AddTrackRequest {
         cid: cid.to_owned(),
         name: cid.to_owned(),
-        r#type: livekit::TrackType::Video as i32,
-        source: livekit::TrackSource::Camera as i32,
+        r#type: mediacore::TrackType::Video as i32,
+        source: mediacore::TrackSource::Camera as i32,
         ..Default::default()
     }
 }
@@ -279,7 +280,7 @@ async fn an_unsubscribe_that_arrives_early_is_not_undone_by_auto_subscribe() {
     let mut session = SubscriberSession::new(true);
     bob.room.update_subscriptions(
         &bob.participant.sid,
-        &livekit::UpdateSubscription {
+        &mediacore::UpdateSubscription {
             track_sids: vec![track.sid.clone()],
             subscribe: false,
             ..Default::default()
@@ -296,7 +297,7 @@ async fn an_unsubscribe_that_arrives_early_is_not_undone_by_auto_subscribe() {
     // Asking for it again is how somebody takes that back.
     bob.room.update_subscriptions(
         &bob.participant.sid,
-        &livekit::UpdateSubscription {
+        &mediacore::UpdateSubscription {
             track_sids: vec![track.sid.clone()],
             subscribe: true,
             ..Default::default()
