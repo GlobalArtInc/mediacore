@@ -24,7 +24,7 @@
 export const ROOM_PATH_PREFIX = "/r/";
 
 /** The tab's name when it is about no particular room. */
-export const TITLE = "mediacore";
+export const TITLE = "MediaCore";
 
 /**
  * Which room this page load is addressed to, and where that address should
@@ -102,16 +102,6 @@ export function offeredRoom(addressed, remembered, fallback) {
   if (usable(addressed)) return { room: addressed.trim(), source: "link" };
   if (usable(remembered)) return { room: remembered.trim(), source: "remembered" };
   return { room: usable(fallback) ? fallback.trim() : "", source: "default" };
-}
-
-/**
- * What the tab is called. Four tabs of the same call are four identical
- * entries in a window's tab strip, and the room is the only thing that tells
- * them apart -- so it goes first, where a tab that has been squeezed to two
- * centimetres still shows it.
- */
-export function roomTitle(room) {
-  return usable(room) ? `${room.trim()} · ${TITLE}` : TITLE;
 }
 
 /**

@@ -65,14 +65,12 @@ const {
 } = await import(`file://${assetPath("stage.js")}`);
 const {
   ROOM_PATH_PREFIX,
-  TITLE,
   addressedRoom,
   composedRoom,
   offeredRoom,
   plainRoom,
   roomInPath,
   roomPath,
-  roomTitle,
 } = await import(`file://${assetPath("room.js")}`);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 
@@ -1417,20 +1415,6 @@ describe("a room is an address", () => {
     assert.equal(offeredRoom("", "   ", "demo").source, "default");
   });
 
-  it("names the tab after the room, and puts the room first", () => {
-    assert.equal(roomTitle("standup"), `standup · ${TITLE}`);
-    assert.equal(
-      roomTitle(null),
-      TITLE,
-      "a tab that is about no particular room claims one anyway",
-    );
-    assert.equal(roomTitle("   "), TITLE);
-    assert.ok(
-      roomTitle("standup").startsWith("standup"),
-      "four tabs squeezed into a strip show their first few characters, and those have to be " +
-        "the ones that differ",
-    );
-  });
 
   it("composes the room the server will know, and reads the spoken name back out of it", () => {
     assert.equal(composedRoom("demo", "standup", "."), "demo.standup");

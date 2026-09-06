@@ -34,7 +34,6 @@ import {
   offeredRoom,
   plainRoom,
   roomPath,
-  roomTitle,
 } from "/room.js";
 import { createDenoiser } from "/denoise.js";
 import {
@@ -87,20 +86,22 @@ const PROCESSING_ROWS = [
 // alone, so the browser's noiseSuppression and voiceIsolation are not offered
 // beside ours: they are what "the browser's own" means, and they are both off
 // whenever ours is running.
+/**
+ * The two a person may choose between. The browser's own suppressor is not
+ * here on purpose: it is no longer an option, it is the floor this page lands
+ * on when ours cannot run -- the probe says no, the worklet will not attach, or
+ * it overruns the render thread. Leaving it in the menu invited somebody to
+ * pick the weaker of the two by hand; taking it out of the rollback would leave
+ * a machine that cannot run ours with nothing at all, which is worse than
+ * either. `effective` under the choices says which one is really in the path,
+ * so a fallback is never silent.
+ */
 const NOISE_ROWS = [
   {
     engine: "off",
     label: "Off",
     short: "off",
     note: "Nothing attenuates the room. Worth a listen before judging either of the other two.",
-  },
-  {
-    engine: "browser",
-    label: "The browser's own",
-    short: "browser",
-    note:
-      "getUserMedia's noiseSuppression, plus voiceIsolation where Chrome offers it. A light " +
-      "attenuator for steady noise, and where this page lands whenever ours cannot run.",
   },
   {
     engine: "mediacore",
@@ -530,7 +531,6 @@ function offerRoom() {
   }
 
   paintLobbyRoom();
-  if (offer.source === "link") document.title = roomTitle(offer.room);
 }
 
 /** Somebody correcting the room: the preview follows, and the link's refusal goes. */
@@ -694,7 +694,6 @@ function enterRoom(credentials) {
   );
 
   el.roomName.textContent = address;
-  document.title = roomTitle(address);
   showAddress(address);
   remember({ room: address });
   el.footUrl.textContent = `${credentials.url} - ${credentials.room} - ${credentials.identity}`;

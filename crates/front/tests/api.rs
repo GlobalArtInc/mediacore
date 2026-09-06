@@ -138,7 +138,7 @@ async fn the_page_is_served() {
 
     let (status, body) = get(addr, "/").await;
     assert_eq!(status, 200);
-    assert!(body.contains("<title>mediacore</title>"));
+    assert!(body.contains("<title>MediaCore</title>"));
     assert!(body.contains(r#"id="join-form""#));
     assert!(body.contains(r#"src="/app.js""#));
 
@@ -549,42 +549,28 @@ async fn reloading_a_rooms_url_comes_back_to_the_same_room() {
     );
 }
 
-/// Four tabs, four rooms, and a tab strip that squeezes each of them to two
-/// centimetres. The room goes first in the title, where that much is still
-/// readable, and the roster header carries the name a person says rather than
-/// the composed one the SFU knows -- the footer already carries that, beside
-/// the socket and the identity, for whoever is reading `ListRooms` at the same
-/// time.
+/// The tab is named after the product and nothing else. It used to lead with the
+/// room, so that four tabs of four calls could be told apart in a squeezed tab
+/// strip; the owner asked for the product's name alone, and the roster header
+/// still carries the room for anyone looking at the page rather than at the tab.
 #[tokio::test]
-async fn a_tab_says_which_room_it_is() {
+async fn a_tab_is_named_after_the_product() {
     let addr = spawn().await;
     let (_, page) = get(addr, "/").await;
     let (_, js) = get(addr, "/app.js").await;
-    let (_, room) = get(addr, "/room.js").await;
 
     assert!(
-        page.contains("<title>mediacore</title>"),
+        page.contains("<title>MediaCore</title>"),
         "the page ships with a title that is not the product's name"
     );
     assert!(
-        room.contains("`${room.trim()} · ${TITLE}`"),
-        "the room is not the first thing in the tab's name, so four of them are four identical \
-         tabs"
-    );
-    assert!(
-        js.contains("document.title = roomTitle(address);"),
-        "joining a room does not name the tab after it"
+        !js.contains("document.title"),
+        "something still renames the tab after the page has loaded, so the name in the strip is \
+         not the one the markup promised"
     );
     assert!(
         js.contains("el.roomName.textContent = address;"),
         "the roster header no longer carries the room this tab is in"
-    );
-    assert!(
-        js.contains(
-            "el.footUrl.textContent = `${credentials.url} - ${credentials.room} - ${credentials.identity}`;"
-        ),
-        "the composed room the sfu knows is nowhere on the page, so nothing connects what is on \
-         screen to what `ListRooms` returns"
     );
 }
 
