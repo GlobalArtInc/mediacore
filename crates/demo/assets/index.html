@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
-    <main>
+    <main data-wide="false">
       <header class="brand">
         <span class="brand-dot" aria-hidden="true"></span>
         <span class="brand-name">mediacore</span>
@@ -17,7 +17,7 @@
         <h1>Join the room</h1>
         <p class="lede">
           Everyone in <code id="lobby-room">&hellip;</code> hears everyone else.
-          Audio only &mdash; the camera is never asked for.
+          Audio only unless you ask for the camera.
         </p>
 
         <form id="join-form" novalidate>
@@ -33,6 +33,12 @@
             spellcheck="false"
             disabled
           />
+
+          <label class="toggle" for="with-video">
+            <input id="with-video" name="with-video" type="checkbox" disabled />
+            <span>Publish my camera too, with simulcast</span>
+          </label>
+
           <button id="join" type="submit" disabled>Join</button>
         </form>
 
@@ -49,6 +55,31 @@
           <span id="room-state" class="pill">connecting</span>
         </div>
 
+        <dl id="link" class="link">
+          <div>
+            <dt>browser estimate in</dt>
+            <dd id="link-estimate">&mdash;</dd>
+          </div>
+          <div>
+            <dt>arriving now</dt>
+            <dd id="link-arriving">&mdash;</dd>
+          </div>
+          <div>
+            <dt>video arriving</dt>
+            <dd id="link-video">&mdash;</dd>
+          </div>
+          <div>
+            <dt>round trip</dt>
+            <dd id="link-rtt">&mdash;</dd>
+          </div>
+          <div>
+            <dt>browser estimate out</dt>
+            <dd id="link-sending">&mdash;</dd>
+          </div>
+        </dl>
+
+        <ul id="tiles" class="tiles" hidden></ul>
+
         <ul id="participants" class="participants"></ul>
 
         <button id="enable-audio" class="secondary" type="button" hidden>
@@ -56,6 +87,7 @@
         </button>
 
         <div class="controls">
+          <button id="camera" type="button" class="secondary">Start camera</button>
           <button id="mute" type="button" class="secondary">Mute</button>
           <button id="leave" type="button" class="ghost">Leave</button>
         </div>

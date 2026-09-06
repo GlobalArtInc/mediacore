@@ -1,3 +1,4 @@
+use crate::bitrate::Bitrate;
 use crate::layer::{LAYER_COUNT, SpatialLayer};
 
 const SIZE_TOLERANCE_NUMERATOR: u32 = 9;
@@ -46,6 +47,7 @@ impl std::fmt::Display for VideoQuality {
 struct Rung {
     quality: Option<VideoQuality>,
     size: Option<(u32, u32)>,
+    bitrate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,8 +78,27 @@ impl LayerLadder {
         self
     }
 
+    pub fn set_bitrate(&mut self, layer: SpatialLayer, bitrate: u32) {
+        self.rungs[layer.slot()].bitrate = (bitrate > 0).then_some(bitrate);
+    }
+
+    pub fn with_bitrate(mut self, layer: SpatialLayer, bitrate: u32) -> Self {
+        self.set_bitrate(layer, bitrate);
+        self
+    }
+
     pub fn size(&self, layer: SpatialLayer) -> Option<(u32, u32)> {
         self.rungs[layer.slot()].size
+    }
+
+    pub fn declared_bitrate(&self, layer: SpatialLayer) -> Option<Bitrate> {
+        self.rungs[layer.slot()]
+            .bitrate
+            .map(|bitrate| Bitrate::bps(u64::from(bitrate)))
+    }
+
+    pub fn declared_bitrates(&self) -> [Option<Bitrate>; LAYER_COUNT] {
+        std::array::from_fn(|slot| self.declared_bitrate(SpatialLayer::new(slot as u8)))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -282,5 +303,25 @@ mod tests {
         assert!(!ladder.is_empty());
         assert_eq!(ladder.size(LOW), None);
         assert_eq!(ladder.ceiling_for(320, 180), Some(mid()));
+    }
+
+    #[test]
+    fn a_declared_bitrate_is_carried_through_the_ladder() {
+        let ladder = LayerLadder::new()
+            .with_bitrate(LOW, 150_000)
+            .with_bitrate(mid(), 0);
+
+        assert_eq!(ladder.declared_bitrate(LOW), Some(Bitrate::kbps(150)));
+        assert_eq!(
+            ladder.declared_bitrate(mid()),
+            None,
+            "a publisher that declared nothing declared nothing, not zero"
+        );
+        assert_eq!(ladder.declared_bitrate(high()), None);
+        assert_eq!(
+            ladder.declared_bitrates(),
+            [Some(Bitrate::kbps(150)), None, None]
+        );
+        assert!(!ladder.is_empty());
     }
 }

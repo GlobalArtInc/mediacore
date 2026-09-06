@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
+use crate::bitrate::Bitrate;
 use crate::layer::{LAYER_COUNT, LayerSet, SpatialLayer};
+use crate::rate::RateWindow;
 
 const MAX_CATCH_UP_CYCLES: u128 = 2;
 
@@ -13,6 +15,7 @@ pub struct LayerTrackerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackerConfig {
     pub cycle: Duration,
+    pub rate_window: Duration,
     pub layers: [LayerTrackerConfig; LAYER_COUNT],
 }
 
@@ -20,6 +23,7 @@ impl TrackerConfig {
     pub fn video() -> Self {
         Self {
             cycle: Duration::from_millis(500),
+            rate_window: Duration::from_secs(1),
             layers: [
                 LayerTrackerConfig {
                     samples_required: 1,
@@ -45,6 +49,7 @@ impl TrackerConfig {
 
         Self {
             cycle: Duration::from_secs(2),
+            rate_window: Duration::from_secs(4),
             layers: [layer; LAYER_COUNT],
         }
     }
@@ -123,6 +128,7 @@ struct LayerState {
     good_cycles: u32,
     packets: u64,
     bytes: u64,
+    rate: RateWindow,
     last_packet: Option<Instant>,
     cycle_started: Option<Instant>,
 }
@@ -137,8 +143,11 @@ pub struct LayerTracker {
 impl LayerTracker {
     pub fn new(config: TrackerConfig) -> Self {
         Self {
+            layers: [LayerState {
+                rate: RateWindow::new(config.rate_window),
+                ..LayerState::default()
+            }; LAYER_COUNT],
             config,
-            layers: [LayerState::default(); LAYER_COUNT],
             paused: false,
         }
     }
@@ -162,6 +171,7 @@ impl LayerTracker {
         let state = &mut self.layers[layer.slot()];
         state.packets += 1;
         state.bytes += payload_len as u64;
+        state.rate.observe(payload_len, now);
         state.last_packet = Some(now);
         state.samples += 1;
 
@@ -275,6 +285,16 @@ impl LayerTracker {
         self.layers[layer.slot()].bytes
     }
 
+    pub fn rate(&self, layer: SpatialLayer, overhead_bytes: u32, now: Instant) -> Option<Bitrate> {
+        self.layers[layer.slot()]
+            .rate
+            .bits_per_second(overhead_bytes, now)
+    }
+
+    pub fn rates(&self, overhead_bytes: u32, now: Instant) -> [Option<Bitrate>; LAYER_COUNT] {
+        std::array::from_fn(|slot| self.rate(SpatialLayer::new(slot as u8), overhead_bytes, now))
+    }
+
     pub fn last_packet(&self, layer: SpatialLayer) -> Option<Instant> {
         self.layers[layer.slot()].last_packet
     }
@@ -294,12 +314,14 @@ impl LayerTracker {
 
     pub fn reset_layer(&mut self, layer: SpatialLayer) -> LayerChanges {
         let mut changes = LayerChanges::default();
+        let window = self.config.rate_window;
         let state = &mut self.layers[layer.slot()];
         let was = state.status;
 
         *state = LayerState {
             packets: state.packets,
             bytes: state.bytes,
+            rate: RateWindow::new(window),
             ..LayerState::default()
         };
 
@@ -345,6 +367,7 @@ mod tests {
 
         TrackerConfig {
             cycle: Duration::from_millis(100),
+            rate_window: Duration::from_millis(200),
             layers: [layer; LAYER_COUNT],
         }
     }
@@ -574,5 +597,65 @@ mod tests {
         tracker.set_paused(false);
         let changes = tracker.observe(BASE, 100, now + Duration::from_millis(200));
         assert!(changes.activated.contains(BASE));
+    }
+
+    #[test]
+    fn a_layer_is_priced_from_what_actually_arrived() {
+        let now = Instant::now();
+        let mut tracker = LayerTracker::new(TrackerConfig::video());
+
+        assert_eq!(tracker.rate(BASE, 40, now), None);
+
+        let at = feed(&mut tracker, BASE, 100, now, Duration::from_millis(10));
+
+        assert_eq!(
+            tracker.rate(BASE, 40, at),
+            Some(Bitrate::bps((100 + 40) * 8 * 100)),
+            "the price of a layer is its payload plus its per-packet wire overhead"
+        );
+        assert_eq!(
+            tracker.rate(SpatialLayer::new(1), 40, at),
+            None,
+            "a layer nobody published has no measured price"
+        );
+    }
+
+    #[test]
+    fn a_screenshare_is_priced_over_a_longer_window_than_a_camera() {
+        assert_eq!(TrackerConfig::video().rate_window, Duration::from_secs(1));
+        assert_eq!(
+            TrackerConfig::screenshare().rate_window,
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn resetting_a_layer_forgets_its_price_but_keeps_its_window() {
+        let now = Instant::now();
+        let mut tracker = LayerTracker::new(TrackerConfig::video());
+        let at = feed(&mut tracker, BASE, 100, now, Duration::from_millis(10));
+
+        assert!(tracker.rate(BASE, 40, at).is_some());
+        tracker.reset_layer(BASE);
+        assert_eq!(tracker.rate(BASE, 40, at), None);
+
+        let at = feed(&mut tracker, BASE, 100, at, Duration::from_millis(10));
+        assert!(
+            tracker.rate(BASE, 40, at).is_some(),
+            "a reset layer must be able to be priced again"
+        );
+    }
+
+    #[test]
+    fn every_rate_is_reported_at_once() {
+        let now = Instant::now();
+        let mut tracker = LayerTracker::new(TrackerConfig::video());
+        let at = feed(&mut tracker, BASE, 100, now, Duration::from_millis(10));
+
+        let rates = tracker.rates(40, at);
+
+        assert_eq!(rates[0], tracker.rate(BASE, 40, at));
+        assert_eq!(rates[1], None);
+        assert_eq!(rates[2], None);
     }
 }

@@ -38,6 +38,10 @@ pub enum TransportError {
     UnknownLayer { mid: Mid, rid: Rid },
     #[error("mid `{0}` carries several layers, name the rid instead of the whole track")]
     AmbiguousLayer(Mid),
+    #[error("bandwidth estimation belongs on a subscriber peer, a publisher only sends rtcp")]
+    BweOnPublisher,
+    #[error("this peer was built without bandwidth estimation and cannot be steered")]
+    BweDisabled,
     #[error("{0} is not implemented in this milestone")]
     NotImplemented(&'static str),
     #[error("webrtc error")]

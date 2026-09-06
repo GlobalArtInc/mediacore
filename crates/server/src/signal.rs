@@ -128,6 +128,8 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
     reconciles.tick().await;
     let mut layers = tokio::time::interval(LAYER_INTERVAL);
     layers.tick().await;
+    let mut allocations = tokio::time::interval(state.config.video.bwe.allocation_interval());
+    allocations.tick().await;
 
     subscriber.on_room_changed(&state, &joined).await;
 
@@ -213,6 +215,9 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
             }
             _ = layers.tick() => {
                 publisher.tick(&state, &joined).await;
+            }
+            _ = allocations.tick() => {
+                subscriber.tick(&state, &joined).await;
             }
             _ = reconciles.tick() => {
                 subscriber.on_room_changed(&state, &joined).await;

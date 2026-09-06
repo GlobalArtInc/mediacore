@@ -4,11 +4,13 @@ use std::time::Instant;
 
 use mediacore_proto::livekit::{self, signal_response};
 use mediacore_room::{Joined, TrackKind};
+use mediacore_sfu::{Allowance, Grant};
 use mediacore_transport::str0m::format::{Codec, PayloadParams};
 use mediacore_transport::str0m::media::{Direction, MediaKind, Mid, Pt};
 use mediacore_transport::{MediaSpec, Negotiation, PeerEvent, PeerEvents, PeerHandle, SendStream};
 use tokio::task::JoinHandle;
 
+use crate::bandwidth::{BandwidthController, SubscribedTrack};
 use crate::forward::{SinkConfig, TrackEffects, TrackSink, forwarder_config, stream_start};
 use crate::peer::{bundle_mid, candidate_from_init, candidate_init};
 use crate::simulcast::{apply_quality_update, preference_of};
@@ -34,6 +36,7 @@ struct Subscription {
     kind: TrackKind,
     liveness: Liveness,
     paused: bool,
+    bandwidth_paused: bool,
     sink: Arc<TrackSink>,
 }
 
@@ -61,6 +64,8 @@ pub struct SubscriberSession {
     candidates_sent: bool,
     offers: u32,
     failed: bool,
+    bandwidth: Option<BandwidthController>,
+    bwe_rearmed: bool,
 }
 
 impl SubscriberSession {
@@ -79,6 +84,8 @@ impl SubscriberSession {
             candidates_sent: false,
             offers: 0,
             failed: false,
+            bandwidth: None,
+            bwe_rearmed: false,
         }
     }
 
@@ -142,6 +149,29 @@ impl SubscriberSession {
                     );
                 }
             }
+            PeerEvent::PeerReport(report) => {
+                if self.bandwidth.is_some() {
+                    let packets = self.forwarded_packets();
+                    let now = Instant::now();
+
+                    if let Some(bandwidth) = self.bandwidth.as_mut() {
+                        bandwidth.on_report(&report, packets, now);
+                    }
+                }
+            }
+            PeerEvent::BitrateEstimate { bitrate, at } => {
+                if let Some(bandwidth) = self.bandwidth.as_mut() {
+                    bandwidth.on_estimate(bitrate.into(), at);
+                }
+            }
+            PeerEvent::RembRequested { mid, bitrate } => {
+                tracing::debug!(
+                    identity = %joined.participant.identity,
+                    %mid,
+                    %bitrate,
+                    "the subscriber asked for a bitrate with remb, which we do not act on"
+                );
+            }
             PeerEvent::MediaAdded(_)
             | PeerEvent::MediaChanged(_)
             | PeerEvent::Rtp(_)
@@ -158,6 +188,156 @@ impl SubscriberSession {
         }
 
         true
+    }
+
+    pub async fn tick(&mut self, state: &AppState, joined: &Joined) {
+        let Some(overhead) = self
+            .bandwidth
+            .as_ref()
+            .map(BandwidthController::overhead_bytes)
+        else {
+            return;
+        };
+
+        let now = Instant::now();
+        let tracks = self.subscribed_tracks(state, joined, overhead, now);
+
+        let Some(bandwidth) = self.bandwidth.as_mut() else {
+            return;
+        };
+        let grants = bandwidth.tick(&tracks, now);
+        let desired = bandwidth.desired_update();
+
+        if let (Some(desired), Some(handle)) = (desired, self.handle.as_ref()) {
+            match handle.set_desired_bitrate(desired.into()) {
+                Ok(()) => {
+                    if let Some(bandwidth) = self.bandwidth.as_mut() {
+                        bandwidth.desired_delivered(desired);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    identity = %joined.participant.identity,
+                    %desired,
+                    %error,
+                    "cannot tell the transport what this subscriber wants, so it will not probe for it"
+                ),
+            }
+        }
+
+        for grant in grants {
+            self.apply_grant(state, joined, grant);
+        }
+    }
+
+    fn subscribed_tracks(
+        &self,
+        state: &AppState,
+        joined: &Joined,
+        overhead: u32,
+        now: Instant,
+    ) -> Vec<SubscribedTrack> {
+        let mut tracks = Vec::with_capacity(self.subscriptions.len());
+
+        for (track_sid, subscription) in &self.subscriptions {
+            if subscription.liveness != Liveness::Live {
+                continue;
+            }
+
+            let Some(source) = state.router.source(track_sid) else {
+                continue;
+            };
+            let Some((_, track)) = joined.room.track(track_sid) else {
+                continue;
+            };
+
+            tracks.push(SubscribedTrack {
+                track_sid: track_sid.clone(),
+                kind: subscription.kind,
+                source: track.source,
+                multi_layer: source.is_simulcast(),
+                carrying: !track.muted && !subscription.paused,
+                available: subscription.sink.available_layers(),
+                ceiling: subscription.sink.wanted_layer(),
+                measured: source.rates(overhead, now),
+                declared: source.declared_bitrates(),
+            });
+        }
+
+        tracks
+    }
+
+    fn apply_grant(&mut self, state: &AppState, joined: &Joined, grant: Grant<String>) {
+        let subscriber_sid = &joined.participant.sid;
+        let Some(subscription) = self.subscriptions.get_mut(&grant.key) else {
+            return;
+        };
+
+        let sink = Arc::clone(&subscription.sink);
+        let publisher_sid = subscription.publisher_sid.clone();
+        let tell = !subscription.paused && subscription.liveness == Liveness::Live;
+
+        state
+            .router
+            .set_allowance(&grant.key, subscriber_sid, grant.allowance);
+
+        let paused = sink.is_bandwidth_paused();
+        if subscription.bandwidth_paused == paused {
+            return;
+        }
+
+        subscription.bandwidth_paused = paused;
+
+        tracing::info!(
+            identity = %joined.participant.identity,
+            track = %grant.key,
+            paused,
+            "a subscription was paused or resumed for bandwidth"
+        );
+
+        if tell {
+            stream_state(joined, &publisher_sid, &grant.key, paused);
+        }
+    }
+
+    fn claim_rearm(&mut self) -> bool {
+        if self.bwe_rearmed {
+            return false;
+        }
+
+        self.bwe_rearmed = true;
+        true
+    }
+
+    fn rearm_estimator(&mut self, state: &AppState, joined: &Joined) {
+        let (Some(handle), Some(settings)) = (self.handle.clone(), state.media.subscriber_bwe())
+        else {
+            return;
+        };
+
+        if !self.claim_rearm() {
+            return;
+        }
+
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            initial = %settings.initial,
+            "the first video subscription restarts the bandwidth estimator"
+        );
+
+        if let Err(error) = handle.reset_bwe(settings.initial) {
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                %error,
+                "cannot restart the bandwidth estimator"
+            );
+        }
+    }
+
+    fn forwarded_packets(&self) -> u64 {
+        self.subscriptions
+            .values()
+            .map(|subscription| subscription.sink.snapshot().packets)
+            .sum()
     }
 
     pub async fn on_room_changed(&mut self, state: &AppState, joined: &Joined) {
@@ -274,6 +454,7 @@ impl SubscriberSession {
         let publisher_sid = subscription.publisher_sid.clone();
         let kind = subscription.kind;
         let toggled = subscription.paused != settings.disabled;
+        let bandwidth_paused = subscription.bandwidth_paused;
         subscription.paused = settings.disabled;
 
         let mut effects = state
@@ -296,7 +477,7 @@ impl SubscriberSession {
             );
         }
 
-        if toggled {
+        if toggled && !bandwidth_paused {
             stream_state(joined, &publisher_sid, track_sid, settings.disabled);
         }
 
@@ -350,6 +531,9 @@ impl SubscriberSession {
 
     pub fn close(&mut self, state: &AppState, joined: &Joined) {
         state.router.remove_subscriber(&joined.participant.sid);
+        state.bandwidth.remove(&joined.participant.sid);
+        self.bandwidth = None;
+        self.bwe_rearmed = false;
 
         if let Some(handle) = self.handle.take() {
             handle.close();
@@ -613,6 +797,10 @@ impl SubscriberSession {
 
         subscription.liveness = Liveness::Live;
         subscription.paused = false;
+        subscription.bandwidth_paused = false;
+        subscription
+            .sink
+            .set_allowance(Allowance::Unlimited, Instant::now());
         subscription.sink.set_paused(false);
 
         let sink = Arc::clone(&subscription.sink);
@@ -725,9 +913,14 @@ impl SubscriberSession {
                 kind: pending.kind,
                 liveness: Liveness::Live,
                 paused: false,
+                bandwidth_paused: false,
                 sink,
             },
         );
+
+        if pending.kind == TrackKind::Video {
+            self.rearm_estimator(state, joined);
+        }
 
         joined
             .participant
@@ -833,6 +1026,13 @@ impl SubscriberSession {
         self.handle = Some(peer.handle.clone());
         self.events = Some(peer.events);
         self.task = Some(peer.task);
+
+        if state.bwe_config().enabled {
+            self.bandwidth = Some(BandwidthController::new(
+                state.bwe_config(),
+                state.bandwidth.of(&joined.participant.sid),
+            ));
+        }
 
         for candidate in std::mem::take(&mut self.queued_candidates) {
             if let Err(error) = peer.handle.add_remote_candidate(candidate).await {
@@ -962,6 +1162,27 @@ mod tests {
     use crate::simulcast::LayerMap;
 
     const ROOM: &str = "demo";
+
+    #[test]
+    fn a_republished_camera_does_not_rearm_the_estimator() {
+        let mut session = SubscriberSession::new(true);
+
+        assert!(
+            session.claim_rearm(),
+            "the first video subscription restarts the estimator"
+        );
+        assert!(
+            !session.claim_rearm(),
+            "a track republished under a new sid is not a new subscriber transport"
+        );
+
+        session.bwe_rearmed = false;
+
+        assert!(
+            session.claim_rearm(),
+            "a subscriber transport built from scratch gets a fresh estimator"
+        );
+    }
 
     async fn app_state(negotiation_timeout: u32) -> AppState {
         let mut config =

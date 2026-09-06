@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use mediacore_proto::livekit::{self, signal_response};
 use mediacore_room::TrackKind;
 use mediacore_sfu::{
-    DropReason, ForwardedPacket, ForwarderConfig, Forwarding, InboundPacket, LAYER_COUNT,
-    LayerLadder, LayerPreference, LayerSet, LayerTracker, SelectorConfig, SpatialLayer,
-    StreamStart, TrackDemand, TrackForwarder, TrackerConfig, VideoCodec, is_keyframe,
+    Allowance, Bitrate, DropReason, ForwardedPacket, ForwarderConfig, Forwarding, InboundPacket,
+    LAYER_COUNT, LayerLadder, LayerPreference, LayerSet, LayerTracker, SelectorConfig,
+    SpatialLayer, StreamStart, TrackDemand, TrackForwarder, TrackerConfig, VideoCodec, is_keyframe,
 };
 use mediacore_transport::str0m::media::{Mid, Pt, Rid};
 use mediacore_transport::{IncomingRtp, LayerStats, OutgoingRtp, PeerHandle};
@@ -27,6 +27,7 @@ pub struct SubscriptionSnapshot {
     pub first_sequence: Option<u64>,
     pub last_sequence: Option<u64>,
     pub paused: bool,
+    pub bandwidth_paused: bool,
     pub layer: Option<u8>,
     pub target_layer: u8,
     pub switches: u64,
@@ -249,6 +250,18 @@ impl TrackSource {
 
     pub fn ladder(&self) -> LayerLadder {
         self.layers.ladder()
+    }
+
+    pub fn is_simulcast(&self) -> bool {
+        self.layers.is_simulcast()
+    }
+
+    pub fn rates(&self, overhead_bytes: u32, now: Instant) -> [Option<Bitrate>; LAYER_COUNT] {
+        self.state().tracker.rates(overhead_bytes, now)
+    }
+
+    pub fn declared_bitrates(&self) -> [Option<Bitrate>; LAYER_COUNT] {
+        self.layers.ladder().declared_bitrates()
     }
 
     fn state(&self) -> MutexGuard<'_, SourceState> {
@@ -560,6 +573,27 @@ impl TrackSink {
         let mut state = self.state();
         state.forwarder.set_subscriber_paused(paused);
         state.counters.paused = paused;
+    }
+
+    pub fn set_allowance(&self, allowance: Allowance, now: Instant) -> bool {
+        let mut state = self.state();
+        let moved = state.forwarder.set_allowance(allowance, now);
+        state.counters.bandwidth_paused = state.forwarder.is_bandwidth_paused();
+        state.counters.target_layer = state.forwarder.target_layer().index();
+
+        moved
+    }
+
+    pub fn allowance(&self) -> Allowance {
+        self.state().forwarder.allowance()
+    }
+
+    pub fn is_bandwidth_paused(&self) -> bool {
+        self.state().forwarder.is_bandwidth_paused()
+    }
+
+    pub fn available_layers(&self) -> LayerSet {
+        self.state().forwarder.selector().available()
     }
 
     pub fn set_publisher_muted(&self, muted: bool) {
@@ -892,6 +926,27 @@ impl MediaRouter {
             layers_changed: false,
             demand_changed,
         }
+    }
+
+    pub fn set_allowance(
+        &self,
+        track_sid: &str,
+        subscriber_sid: &str,
+        allowance: Allowance,
+    ) -> bool {
+        let (source, sink) = self.pair(track_sid, subscriber_sid);
+        let Some(sink) = sink else {
+            return false;
+        };
+
+        let now = Instant::now();
+        let moved = sink.set_allowance(allowance, now);
+
+        if let Some(source) = source {
+            self.serve_keyframes(&source, std::slice::from_ref(&sink), now);
+        }
+
+        moved
     }
 
     pub fn tick_track(&self, track_sid: &str, now: Instant) -> TrackEffects {

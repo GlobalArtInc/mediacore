@@ -1,8 +1,10 @@
 # mediacore-demo
 
-A single-page audio room. Someone opens the URL, types a name, and hears everyone else in the
-room. The binary serves the page and mints access tokens; it never carries media and never talks
-to the SFU itself.
+A single-page room. Someone opens the URL, types a name, and hears everyone else in the room.
+Audio only by default; tick one box and the page also publishes the camera with simulcast, which
+turns the same page into a bandwidth bench — it shows, per remote track, which layer is arriving
+and what it costs, next to the browser's own view of the link. The binary serves the page and
+mints access tokens; it never carries media and never talks to the SFU itself.
 
 ```
 mediacore-demo
@@ -32,6 +34,8 @@ log through a stray `{config:?}`.
 |---|---|
 | `GET /` | the page |
 | `GET /app.css`, `GET /app.js` | the page's assets, compiled into the binary |
+| `GET /bench.js` | reads the browser's WebRTC statistics; no DOM |
+| `GET /readout.js` | draws the video tiles and the numbers; no statistics |
 | `GET /vendor/livekit-client-<version>.esm.js` | the browser SDK, also compiled into the binary |
 | `GET /api/config` | the default room and the public WebSocket URL, for the lobby |
 | `POST /api/token` | `{"name": "...", "room": "..."}` in, `{"url","token","room","identity","name"}` out |
@@ -70,6 +74,196 @@ the internet works, the content security policy above can forbid third-party scr
 no third party can change what the browser executes. The route carries the SDK version and is
 served `immutable`, so upgrading it can never serve a stale cached copy. `assets/vendor/README.md`
 says how to move to another version.
+
+
+## Query parameters
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `?room=<name>` | the configured room | joins `<configured>.<name>`; see the namespacing section above |
+| `?video=1` | off | ticks the camera box in the lobby, so joining publishes the camera as well as the microphone |
+| `?res=180\|360\|720` | `720` | capture resolution for the camera |
+| `?simulcast=0` | simulcast on | publishes a single encoding instead of a ladder |
+
+`?res` decides how many rungs there are, and the rule is `livekit-client`'s, not ours: three
+encodings (`q` 320×180, `h` 640×360, `f` 1280×720) only when the capture is at least 960 px on its
+long side. `?res=360` publishes two rungs, `?res=180` publishes one. Run the bench at `?res=720`
+unless you are deliberately testing a shorter ladder, and use the same `?res` for every publisher
+in a run or the numbers are not comparable between them.
+
+The token always grants both `microphone` and `camera`, so the camera button works after joining
+audio-only — which is the case worth testing, because it is the one where the SFU has to discover
+bandwidth it never had a reason to measure.
+
+## What the page shows
+
+**The link panel**, five numbers straight from `RTCPeerConnection.getStats()` on the client's own
+transports, sampled once a second:
+
+| Cell | Source |
+|---|---|
+| browser estimate in | `availableIncomingBitrate` on the subscriber transport's selected candidate pair |
+| arriving now | every `inbound-rtp` `bytesReceived` on that transport, summed and differenced over the sample |
+| video arriving | the same, over the video `inbound-rtp` entries only |
+| round trip | `currentRoundTripTime` on the same candidate pair |
+| browser estimate out | `availableOutgoingBitrate` on the publisher transport |
+
+Video is measured apart from audio because the failure this bench exists to catch — a subscriber the
+SFU has capped or paused and never restores — leaves audio arriving exactly as before. A total that
+still reads a few tens of kilobits per second when every tile has frozen is not a signal, it is
+camouflage; the video cell goes to zero and says so.
+
+The two estimates are the *browser's* opinion, not the SFU's. That is the point: the SFU's
+allocator runs off str0m's send-side estimate, and the only independent check available from
+outside the server is what the receiving browser thinks the same link is worth. Chrome fills in
+`availableIncomingBitrate` only while it is running a receive-side estimator; when it does not, the
+cell shows an em dash whose tooltip says so and points at the video rate instead, which is the
+number that actually answers whether the link came back. Nothing on this page
+invents a number, and nothing shows a zero for a value that was absent — a zero on the page is a
+zero the browser reported.
+
+**A tile per remote video track.** The badge names the layer and the exact decoded frame size, for
+example `mid · 640×360`. The frame size is measured; the layer name is *inferred* from the frame
+height (≤ 200 px low, ≤ 400 px mid, above that high), because the SFU tells the client which track
+is paused but never which spatial layer it chose. Underneath: bitrate, loss over the sample, frames
+per second, jitter, the browser's freeze count, and the stream state — `paused` there is the
+`StreamStateUpdate` the SFU sends when it pauses a track for bandwidth, so a bandwidth pause is
+visible as itself and not as a track that merely stopped.
+
+Under that, the tile counts layer changes and says how long ago the last one was
+(`3 layer changes · high → mid 4 s ago`), and its border goes green for a couple of seconds when
+one happens. That is the thing to watch during a step change.
+
+**A tile for your own camera**, one row per simulcast rung, read from `outbound-rtp`: the rid, the
+encoded size, the measured bitrate and — when the browser is holding a rung down — the
+`qualityLimitationReason`. A rung the browser has stopped sending is dimmed. This is where dynacast
+shows itself: if the SFU stops asking for a rung, the publisher stops encoding it and the row goes
+quiet, which matters because one congested subscriber must never do that to the room.
+
+**A line per remote participant** in the list, with the arriving bitrate and loss of their audio.
+
+The bench reads all of this off the two transports the vendored `livekit-client` builds, which is
+not part of that library's public surface. It is pinned to the vendored copy; if the SDK is
+upgraded and those fields move, every cell reports that it has no connection to read rather than
+quietly reporting nothing at all.
+
+Loss is reported as `lost / (lost + received)` over one sample, and is blank rather than `0 %` when
+no packet arrived at all in that window — a silent DTX track and a track that is being dropped are
+not the same thing and the page will not conflate them.
+
+The client runs with `adaptiveStream: false`, so the browser never asks for a different quality
+itself. Every layer change you see on a tile was the SFU's decision. Turning adaptive streaming on
+would make the page measure the client instead.
+
+## Running the bench against a constrained link
+
+Shape the **SFU host's egress on the UDP media port**, `rtc.udp_port`, which defaults to **7882**.
+Not the demo's HTTP port, and not the signalling port: signalling is TCP on 7880, and shaping it
+kills the session for reasons that have nothing to do with congestion. Egress from the SFU is the
+direction that matters — it is the direction the allocator spends.
+
+Keep the bottleneck queue shallow, around 50 packets. A deep queue turns the run into a latency
+test: the pacer hides behind it, nothing is lost, and the estimator sees a slow drift instead of a
+cliff. If the SFU runs in a container, shape inside its network namespace or on its veth; shaping
+the host bridge shapes every peer at once and the "one subscriber shaped, one not" run becomes
+impossible.
+
+### Linux
+
+```
+IFACE=eth0
+sudo tc qdisc add dev $IFACE root handle 1: htb default 20
+sudo tc class add dev $IFACE parent 1: classid 1:10 htb rate 1500kbit burst 15k
+sudo tc class add dev $IFACE parent 1: classid 1:20 htb rate 1000mbit
+sudo tc qdisc add dev $IFACE parent 1:10 handle 10: netem delay 40ms limit 50
+sudo tc filter add dev $IFACE protocol ip parent 1:0 prio 1 u32 \
+  match ip protocol 17 0xff match ip sport 7882 0xffff flowid 1:10
+```
+
+Change the ceiling in place, which is how you produce a step:
+
+```
+sudo tc class change dev $IFACE parent 1: classid 1:10 htb rate 800kbit burst 15k
+```
+
+Add loss without a ceiling, for the wifi impersonation:
+
+```
+sudo tc qdisc change dev $IFACE parent 1:10 handle 10: netem delay 20ms loss 20% limit 50
+```
+
+Tear it all down:
+
+```
+sudo tc qdisc del dev $IFACE root
+```
+
+### macOS
+
+```
+sudo dnctl pipe 1 config bw 1500Kbit/s delay 40ms queue 50
+printf 'dummynet out proto udp from any port 7882 to any pipe 1\n' | sudo pfctl -f - -e
+```
+
+Step it:
+
+```
+sudo dnctl pipe 1 config bw 800Kbit/s delay 40ms queue 50
+```
+
+Loss without a ceiling:
+
+```
+sudo dnctl pipe 1 config bw 5Mbit/s plr 0.2 delay 20ms queue 50
+```
+
+Tear it down:
+
+```
+sudo pfctl -d
+sudo dnctl -q flush
+```
+
+`pfctl -f -` replaces the whole ruleset, so on a machine with rules of its own, add the `dummynet`
+line to that ruleset instead of piping a one-line file at it.
+
+### A run
+
+Three publishers at `?video=1&res=720` and one subscriber behind the shaper. Two browser profiles
+on one machine will do for the publishers; the subscriber should be the shaped host. Ten minutes
+each, and write down the git rev and the shaper settings — a run nobody recorded cannot be compared
+against the next one.
+
+| # | Do this | The page should show |
+|---|---|---|
+| 1 | steady 1500 kbit/s | "arriving now" settles near 1500 kbit/s; every tile picks a rung and stops; under two layer changes per minute per track; loss under 1 %; round trip within 100 ms of the unshaped baseline |
+| 2 | step 5000 → 800 kbit/s | a tile's badge steps down within about two seconds, its border flashes, loss is back under 1 % within five; the freeze counters stay put |
+| 3 | step 800 → 5000 kbit/s | at least one tile climbs back within thirty seconds |
+| 4 | no ceiling, 20 % loss | no tile reports `paused`, and the badges settle once and then do not move |
+| 5 | shape one subscriber, leave a second unshaped | the unshaped subscriber's badges never move, and every rung on each publisher's own tile stays alive |
+| 6 | join with `?video=0`, press Start camera after a minute | video reaches at least the mid rung within ten seconds |
+| 7 | no shaping at all, ten minutes | no `paused`, and fewer than two layer changes per minute per track |
+
+Scenario 4 does not measure a five megabit link, and it is not supposed to. str0m's loss controller
+caps its own estimate at `instant_upper_bound_bandwidth_balance / (loss - 0.05)`, which at twenty
+percent loss is about 666 kbit/s no matter how fast the link is, and its pacer paces at that number
+whatever the allocator thinks. So the run is passed by the badges settling at a rung that fits inside
+666 kbit/s within the first couple of seconds and then never moving, and by the state never reaching
+`congested` — not by the badges staying at 720p. Fighting the estimate instead of honouring it is
+what fills the pacer's queue, and a full queue is the one thing this system reads as congestion.
+`the_bench_wifi_scenario_is_a_smaller_budget_and_not_a_congested_link` in
+`crates/server/src/bandwidth.rs` is this scenario driven off a model of that link, so a regression
+shows up without a shaper; the shaped run is still what proves the model.
+
+The failure worth learning to recognise is scenario 1 going wrong quietly: **round trip climbing
+into the hundreds of milliseconds while loss stays at zero and no tile changes layer**. That is not
+a healthy link, it is the pacer's queue filling — the SFU is over-subscribing and the allocator has
+not reacted. Loss is the loud failure; standing delay with no loss is the silent one, and it is why
+the round-trip cell is on the panel at all.
+
+Cross-check anything surprising in `chrome://webrtc-internals`, which shows the same counters this
+page samples, plus the graphs. Every em dash on the page carries a tooltip saying why the value is
+missing; hover it before assuming the bench is broken.
 
 ## Deployment
 

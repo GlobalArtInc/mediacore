@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use mediacore_config::Config;
+use mediacore_config::{BweConfig, Config};
 use mediacore_proto::livekit;
 use mediacore_room::{Registry, RoomDefaults};
 
 use mediacore_sfu::SelectorConfig;
+use mediacore_transport::{Bitrate, BweSettings};
 
+use crate::bandwidth::Subscribers;
 use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
@@ -17,11 +19,12 @@ pub struct AppState {
     pub media: Arc<MediaEngine>,
     pub publishers: Arc<Publishers>,
     pub router: Arc<MediaRouter>,
+    pub bandwidth: Arc<Subscribers>,
 }
 
 impl AppState {
     pub async fn start(config: Config) -> anyhow::Result<Self> {
-        let media = MediaEngine::start(&config.rtc).await?;
+        let media = MediaEngine::start(&config.rtc, subscriber_bwe(&config.video.bwe)).await?;
 
         Ok(Self::with_media(config, media))
     }
@@ -40,7 +43,12 @@ impl AppState {
             media: Arc::new(media),
             publishers: Arc::new(Publishers::default()),
             router: Arc::new(MediaRouter::default()),
+            bandwidth: Arc::new(Subscribers::default()),
         }
+    }
+
+    pub fn bwe_config(&self) -> &BweConfig {
+        &self.config.video.bwe
     }
 
     pub fn source_config(&self, source: livekit::TrackSource) -> SourceConfig {
@@ -55,4 +63,10 @@ impl AppState {
             upgrade_hold: self.config.video.layer_upgrade_hold(),
         }
     }
+}
+
+pub fn subscriber_bwe(config: &BweConfig) -> Option<BweSettings> {
+    config
+        .enabled
+        .then(|| BweSettings::new(Bitrate::kbps(config.initial_kbps.into())))
 }

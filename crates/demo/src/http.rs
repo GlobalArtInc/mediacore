@@ -18,6 +18,8 @@ use crate::name::{NameError, RoomError, clean_name, identity_for, namespaced_roo
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
+const BENCH_JS: &str = include_str!("../assets/bench.js");
+const READOUT_JS: &str = include_str!("../assets/readout.js");
 const SDK_JS: &str = include_str!("../assets/vendor/livekit-client.esm.js");
 const TOKEN_BODY_LIMIT: usize = 4 * 1024;
 
@@ -34,6 +36,8 @@ pub fn router(config: Config) -> Router {
         .route("/", get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(script))
+        .route("/bench.js", get(bench))
+        .route("/readout.js", get(readout))
         .route(SDK_PATH, get(sdk))
         .route("/healthz", get(healthz))
         .route("/api/config", get(public_config))
@@ -92,6 +96,14 @@ async fn stylesheet() -> impl IntoResponse {
 
 async fn script() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, APP_JS)
+}
+
+async fn bench() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, BENCH_JS)
+}
+
+async fn readout() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, READOUT_JS)
 }
 
 async fn sdk() -> impl IntoResponse {
@@ -223,7 +235,7 @@ async fn token(
             can_publish: Some(true),
             can_subscribe: Some(true),
             can_publish_data: Some(false),
-            can_publish_sources: vec!["microphone".to_owned()],
+            can_publish_sources: vec!["microphone".to_owned(), "camera".to_owned()],
             ..VideoGrant::default()
         },
         ..Claims::default()
@@ -255,6 +267,40 @@ mod tests {
             APP_JS.contains(SDK_PATH),
             "app.js does not import the sdk from {SDK_PATH}"
         );
+    }
+
+    #[test]
+    fn every_module_the_page_imports_is_compiled_in() {
+        let served = [
+            ("/app.js", APP_JS),
+            ("/bench.js", BENCH_JS),
+            ("/readout.js", READOUT_JS),
+        ];
+
+        for (path, module) in served {
+            for import in imports(module) {
+                assert!(
+                    served.iter().any(|(candidate, _)| *candidate == import),
+                    "{path} imports {import}, which this server does not serve"
+                );
+            }
+        }
+
+        assert!(
+            imports(BENCH_JS).is_empty(),
+            "bench.js is meant to be the leaf of the module graph"
+        );
+    }
+
+    fn imports(module: &str) -> Vec<String> {
+        module
+            .match_indices("from \"")
+            .filter_map(|(index, marker)| {
+                let rest = &module[index + marker.len()..];
+                rest.split_once('"').map(|(path, _)| path.to_owned())
+            })
+            .filter(|path| path.ends_with(".js") && !path.contains("/vendor/"))
+            .collect()
     }
 
     #[test]

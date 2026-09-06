@@ -9,7 +9,7 @@ use crate::layer::{LayerDecision, LayerLatch, LayerSet, SpatialLayer};
 use crate::packet::{
     DropReason, ForwardedPacket, Forwarding, InboundPacket, subscriber_extensions,
 };
-use crate::selector::{LayerPreference, LayerSelector, SelectorConfig};
+use crate::selector::{Allowance, LayerPreference, LayerSelector, SelectorConfig};
 use crate::seq::{SeqUnwrapper, TimeUnwrapper};
 
 const DEFAULT_KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
@@ -179,6 +179,7 @@ pub struct TrackForwarder {
     out: OutgoingState,
     publisher_muted: bool,
     subscriber_paused: bool,
+    bandwidth_paused: bool,
     keyframe_needed: bool,
     keyframe_asked: Option<Instant>,
     keyframe_attempts: u32,
@@ -210,6 +211,7 @@ impl TrackForwarder {
             },
             publisher_muted: false,
             subscriber_paused: false,
+            bandwidth_paused: false,
             keyframe_needed: config.gated(),
             keyframe_asked: None,
             keyframe_attempts: 0,
@@ -273,6 +275,20 @@ impl TrackForwarder {
         self.take_target(target)
     }
 
+    pub fn allowance(&self) -> Allowance {
+        self.selector.allowance()
+    }
+
+    pub fn set_allowance(&mut self, allowance: Allowance, now: Instant) -> bool {
+        let was = self.is_paused();
+        let target = self.selector.set_allowance(allowance, now);
+
+        self.bandwidth_paused = allowance.is_paused();
+        self.apply_pause(was);
+
+        self.take_target(target)
+    }
+
     pub fn observe_layers(&mut self, available: LayerSet, now: Instant) -> bool {
         let target = self.selector.update(available, now);
         self.take_target(target)
@@ -288,7 +304,7 @@ impl TrackForwarder {
             return None;
         }
 
-        self.selector.ceiling()
+        self.selector.preferred_ceiling()
     }
 
     fn take_target(&mut self, target: Option<SpatialLayer>) -> bool {
@@ -313,7 +329,7 @@ impl TrackForwarder {
     fn wants_keyframe(&self) -> bool {
         self.keyframe_needed
             && !self.publisher_muted
-            && !self.subscriber_paused
+            && !self.is_paused()
             && self.keyframe_attempts < self.config.keyframe_attempts
     }
 
@@ -351,6 +367,14 @@ impl TrackForwarder {
         self.subscriber_paused
     }
 
+    pub fn is_bandwidth_paused(&self) -> bool {
+        self.bandwidth_paused
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.subscriber_paused || self.bandwidth_paused
+    }
+
     pub fn set_publisher_muted(&mut self, muted: bool) {
         if self.publisher_muted == muted {
             return;
@@ -367,8 +391,13 @@ impl TrackForwarder {
             return;
         }
 
+        let was = self.is_paused();
         self.subscriber_paused = paused;
-        if !paused {
+        self.apply_pause(was);
+    }
+
+    fn apply_pause(&mut self, was: bool) {
+        if was && !self.is_paused() {
             self.resync();
         }
     }
@@ -387,7 +416,7 @@ impl TrackForwarder {
             return Forwarding::Drop(DropReason::PublisherMuted);
         }
 
-        if self.subscriber_paused {
+        if self.is_paused() {
             self.stats.paused += 1;
             return Forwarding::Drop(DropReason::SubscriberPaused);
         }
@@ -1257,5 +1286,120 @@ mod tests {
 
         assert_eq!(other.dropped(), Some(DropReason::WrongLayer));
         assert_eq!(forwarder.stats().wrong_layer, 1);
+    }
+
+    #[test]
+    fn a_bandwidth_pause_and_a_client_pause_are_independent() {
+        let now = base();
+        let mut forwarder = video(3);
+
+        forwarder.set_subscriber_paused(true);
+        forwarder.set_allowance(Allowance::Paused, now);
+
+        assert!(forwarder.is_subscriber_paused());
+        assert!(forwarder.is_bandwidth_paused());
+
+        forwarder.set_subscriber_paused(false);
+        assert!(
+            forwarder.is_paused(),
+            "a client cannot un-pause a track the allocator paused"
+        );
+
+        forwarder.set_allowance(Allowance::Capped(SpatialLayer::BASE), now);
+        assert!(!forwarder.is_paused());
+        assert_eq!(forwarder.allowance(), Allowance::Capped(SpatialLayer::BASE));
+    }
+
+    #[test]
+    fn a_bandwidth_paused_track_still_wants_its_layer() {
+        let now = base();
+        let mut forwarder = video(4);
+        forwarder.observe_layers(LayerSet::all(), now);
+
+        assert_eq!(forwarder.wanted_layer(), Some(SpatialLayer::MAX));
+
+        forwarder.set_allowance(Allowance::Paused, now);
+        assert_eq!(
+            forwarder.wanted_layer(),
+            Some(SpatialLayer::MAX),
+            "one congested subscriber must not tell the publisher to stop encoding"
+        );
+
+        forwarder.set_subscriber_paused(true);
+        assert_eq!(
+            forwarder.wanted_layer(),
+            None,
+            "a track the client turned off leaves the demand union"
+        );
+    }
+
+    #[test]
+    fn an_allowance_never_breaks_the_outgoing_sequence() {
+        let now = base();
+        let mut forwarder = video(9);
+        let mut emitted: Vec<u64> = Vec::new();
+
+        for step in 0..4u16 {
+            let result = forwarder.forward(
+                &packet(
+                    PUBLISHER,
+                    300 + step,
+                    50_000 + u32::from(step) * STEP,
+                    now + TICK * u32::from(step),
+                )
+                .with_keyframe(step == 0),
+            );
+            emitted.push(*sent(&result).seq);
+        }
+
+        forwarder.set_allowance(Allowance::Paused, now + TICK * 4);
+
+        for step in 4..8u16 {
+            let result = forwarder.forward(&packet(
+                PUBLISHER,
+                300 + step,
+                50_000 + u32::from(step) * STEP,
+                now + TICK * u32::from(step),
+            ));
+            assert_eq!(result.dropped(), Some(DropReason::SubscriberPaused));
+        }
+
+        forwarder.set_allowance(Allowance::Capped(SpatialLayer::BASE), now + TICK * 8);
+        assert!(forwarder.needs_keyframe());
+
+        let held = forwarder.forward(&packet(PUBLISHER, 308, 50_000 + 8 * STEP, now + TICK * 8));
+        assert_eq!(held.dropped(), Some(DropReason::AwaitingKeyframe));
+
+        let result =
+            forwarder.forward(&keyframe(PUBLISHER, 309, 50_000 + 9 * STEP, now + TICK * 9));
+        emitted.push(*sent(&result).seq);
+
+        let follow =
+            forwarder.forward(&packet(PUBLISHER, 310, 50_000 + 10 * STEP, now + TICK * 10));
+        emitted.push(*sent(&follow).seq);
+
+        let expected: Vec<u64> = (emitted[0]..emitted[0] + emitted.len() as u64).collect();
+        assert_eq!(
+            emitted, expected,
+            "a bandwidth pause and resume must leave no hole in the subscriber's sequence"
+        );
+    }
+
+    #[test]
+    fn an_allowance_caps_the_layer_the_forwarder_asks_for() {
+        let now = base();
+        let mut forwarder = video(11);
+        forwarder.observe_layers(LayerSet::all(), now);
+        assert_eq!(forwarder.target_layer(), SpatialLayer::MAX);
+
+        assert!(forwarder.set_allowance(Allowance::Capped(SpatialLayer::BASE), now));
+        assert_eq!(forwarder.target_layer(), SpatialLayer::BASE);
+
+        assert!(forwarder.set_allowance(Allowance::Unlimited, now));
+        assert_eq!(
+            forwarder.target_layer(),
+            SpatialLayer::MAX,
+            "the subscriber never asked for less, so it goes back on its own"
+        );
     }
 }

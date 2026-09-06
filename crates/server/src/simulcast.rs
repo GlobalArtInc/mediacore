@@ -166,11 +166,10 @@ impl LayerMap {
         self.entries
             .iter()
             .fold(LayerLadder::new(), |ladder, entry| {
-                ladder.with_quality(entry.layer, entry.quality).with_size(
-                    entry.layer,
-                    entry.width,
-                    entry.height,
-                )
+                ladder
+                    .with_quality(entry.layer, entry.quality)
+                    .with_size(entry.layer, entry.width, entry.height)
+                    .with_bitrate(entry.layer, entry.bitrate)
             })
     }
 

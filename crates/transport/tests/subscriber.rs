@@ -315,7 +315,7 @@ async fn subscriber_server() -> (TransportCrypto, UdpRouter, SpawnedPeer) {
     .expect("the ice socket binds");
     udp.spawn_reader();
 
-    let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).expect("the peer starts");
+    let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).expect("the peer starts");
 
     (crypto, udp, peer)
 }

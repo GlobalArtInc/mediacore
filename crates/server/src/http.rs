@@ -47,7 +47,8 @@ async fn healthz(State(state): State<AppState>) -> String {
 
     format!(
         "rooms={} participants={participants} publishers={} rtp_packets={} rtp_bytes={} \
-         tracks={} subscriptions={} forwarded_packets={} forwarded_bytes={} ice={}",
+         tracks={} subscriptions={} forwarded_packets={} forwarded_bytes={} bwe={} \
+         allocated_subscribers={} ice={}",
         rooms.len(),
         state.publishers.count(),
         media.rtp_packets,
@@ -56,6 +57,12 @@ async fn healthz(State(state): State<AppState>) -> String {
         forwarding.subscriptions,
         forwarding.packets,
         forwarding.bytes,
+        if state.bwe_config().enabled {
+            "on"
+        } else {
+            "off"
+        },
+        state.bandwidth.count(),
         state.media.local_addr()
     )
 }

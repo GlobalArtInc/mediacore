@@ -1,9 +1,26 @@
+import {
+  FIRST_SAMPLE,
+  NOT_REPORTED,
+  NO_SUBSCRIBER,
+  createBench,
+} from "/bench.js";
+import {
+  createTiles,
+  describeAudio,
+  formatBitrate,
+  formatMillis,
+  write,
+} from "/readout.js";
+
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 const SPEAKING_RMS = 0.02;
 const SPEAKING_HOLD_MS = 500;
 const METER_INTERVAL_MS = 150;
+const BENCH_INTERVAL_MS = 1000;
+const PRESETS = { 180: "h180", 360: "h360", 720: "h720" };
 
 const el = {
+  main: document.querySelector("main"),
   lobby: document.getElementById("lobby"),
   lobbyRoom: document.getElementById("lobby-room"),
   lobbyStatus: document.getElementById("lobby-status"),
@@ -11,20 +28,30 @@ const el = {
   form: document.getElementById("join-form"),
   name: document.getElementById("name"),
   join: document.getElementById("join"),
+  video: document.getElementById("with-video"),
   room: document.getElementById("room"),
   roomName: document.getElementById("room-name"),
   roomCount: document.getElementById("room-count"),
   roomState: document.getElementById("room-state"),
   roomError: document.getElementById("room-error"),
   participants: document.getElementById("participants"),
+  tiles: document.getElementById("tiles"),
+  estimate: document.getElementById("link-estimate"),
+  arriving: document.getElementById("link-arriving"),
+  video: document.getElementById("link-video"),
+  rtt: document.getElementById("link-rtt"),
+  sending: document.getElementById("link-sending"),
   enableAudio: document.getElementById("enable-audio"),
+  camera: document.getElementById("camera"),
   mute: document.getElementById("mute"),
   leave: document.getElementById("leave"),
   audio: document.getElementById("audio"),
   footUrl: document.getElementById("foot-url"),
 };
 
-const requestedRoom = new URLSearchParams(location.search).get("room");
+const query = new URLSearchParams(location.search);
+const requestedRoom = query.get("room");
+const wantsSimulcast = query.get("simulcast") !== "0";
 
 let lk = null;
 let settings = {
@@ -35,15 +62,25 @@ let settings = {
 };
 let room = null;
 let micTrack = null;
+let cameraTrack = null;
 let speaking = new Set();
 const meters = new Map();
+const arriving = new Map();
 let meterTimer = null;
 let audioContext = null;
+let bench = null;
+let benchTimer = null;
+let lastReading = null;
+let tiles = null;
 
 start();
 
 async function start() {
+  tiles = createTiles(el.tiles);
+  el.video.checked = query.get("video") === "1";
+
   el.form.addEventListener("submit", onJoin);
+  el.camera.addEventListener("click", onCamera);
   el.mute.addEventListener("click", onMute);
   el.leave.addEventListener("click", () => leave("You left the room."));
   el.enableAudio.addEventListener("click", onEnableAudio);
@@ -81,6 +118,7 @@ async function start() {
 function ready() {
   el.join.disabled = false;
   el.name.disabled = false;
+  el.video.disabled = false;
   el.lobbyStatus.textContent = "";
   el.name.focus();
 }
@@ -113,6 +151,7 @@ async function onJoin(event) {
     return;
   }
 
+  const withVideo = el.video.checked;
   busy(true, "Asking for the microphone…");
 
   try {
@@ -151,6 +190,8 @@ async function onJoin(event) {
 
   busy(false, "");
   enterRoom(credentials);
+
+  if (withVideo) await startCamera();
 }
 
 async function mintToken(name) {
@@ -189,7 +230,9 @@ async function connect(credentials) {
     .on(lk.RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
     .on(lk.RoomEvent.TrackMuted, render)
     .on(lk.RoomEvent.TrackUnmuted, render)
+    .on(lk.RoomEvent.TrackStreamStateChanged, render)
     .on(lk.RoomEvent.LocalTrackPublished, render)
+    .on(lk.RoomEvent.LocalTrackUnpublished, render)
     .on(lk.RoomEvent.ConnectionStateChanged, onConnectionState)
     .on(lk.RoomEvent.AudioPlaybackStatusChanged, onPlaybackStatus)
     .on(lk.RoomEvent.Disconnected, onDisconnected);
@@ -197,6 +240,7 @@ async function connect(credentials) {
   await room.connect(credentials.url, credentials.token);
   await room.localParticipant.publishTrack(micTrack);
   watchLevel(room.localParticipant.identity, micTrack);
+  startBench();
 }
 
 function enterRoom(credentials) {
@@ -206,6 +250,7 @@ function enterRoom(credentials) {
   el.lobby.hidden = true;
   el.room.hidden = false;
   updateMuteButton();
+  updateCameraButton();
   onPlaybackStatus();
   render();
   el.mute.focus();
@@ -213,8 +258,12 @@ function enterRoom(credentials) {
 
 async function leave(reason) {
   await discardRoom();
+  await releaseCamera();
   await releaseMicrophone();
+  stopBench();
   dropAllLevels();
+  tiles.clear();
+  el.main.dataset.wide = "false";
   el.audio.replaceChildren();
   speaking = new Set();
   el.room.hidden = true;
@@ -238,18 +287,152 @@ async function releaseMicrophone() {
   await track.stop();
 }
 
-function onTrackSubscribed(track, _publication, participant) {
-  if (track.kind !== lk.Track.Kind.Audio) return;
-  const element = track.attach();
-  element.dataset.identity = participant.identity;
-  el.audio.appendChild(element);
-  watchLevel(participant.identity, track);
+async function releaseCamera() {
+  if (!cameraTrack) return;
+  const track = cameraTrack;
+  cameraTrack = null;
+  await track.stop();
+}
+
+function capturePreset() {
+  const name = PRESETS[query.get("res")] || "h720";
+  return lk.VideoPresets[name];
+}
+
+async function startCamera() {
+  if (!room || cameraTrack) return;
+
+  el.camera.disabled = true;
+  el.camera.textContent = "Starting camera…";
+
+  const preset = capturePreset();
+  try {
+    cameraTrack = await lk.createLocalVideoTrack({ resolution: preset.resolution });
+    await room.localParticipant.publishTrack(cameraTrack, {
+      simulcast: wantsSimulcast,
+      videoCodec: "vp8",
+      backupCodec: false,
+      videoEncoding: preset.encoding,
+    });
+  } catch (error) {
+    await releaseCamera();
+    fail(el.roomError, cameraMessage(error));
+  }
+
+  el.camera.disabled = false;
+  updateCameraButton();
   render();
 }
 
-function onTrackUnsubscribed(track, _publication, participant) {
-  track.detach().forEach((element) => element.remove());
-  dropLevel(participant.identity);
+async function stopCamera() {
+  if (!room || !cameraTrack) return;
+
+  el.camera.disabled = true;
+  try {
+    await room.localParticipant.unpublishTrack(cameraTrack, true);
+  } catch (error) {
+    console.warn("the camera track could not be unpublished cleanly", error);
+  }
+  await releaseCamera();
+  el.camera.disabled = false;
+  updateCameraButton();
+  render();
+}
+
+async function onCamera() {
+  hide(el.roomError);
+  if (cameraTrack) {
+    await stopCamera();
+  } else {
+    await startCamera();
+  }
+}
+
+function updateCameraButton() {
+  el.camera.textContent = cameraTrack ? "Stop camera" : "Start camera";
+}
+
+function startBench() {
+  bench = createBench(room);
+  lastReading = null;
+  if (!benchTimer) benchTimer = setInterval(pump, BENCH_INTERVAL_MS);
+}
+
+function stopBench() {
+  if (benchTimer) {
+    clearInterval(benchTimer);
+    benchTimer = null;
+  }
+  if (bench) bench.reset();
+  bench = null;
+  lastReading = null;
+  paintLink({
+    estimate: null,
+    arriving: null,
+    video: null,
+    rtt: null,
+    sending: null,
+    note: NO_SUBSCRIBER,
+  });
+}
+
+async function pump() {
+  if (!bench || !room) return;
+
+  let reading;
+  try {
+    reading = await bench.read();
+  } catch (error) {
+    console.warn("the browser refused to report statistics", error);
+    return;
+  }
+  if (!bench) return;
+
+  lastReading = reading;
+  paint(reading);
+}
+
+function paint(reading) {
+  paintLink(reading.link);
+  tiles.paint(reading);
+  paintArriving(reading);
+}
+
+function paintLink(link) {
+  write(
+    el.estimate,
+    formatBitrate(link.estimate),
+    link.note || link.pairNote || link.estimateNote || NOT_REPORTED,
+  );
+  write(el.arriving, formatBitrate(link.arriving), link.note || FIRST_SAMPLE);
+  write(el.video, formatBitrate(link.video), link.note || link.videoNote || FIRST_SAMPLE);
+  write(el.rtt, formatMillis(link.rtt), link.note || link.pairNote || NOT_REPORTED);
+  write(el.sending, formatBitrate(link.sending), link.sendingNote || NOT_REPORTED);
+}
+
+function paintArriving(reading) {
+  for (const entry of arriving.values()) {
+    const described = describeAudio(reading.tracks.get(entry.sid));
+    write(entry.node, described.text, described.reason);
+  }
+}
+
+function onTrackSubscribed(track, _publication, participant) {
+  if (track.kind === lk.Track.Kind.Audio) {
+    const element = track.attach();
+    element.dataset.identity = participant.identity;
+    el.audio.appendChild(element);
+    watchLevel(participant.identity, track);
+  }
+  render();
+}
+
+function onTrackUnsubscribed(track, publication, participant) {
+  if (track.kind === lk.Track.Kind.Audio) {
+    track.detach().forEach((element) => element.remove());
+    dropLevel(participant.identity);
+  }
+  if (bench && publication) bench.forget(publication.trackSid);
   render();
 }
 
@@ -424,6 +607,8 @@ function render() {
 
   const people = [room.localParticipant, ...room.remoteParticipants.values()];
   const labels = labelsFor(people);
+
+  arriving.clear();
   el.participants.replaceChildren(
     ...people.map((participant) =>
       renderParticipant(
@@ -435,6 +620,40 @@ function render() {
   );
   el.roomCount.textContent =
     people.length === 1 ? "Just you so far." : `${people.length} people in the room.`;
+
+  const wanted = videoTiles(people, labels);
+  tiles.sync(wanted);
+  el.main.dataset.wide = String(wanted.length > 0);
+
+  if (lastReading) paint(lastReading);
+}
+
+function videoTiles(people, labels) {
+  const wanted = [];
+
+  if (cameraTrack) {
+    wanted.push({
+      key: "local",
+      label: `${labels.get(room.localParticipant.identity)} · you`,
+      track: cameraTrack,
+      local: true,
+    });
+  }
+
+  for (const participant of people) {
+    if (participant === room.localParticipant) continue;
+    for (const publication of participant.videoTrackPublications.values()) {
+      if (!publication.track) continue;
+      wanted.push({
+        key: publication.trackSid,
+        label: labels.get(participant.identity),
+        track: publication.track,
+        local: false,
+      });
+    }
+  }
+
+  return wanted;
 }
 
 function labelsFor(people) {
@@ -502,6 +721,15 @@ function renderParticipant(participant, isLocal, label) {
   }
 
   row.append(level, who, state);
+
+  if (!isLocal && publication) {
+    const heard = document.createElement("span");
+    heard.className = "heard";
+    heard.textContent = "…";
+    row.appendChild(heard);
+    arriving.set(participant.identity, { node: heard, sid: publication.trackSid });
+  }
+
   return row;
 }
 
@@ -530,6 +758,28 @@ function microphoneMessage(error) {
   }
 }
 
+function cameraMessage(error) {
+  switch (error && error.name) {
+    case "NotAllowedError":
+    case "PermissionDeniedError":
+      return (
+        "The camera was blocked. Open the padlock in the address bar, set Camera to Allow " +
+        "for this site, then press Start camera again. The room carries on without it."
+      );
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+      return "No camera was found. The room carries on without it.";
+    case "NotReadableError":
+    case "TrackStartError":
+      return (
+        "The camera is already in use by another application. Close it and press Start " +
+        "camera again."
+      );
+    default:
+      return `The camera could not be published: ${(error && error.message) || error}.`;
+  }
+}
+
 function connectionMessage(error, url) {
   const detail = (error && error.message) || error;
   return (
@@ -546,6 +796,7 @@ function setState(kind, label) {
 function busy(active, message) {
   el.join.disabled = active;
   el.name.disabled = active;
+  el.video.disabled = active;
   el.join.textContent = active ? "Joining…" : "Join";
   el.lobbyStatus.textContent = message;
 }
@@ -554,6 +805,7 @@ function block(message) {
   fail(el.lobbyError, message);
   el.join.disabled = true;
   el.name.disabled = true;
+  el.video.disabled = true;
 }
 
 function fail(node, message) {

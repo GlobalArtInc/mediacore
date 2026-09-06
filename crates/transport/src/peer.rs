@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpApi, SdpOffer, SdpPendingOffer};
 use str0m::format::{Codec, PayloadParams};
 use str0m::media::{
@@ -19,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
+use crate::bwe::{BweSettings, PeerReport, SendQueueEntry, clamp_desired};
 use crate::crypto::TransportCrypto;
 use crate::error::TransportError;
 use crate::negotiation::{
@@ -35,6 +37,8 @@ pub const COMMAND_QUEUE_CAPACITY: usize = 64;
 pub const MEDIA_QUEUE_CAPACITY: usize = 512;
 pub const WRITE_QUEUE_CAPACITY: usize = 1024;
 pub const ICE_DISCONNECTED_GRACE: Duration = Duration::from_secs(20);
+pub const PUBLISHER_STATS_INTERVAL: Duration = Duration::from_secs(2);
+pub const SUBSCRIBER_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -60,6 +64,7 @@ pub struct PeerConfig {
     pub negotiation_backlog: usize,
     pub layer_silence: Duration,
     pub keyframe_probe: Option<KeyframeProbe>,
+    pub bwe: Option<BweSettings>,
 }
 
 impl Default for PeerConfig {
@@ -69,7 +74,7 @@ impl Default for PeerConfig {
             advertise: Vec::new(),
             ice_lite: true,
             rtp_mode: true,
-            stats_interval: Some(Duration::from_secs(2)),
+            stats_interval: Some(PUBLISHER_STATS_INTERVAL),
             command_queue: COMMAND_QUEUE_CAPACITY,
             media_queue: MEDIA_QUEUE_CAPACITY,
             write_queue: WRITE_QUEUE_CAPACITY,
@@ -78,6 +83,7 @@ impl Default for PeerConfig {
             negotiation_backlog: NEGOTIATION_BACKLOG,
             layer_silence: LAYER_SILENCE_THRESHOLD,
             keyframe_probe: None,
+            bwe: None,
         }
     }
 }
@@ -87,9 +93,11 @@ impl PeerConfig {
         Self::default()
     }
 
-    pub fn subscriber() -> Self {
+    pub fn subscriber(bwe: Option<BweSettings>) -> Self {
         Self {
             role: PeerRole::Subscriber,
+            stats_interval: Some(SUBSCRIBER_STATS_INTERVAL),
+            bwe,
             ..Self::default()
         }
     }
@@ -177,6 +185,9 @@ pub enum PeerEvent {
     KeyframeRequested(KeyframeRequest),
     EgressReport(EgressReport),
     IngressReport(IngressReport),
+    PeerReport(Box<PeerReport>),
+    BitrateEstimate { bitrate: Bitrate, at: Instant },
+    RembRequested { mid: Mid, bitrate: Bitrate },
     LayerActivity(LayerActivity),
     Disconnected,
 }
@@ -227,6 +238,11 @@ enum PeerCommand {
         mid: Mid,
         reply: oneshot::Sender<Option<MediaInfo>>,
     },
+    SetDesiredBitrate(Bitrate),
+    ResetBwe(Bitrate),
+    QueueQuery {
+        reply: oneshot::Sender<Vec<SendQueueEntry>>,
+    },
     Close,
 }
 
@@ -234,6 +250,7 @@ enum PeerCommand {
 pub struct PeerHandle {
     id: SessionId,
     role: PeerRole,
+    bwe: Option<BweSettings>,
     ice_creds: Arc<RwLock<IceCreds>>,
     dropped_media: Arc<AtomicU64>,
     dropped_writes: Arc<AtomicU64>,
@@ -251,6 +268,14 @@ impl PeerHandle {
 
     pub fn role(&self) -> PeerRole {
         self.role
+    }
+
+    pub fn bwe(&self) -> Option<BweSettings> {
+        self.bwe
+    }
+
+    pub fn estimates_bandwidth(&self) -> bool {
+        self.bwe.is_some()
     }
 
     pub fn ice_creds(&self) -> IceCreds {
@@ -394,6 +419,27 @@ impl PeerHandle {
             .ok_or(TransportError::UnknownMid(mid))
     }
 
+    pub fn set_desired_bitrate(&self, desired: Bitrate) -> Result<(), TransportError> {
+        if self.bwe.is_none() {
+            return Err(TransportError::BweDisabled);
+        }
+
+        self.notify(PeerCommand::SetDesiredBitrate(clamp_desired(desired)))
+    }
+
+    pub fn reset_bwe(&self, initial: Bitrate) -> Result<(), TransportError> {
+        if self.bwe.is_none() {
+            return Err(TransportError::BweDisabled);
+        }
+
+        self.notify(PeerCommand::ResetBwe(initial))
+    }
+
+    pub async fn send_queues(&self) -> Result<Vec<SendQueueEntry>, TransportError> {
+        self.request(|reply| PeerCommand::QueueQuery { reply })
+            .await
+    }
+
     pub fn write_rtp(&self, packet: OutgoingRtp) -> Result<(), TransportError> {
         match self.rtp.try_send(Box::new(packet)) {
             Ok(()) => Ok(()),
@@ -507,6 +553,10 @@ fn build_peer(
     udp: &UdpRouter,
     config: PeerConfig,
 ) -> Result<(PeerHandle, PeerActor, PeerEvents), TransportError> {
+    if config.bwe.is_some() && config.role != PeerRole::Subscriber {
+        return Err(TransportError::BweOnPublisher);
+    }
+
     let ice_creds = IceCreds::new();
     let mut route = udp.register(&ice_creds)?;
     let datagrams = route
@@ -537,6 +587,7 @@ fn build_peer(
     let handle = PeerHandle {
         id: route.id(),
         role: config.role,
+        bwe: config.bwe,
         ice_creds: Arc::clone(&creds),
         dropped_media: Arc::clone(&dropped_media),
         dropped_writes,
@@ -570,6 +621,8 @@ fn build_peer(
         codecs: HashMap::new(),
         probe: config.keyframe_probe.clone(),
         layer_silence: config.layer_silence,
+        bwe: config.bwe,
+        send_streams: Vec::new(),
         missed_keyframes,
         keyframes_without_stream,
         drain_deadline: None,
@@ -605,7 +658,7 @@ fn build_rtc(
     config: &PeerConfig,
     advertise: &[SocketAddr],
 ) -> Result<Rtc, TransportError> {
-    let mut rtc = Rtc::builder()
+    let builder = Rtc::builder()
         .set_ice_lite(config.ice_lite)
         .set_rtp_mode(config.rtp_mode)
         .set_local_ice_credentials(ice_creds.clone())
@@ -616,8 +669,24 @@ fn build_rtc(
         .enable_vp8(true)
         .enable_h264(true)
         .enable_vp9(true)
-        .enable_av1(true)
-        .build(Instant::now());
+        .enable_av1(true);
+
+    let builder = match config.bwe {
+        Some(bwe) => builder.enable_bwe(Some(bwe.initial)),
+        None => builder,
+    };
+
+    let mut rtc = builder.build(Instant::now());
+
+    if let Some(bwe) = config.bwe {
+        rtc.bwe().set_desired_bitrate(bwe.desired);
+
+        tracing::info!(
+            initial = bwe.initial.as_u64(),
+            desired = bwe.desired.as_u64(),
+            "bandwidth estimation and the leaky bucket pacer are on for this peer"
+        );
+    }
 
     let mut accepted = 0usize;
 
@@ -741,6 +810,8 @@ struct PeerActor {
     codecs: HashMap<Pt, Codec>,
     probe: Option<KeyframeProbe>,
     layer_silence: Duration,
+    bwe: Option<BweSettings>,
+    send_streams: Vec<(Mid, Option<Rid>)>,
     missed_keyframes: Arc<AtomicU64>,
     keyframes_without_stream: Arc<AtomicU64>,
     drain_deadline: Option<Instant>,
@@ -921,6 +992,11 @@ impl PeerActor {
             PeerCommand::MediaQuery { mid, reply } => {
                 let _ = reply.send(self.media_by_mid(mid));
             }
+            PeerCommand::SetDesiredBitrate(desired) => self.set_desired_bitrate(desired),
+            PeerCommand::ResetBwe(initial) => self.reset_bwe(initial),
+            PeerCommand::QueueQuery { reply } => {
+                let _ = reply.send(self.send_queues());
+            }
             PeerCommand::Close => self.begin_close(),
         }
     }
@@ -1044,6 +1120,7 @@ impl PeerActor {
 
         let cache = spec.rtx_cache.unwrap_or_else(|| RtxCache::for_kind(kind));
         let unpaced = spec.unpaced.unwrap_or(kind.is_audio());
+        let resendable = self.carries_rtx_payload_type(spec.mid);
 
         let mut direct = self.rtc.direct_api();
 
@@ -1057,7 +1134,7 @@ impl PeerActor {
                 let ssrc = spec.ssrc.unwrap_or_else(|| direct.new_ssrc());
                 let rtx = match spec.rtx {
                     Some(rtx) => Some(rtx),
-                    None if kind.is_video() => Some(direct.new_ssrc()),
+                    None if kind.is_video() || resendable => Some(direct.new_ssrc()),
                     None => None,
                 };
 
@@ -1084,13 +1161,27 @@ impl PeerActor {
             rtx = ?declared.rtx,
             negotiated = declared.negotiated,
             unpaced,
+            paced = self.bwe.is_some() && !unpaced,
             "declared a send stream"
         );
+
+        let key = (declared.mid, declared.rid);
+        if !self.send_streams.contains(&key) {
+            self.send_streams.push(key);
+        }
 
         Ok(declared)
     }
 
+    fn carries_rtx_payload_type(&self, mid: Mid) -> bool {
+        self.negotiated_params(mid)
+            .iter()
+            .any(|params| params.resend().is_some())
+    }
+
     fn remove_send_stream(&mut self, mid: Mid, rid: Option<Rid>) -> bool {
+        self.send_streams.retain(|declared| *declared != (mid, rid));
+
         let mut direct = self.rtc.direct_api();
 
         let Some(ssrc) = direct
@@ -1101,6 +1192,69 @@ impl PeerActor {
         };
 
         direct.remove_stream_tx(ssrc)
+    }
+
+    fn set_desired_bitrate(&mut self, desired: Bitrate) {
+        if self.bwe.is_none() {
+            tracing::warn!(
+                desired = desired.as_u64(),
+                "ignoring a desired bitrate on a peer without bandwidth estimation"
+            );
+            return;
+        }
+
+        tracing::debug!(desired = desired.as_u64(), "desired bitrate set");
+
+        self.rtc.bwe().set_desired_bitrate(desired);
+    }
+
+    fn reset_bwe(&mut self, initial: Bitrate) {
+        if self.bwe.is_none() {
+            tracing::warn!(
+                initial = initial.as_u64(),
+                "ignoring a bandwidth estimator reset on a peer without one"
+            );
+            return;
+        }
+
+        tracing::info!(initial = initial.as_u64(), "bandwidth estimator reset");
+
+        self.rtc.bwe().reset(initial);
+    }
+
+    fn send_queues(&mut self) -> Vec<SendQueueEntry> {
+        let keys = self.send_streams.clone();
+        let mut queues = Vec::with_capacity(keys.len());
+        let mut stale = Vec::new();
+
+        for (mid, rid) in keys {
+            let mut direct = self.rtc.direct_api();
+
+            let Some(stream) = direct.stream_tx_by_mid(mid, rid) else {
+                stale.push((mid, rid));
+                continue;
+            };
+
+            let entry = match stream.queue_info() {
+                Some(info) => SendQueueEntry {
+                    mid,
+                    rid,
+                    bytes: info.byte_size(),
+                    packets: info.packet_count(),
+                    oldest_unsent: info.first_unsent(),
+                    sampled_at: Some(info.created_at()),
+                },
+                None => SendQueueEntry::empty(mid, rid),
+            };
+
+            queues.push(entry);
+        }
+
+        if !stale.is_empty() {
+            self.send_streams.retain(|key| !stale.contains(key));
+        }
+
+        queues
     }
 
     fn media_by_mid(&self, mid: Mid) -> Option<MediaInfo> {
@@ -1456,6 +1610,22 @@ impl PeerActor {
                 self.layers.merge_ingress(&report);
                 self.sink.emit_control(PeerEvent::IngressReport(report))
             }
+            Event::PeerStats(stats) => {
+                let queues = self.send_queues();
+                let report = PeerReport::from_stats(stats, queues);
+
+                self.sink
+                    .emit_control(PeerEvent::PeerReport(Box::new(report)))
+            }
+            Event::EgressBitrateEstimate(BweKind::Twcc(bitrate)) => {
+                self.sink.emit_control(PeerEvent::BitrateEstimate {
+                    bitrate,
+                    at: Instant::now(),
+                })
+            }
+            Event::EgressBitrateEstimate(BweKind::Remb(mid, bitrate)) => self
+                .sink
+                .emit_control(PeerEvent::RembRequested { mid, bitrate }),
             Event::StreamPaused(paused) => {
                 let activity = LayerActivity {
                     mid: paused.mid,
@@ -1480,7 +1650,17 @@ impl PeerActor {
                 self.rtc.disconnect();
                 false
             }
-            _ => true,
+            Event::ChannelOpen(..)
+            | Event::ChannelData(_)
+            | Event::ChannelClose(_)
+            | Event::ChannelBufferedAmountLow(_)
+            | Event::SenderFeedback(_)
+            | Event::AppSpecificFeedback(_)
+            | Event::RawPacket(_) => true,
+            other => {
+                tracing::trace!(?other, "an unhandled str0m event");
+                true
+            }
         }
     }
 
@@ -1649,7 +1829,7 @@ mod tests {
     async fn offers_outgoing_media_and_applies_the_client_answer() {
         let crypto = TransportCrypto::new().unwrap();
         let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
-        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).unwrap();
 
         assert!(matches!(
             peer.handle.negotiate(Negotiation::default()).await,
@@ -1981,7 +2161,7 @@ mod tests {
     async fn declaring_a_send_stream_for_an_unknown_mid_is_refused() {
         let crypto = TransportCrypto::new().unwrap();
         let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
-        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).unwrap();
 
         let missing = Mid::from("nosuch");
         let error = peer
@@ -2008,7 +2188,7 @@ mod tests {
     async fn a_declared_stream_keeps_the_ssrc_that_was_offered() {
         let crypto = TransportCrypto::new().unwrap();
         let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
-        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber()).unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).unwrap();
 
         let local = peer
             .handle
@@ -2063,7 +2243,7 @@ mod tests {
         let crypto = TransportCrypto::new().unwrap();
         let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
         let (_handle, mut actor, _events) =
-            peer_actor(&crypto, &udp, PeerConfig::subscriber()).await;
+            peer_actor(&crypto, &udp, PeerConfig::subscriber(None)).await;
 
         let (reply, first) = oneshot::channel();
         actor.on_command(PeerCommand::Negotiate {
@@ -2120,7 +2300,7 @@ mod tests {
             &udp,
             PeerConfig {
                 negotiation_timeout: Duration::from_millis(10),
-                ..PeerConfig::subscriber()
+                ..PeerConfig::subscriber(None)
             },
         )
         .await;
@@ -2187,7 +2367,7 @@ mod tests {
             &udp,
             PeerConfig {
                 negotiation_timeout: Duration::from_millis(10),
-                ..PeerConfig::subscriber()
+                ..PeerConfig::subscriber(None)
             },
         )
         .await;
@@ -2236,7 +2416,7 @@ mod tests {
             &udp,
             PeerConfig {
                 negotiation_backlog: 1,
-                ..PeerConfig::subscriber()
+                ..PeerConfig::subscriber(None)
             },
         )
         .await;
@@ -2264,5 +2444,274 @@ mod tests {
             refused.await.unwrap(),
             Err(TransportError::NegotiationBacklog)
         ));
+    }
+
+    fn settings(initial: Bitrate) -> BweSettings {
+        BweSettings::new(initial)
+    }
+
+    #[tokio::test]
+    async fn a_publisher_is_never_built_with_an_estimator_or_a_real_pacer() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+
+        let error = spawn_peer(
+            &crypto,
+            &udp,
+            PeerConfig {
+                bwe: Some(settings(Bitrate::kbps(600))),
+                ..PeerConfig::publisher()
+            },
+        )
+        .expect_err("a publisher sends nothing but rtcp and must keep the null pacer");
+
+        assert!(matches!(error, TransportError::BweOnPublisher));
+        assert_eq!(udp.router().session_count(), 0);
+
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::publisher()).unwrap();
+        assert!(!peer.handle.estimates_bandwidth());
+        assert_eq!(peer.handle.bwe(), None);
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_carries_the_estimator_settings_it_was_built_with() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+
+        let plain = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).unwrap();
+        assert!(!plain.handle.estimates_bandwidth());
+
+        let bwe = settings(Bitrate::kbps(900));
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(Some(bwe))).unwrap();
+
+        assert!(peer.handle.estimates_bandwidth());
+        assert_eq!(peer.handle.bwe(), Some(bwe));
+        assert_eq!(
+            PeerConfig::subscriber(None).stats_interval,
+            Some(SUBSCRIBER_STATS_INTERVAL),
+            "the congestion interpreter samples once a second, not once every two"
+        );
+        assert_eq!(
+            PeerConfig::publisher().stats_interval,
+            Some(PUBLISHER_STATS_INTERVAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_an_estimator_that_was_never_built_is_refused() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(&crypto, &udp, PeerConfig::subscriber(None)).unwrap();
+
+        assert!(matches!(
+            peer.handle.set_desired_bitrate(Bitrate::mbps(3)),
+            Err(TransportError::BweDisabled)
+        ));
+        assert!(matches!(
+            peer.handle.reset_bwe(Bitrate::kbps(600)),
+            Err(TransportError::BweDisabled)
+        ));
+
+        assert!(
+            peer.handle.send_queues().await.unwrap().is_empty(),
+            "a peer with no declared send streams has nothing queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_desired_bitrate_reaches_str0m_and_leaves_the_peer_serving() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, _events) = peer_actor(
+            &crypto,
+            &udp,
+            PeerConfig::subscriber(Some(settings(Bitrate::kbps(600)))),
+        )
+        .await;
+
+        actor.on_command(PeerCommand::SetDesiredBitrate(Bitrate::mbps(4)));
+        actor.on_command(PeerCommand::ResetBwe(Bitrate::kbps(800)));
+
+        let (reply, queues) = oneshot::channel();
+        actor.on_command(PeerCommand::QueueQuery { reply });
+
+        assert!(
+            queues.await.unwrap().is_empty(),
+            "str0m accepted both bwe commands and the actor kept answering"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_commands_on_a_peer_without_bwe_are_ignored_rather_than_fatal() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let (_handle, mut actor, _events) =
+            peer_actor(&crypto, &udp, PeerConfig::publisher()).await;
+
+        actor.on_command(PeerCommand::SetDesiredBitrate(Bitrate::mbps(4)));
+        actor.on_command(PeerCommand::ResetBwe(Bitrate::kbps(800)));
+
+        let (reply, queues) = oneshot::channel();
+        actor.on_command(PeerCommand::QueueQuery { reply });
+
+        assert!(queues.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_desired_bitrate_is_clamped_before_it_leaves_the_handle() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(
+            &crypto,
+            &udp,
+            PeerConfig::subscriber(Some(settings(Bitrate::kbps(600)))),
+        )
+        .unwrap();
+
+        peer.handle
+            .set_desired_bitrate(Bitrate::ZERO)
+            .expect("a zero wish is floored rather than refused");
+
+        assert_eq!(
+            settings(Bitrate::kbps(600)).desired,
+            Bitrate::kbps(600),
+            "the build time wish arms str0m's prober, which refuses a first ever zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_offers_transport_wide_congestion_control_on_every_m_line() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(
+            &crypto,
+            &udp,
+            PeerConfig::subscriber(Some(settings(Bitrate::kbps(600)))),
+        )
+        .unwrap();
+
+        let mut request = outgoing(MediaKind::Video, "video");
+        request.add_media.push(MediaSpec {
+            kind: MediaKind::Audio,
+            direction: Direction::SendOnly,
+            stream_id: Some("stream".to_owned()),
+            track_id: Some("audio".to_owned()),
+            simulcast: None,
+        });
+
+        let local = peer.handle.negotiate(request).await.unwrap();
+
+        assert!(
+            local.sdp.contains("transport-wide-cc-extensions-01"),
+            "without the twcc header extension str0m never registers a sent packet, \
+             and the estimator has nothing to work from: {}",
+            local.sdp
+        );
+
+        let feedback = local
+            .sdp
+            .lines()
+            .filter(|line| line.trim().ends_with("transport-cc"))
+            .count();
+
+        assert!(
+            feedback >= 2,
+            "both the video and the audio m-line must ask the client for twcc feedback: {}",
+            local.sdp
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_send_stream_is_visible_to_a_queue_query_until_it_is_removed() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(
+            &crypto,
+            &udp,
+            PeerConfig::subscriber(Some(settings(Bitrate::kbps(600)))),
+        )
+        .unwrap();
+
+        let local = peer
+            .handle
+            .negotiate(outgoing(MediaKind::Video, "video"))
+            .await
+            .unwrap();
+        let mid = local.mids[0];
+
+        let mut client = answering_client(&crypto, 40120);
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&local.sdp).expect("our offer parses"))
+            .expect("the client answers");
+        peer.handle
+            .accept_answer(answer.to_sdp_string())
+            .await
+            .unwrap();
+
+        let declared = peer
+            .handle
+            .declare_send_stream(SendStream::new(mid))
+            .await
+            .unwrap();
+
+        assert!(
+            declared.rtx.is_some(),
+            "without an rtx ssrc str0m has no padding queue and never probes"
+        );
+
+        let queues = peer.handle.send_queues().await.unwrap();
+        assert_eq!(queues.len(), 1);
+        assert_eq!(queues[0].mid, mid);
+        assert_eq!(queues[0].bytes, 0);
+        assert_eq!(queues[0].packets, 0);
+
+        assert!(peer.handle.remove_send_stream(mid, None).await.unwrap());
+        assert!(peer.handle.send_queues().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_audio_stream_gets_an_rtx_ssrc_only_when_the_codec_negotiated_one() {
+        let crypto = TransportCrypto::new().unwrap();
+        let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+        let peer = spawn_peer(
+            &crypto,
+            &udp,
+            PeerConfig::subscriber(Some(settings(Bitrate::kbps(600)))),
+        )
+        .unwrap();
+
+        let local = peer
+            .handle
+            .negotiate(outgoing(MediaKind::Audio, "audio"))
+            .await
+            .unwrap();
+        let mid = local.mids[0];
+
+        let mut client = answering_client(&crypto, 40121);
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&local.sdp).expect("our offer parses"))
+            .expect("the client answers");
+        peer.handle
+            .accept_answer(answer.to_sdp_string())
+            .await
+            .unwrap();
+
+        let media = peer.handle.media(mid).await.unwrap();
+        let resendable = media.params.iter().any(|params| params.resend().is_some());
+
+        let declared = peer
+            .handle
+            .declare_send_stream(SendStream::new(mid))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            declared.rtx.is_some(),
+            resendable,
+            "an rtx ssrc without an rtx payload type is dead weight, and with one it is \
+             what lets an audio only subscriber probe at all"
+        );
     }
 }

@@ -188,7 +188,19 @@ impl PublisherSession {
                     self.dirty.insert(track_sid.clone());
                 }
             }
-            PeerEvent::Media(_) | PeerEvent::KeyframeRequested(_) => {}
+            PeerEvent::PeerReport(report) => {
+                tracing::trace!(
+                    identity = %joined.participant.identity,
+                    bytes_rx = report.bytes_rx,
+                    loss = ?report.ingress_loss,
+                    rtt = ?report.rtt,
+                    "publisher transport report"
+                );
+            }
+            PeerEvent::Media(_)
+            | PeerEvent::KeyframeRequested(_)
+            | PeerEvent::BitrateEstimate { .. }
+            | PeerEvent::RembRequested { .. } => {}
             PeerEvent::Disconnected => {
                 self.stats.mark_disconnected();
                 tracing::info!(

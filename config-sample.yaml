@@ -27,3 +27,59 @@ rtc:
 video:
   dynacast_pause_delay_ms: 5000
   layer_upgrade_hold_ms: 2000
+
+  # Bandwidth estimation, allocation and pacing, off by default. Turning it on
+  # gives every subscriber transport str0m's congestion estimator and its leaky
+  # bucket pacer, and gives the server a budget to spend across that
+  # subscriber's video tracks. Publisher transports are never given either.
+  bwe:
+    enabled: false
+
+    # What the estimator starts from before any feedback has arrived, and what
+    # the allocator is allowed to spend over that same window, so a subscriber
+    # joining a slow link is never handed everything. max_desired_kbps is the
+    # ceiling on what the server ever asks the prober to aim for.
+    initial_kbps: 600
+    max_desired_kbps: 10000
+
+    # A committed budget never falls below this. Below it there is no video
+    # worth sending and the answer is to pause instead.
+    min_budget_kbps: 150
+
+    # Taken off the top for every audio subscription before video is allocated.
+    # The floor matters: a track whose owner is silent measures near zero and
+    # must still book the room it needs the moment they speak.
+    audio_reserve_kbps: 48
+
+    # false overruns the budget rather than blanking a subscriber's video,
+    # which is also the reference's default. true lets the allocator pause the
+    # lowest priority tracks instead, and the subscriber is told with
+    # StreamStateUpdate when it does.
+    allow_pause: false
+
+    # How far past the budget allow_pause: false is allowed to go before it
+    # pauses the lowest priority tracks anyway. Without a bound, refusing to
+    # pause turns over-subscription into two seconds of pacer queue and leaves
+    # the allocator with no move. The highest priority track always keeps its
+    # base rung whatever this says.
+    max_overrun_percent: 150
+
+    # Bytes per packet added to a measured payload rate to price a layer as it
+    # costs on the wire. Calibrated per subscriber at runtime from what str0m
+    # reports; this is only the starting point.
+    overhead_bytes: 40
+
+    # How often the budget is spent across the tracks a subscriber receives.
+    allocation_interval_ms: 250
+
+    # Recovery is deliberately slower than reaction. A track is raised only
+    # after the link has been clear for recovery_hold_ms, at most one track per
+    # tick, and no track twice inside recovery_step_ms. Going down waits for
+    # nothing.
+    recovery_hold_ms: 2000
+    recovery_step_ms: 1000
+
+    # How long a packet may sit unsent in the pacer's queue before that counts
+    # as congestion on its own. This is the signal that catches the failure
+    # pacing introduces: over-subscription becomes latency, not loss.
+    queue_pressure_ms: 150

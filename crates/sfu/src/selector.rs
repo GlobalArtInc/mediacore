@@ -24,6 +24,46 @@ impl std::fmt::Display for LayerPreference {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Allowance {
+    #[default]
+    Unlimited,
+    Capped(SpatialLayer),
+    Paused,
+}
+
+impl Allowance {
+    pub fn is_paused(self) -> bool {
+        matches!(self, Self::Paused)
+    }
+
+    pub fn cap(self) -> Option<SpatialLayer> {
+        match self {
+            Self::Unlimited => Some(SpatialLayer::MAX),
+            Self::Capped(layer) => Some(layer),
+            Self::Paused => None,
+        }
+    }
+
+    pub fn rank(self) -> i16 {
+        match self {
+            Self::Paused => -1,
+            Self::Capped(layer) => i16::from(layer.index()),
+            Self::Unlimited => i16::MAX,
+        }
+    }
+}
+
+impl std::fmt::Display for Allowance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlimited => write!(f, "unlimited"),
+            Self::Capped(layer) => write!(f, "capped@{layer}"),
+            Self::Paused => write!(f, "paused"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectorConfig {
     pub upgrade_hold: Duration,
@@ -52,6 +92,7 @@ pub struct LayerSelector {
     config: SelectorConfig,
     ladder: LayerLadder,
     preference: LayerPreference,
+    allowance: Allowance,
     available: LayerSet,
     target: Option<SpatialLayer>,
     peak: Option<SpatialLayer>,
@@ -64,6 +105,7 @@ impl LayerSelector {
             config,
             ladder: LayerLadder::new(),
             preference: LayerPreference::default(),
+            allowance: Allowance::default(),
             available: LayerSet::EMPTY,
             target: None,
             peak: None,
@@ -77,6 +119,10 @@ impl LayerSelector {
 
     pub fn preference(&self) -> LayerPreference {
         self.preference
+    }
+
+    pub fn allowance(&self) -> Allowance {
+        self.allowance
     }
 
     pub fn available(&self) -> LayerSet {
@@ -117,6 +163,15 @@ impl LayerSelector {
         self.decide(now, true)
     }
 
+    pub fn set_allowance(&mut self, allowance: Allowance, now: Instant) -> Option<SpatialLayer> {
+        if self.allowance == allowance {
+            return None;
+        }
+
+        self.allowance = allowance;
+        self.decide(now, true)
+    }
+
     pub fn update(&mut self, available: LayerSet, now: Instant) -> Option<SpatialLayer> {
         self.available = available;
         self.decide(now, false)
@@ -140,7 +195,7 @@ impl LayerSelector {
         self.peak.is_none_or(|peak| want > peak)
     }
 
-    pub fn ceiling(&self) -> Option<SpatialLayer> {
+    pub fn preferred_ceiling(&self) -> Option<SpatialLayer> {
         match self.preference {
             LayerPreference::Quality(quality) => self.ladder.layer_of(quality),
             LayerPreference::Size { width, height } => self
@@ -150,12 +205,24 @@ impl LayerSelector {
         }
     }
 
+    pub fn ceiling(&self) -> Option<SpatialLayer> {
+        let preference = self.preferred_ceiling()?;
+
+        match self.allowance {
+            Allowance::Unlimited => Some(preference),
+            Allowance::Capped(cap) => Some(preference.min(cap)),
+            Allowance::Paused => None,
+        }
+    }
+
     pub fn desired(&self) -> Option<SpatialLayer> {
         let ceiling = self.ceiling()?;
+        let fitting = self.available.highest_at_most(ceiling);
 
-        self.available
-            .highest_at_most(ceiling)
-            .or_else(|| self.available.lowest())
+        match self.allowance {
+            Allowance::Unlimited => fitting.or_else(|| self.available.lowest()),
+            _ => fitting,
+        }
     }
 
     fn decide(&mut self, now: Instant, immediate: bool) -> Option<SpatialLayer> {
@@ -461,6 +528,97 @@ mod tests {
                 now
             ),
             Some(mid())
+        );
+    }
+
+    #[test]
+    fn an_allowance_caps_a_preference_but_never_raises_it() {
+        let now = Instant::now();
+        let mut selector = selector();
+        selector.update(all(), now);
+
+        assert_eq!(
+            selector.set_allowance(Allowance::Capped(LOW), now),
+            Some(LOW)
+        );
+        assert_eq!(selector.ceiling(), Some(LOW));
+        assert_eq!(
+            selector.preferred_ceiling(),
+            Some(high()),
+            "the allowance is a second ceiling, not a new preference"
+        );
+
+        selector.set_preference(LayerPreference::Quality(VideoQuality::Low), now);
+        assert_eq!(
+            selector.set_allowance(Allowance::Capped(high()), now),
+            None,
+            "an allowance above what the subscriber asked for changes nothing"
+        );
+        assert_eq!(selector.ceiling(), Some(LOW));
+    }
+
+    #[test]
+    fn a_lifted_allowance_returns_to_what_the_subscriber_asked_for() {
+        let now = Instant::now();
+        let mut selector = selector();
+        selector.update(all(), now);
+        selector.set_allowance(Allowance::Capped(LOW), now);
+
+        assert_eq!(
+            selector.set_allowance(Allowance::Unlimited, now),
+            Some(high()),
+            "a subscriber that gets bandwidth back does not have to ask again"
+        );
+        assert_eq!(selector.allowance(), Allowance::Unlimited);
+    }
+
+    #[test]
+    fn a_capped_selector_does_not_overshoot_to_a_layer_above_the_cap() {
+        let now = Instant::now();
+        let mut selector = selector();
+        selector.set_preference(LayerPreference::Quality(VideoQuality::Low), now);
+        selector.set_allowance(Allowance::Capped(LOW), now);
+
+        assert_eq!(
+            selector.update(LayerSet::from_iter([mid(), high()]), now),
+            None
+        );
+        assert_eq!(selector.desired(), None);
+        assert_eq!(selector.target(), None);
+
+        selector.set_allowance(Allowance::Unlimited, now);
+        assert_eq!(
+            selector.desired(),
+            Some(mid()),
+            "without a budget the old overshoot is still what a subscriber gets"
+        );
+    }
+
+    #[test]
+    fn a_paused_allowance_asks_for_no_layer_but_keeps_the_target_it_had() {
+        let now = Instant::now();
+        let mut selector = selector();
+        selector.update(all(), now);
+
+        assert_eq!(selector.set_allowance(Allowance::Paused, now), None);
+        assert_eq!(selector.ceiling(), None);
+        assert_eq!(selector.desired(), None);
+        assert_eq!(selector.target(), Some(high()));
+    }
+
+    #[test]
+    fn an_allowance_change_bypasses_the_upgrade_hold() {
+        let mut now = Instant::now();
+        let mut selector = selector();
+        selector.update(all(), now);
+        selector.set_allowance(Allowance::Capped(LOW), now);
+
+        now += Duration::from_millis(100);
+
+        assert_eq!(
+            selector.set_allowance(Allowance::Capped(mid()), now),
+            Some(mid()),
+            "an allocator grant is not a blinking publisher and must not wait out the hold"
         );
     }
 }

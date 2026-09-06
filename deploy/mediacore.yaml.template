@@ -41,3 +41,9 @@ rtc:
 video:
   dynacast_pause_delay_ms: 5000
   layer_upgrade_hold_ms: 2000
+
+  # Bandwidth estimation and allocation. Off until the constrained-link bench
+  # in the M5 design has been run against this deployment; config-sample.yaml
+  # documents the rest of the block.
+  bwe:
+    enabled: false

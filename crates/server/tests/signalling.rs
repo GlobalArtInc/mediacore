@@ -284,5 +284,6 @@ async fn room_state_is_visible_over_http() {
     let (status, body) = http_get(addr, "/healthz").await;
     assert_eq!(status, 200);
     assert!(body.starts_with("rooms=1 participants=1 publishers=1 rtp_packets=0"));
+    assert!(body.contains("bwe=off allocated_subscribers=0"));
     assert!(body.contains("ice=127.0.0.1:"));
 }

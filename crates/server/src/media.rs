@@ -5,7 +5,7 @@ use mediacore_sfu::{VideoCodec, is_keyframe};
 use mediacore_transport::str0m::Candidate;
 use mediacore_transport::str0m::format::Codec;
 use mediacore_transport::{
-    KeyframeProbe, PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto,
+    BweSettings, KeyframeProbe, PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto,
     TransportError, UdpRouter, spawn_peer,
 };
 
@@ -19,10 +19,14 @@ pub struct MediaEngine {
     ice_disconnected_grace: std::time::Duration,
     negotiation_timeout: std::time::Duration,
     keyframe_probe: KeyframeProbe,
+    subscriber_bwe: Option<BweSettings>,
 }
 
 impl MediaEngine {
-    pub async fn start(config: &RtcConfig) -> anyhow::Result<Self> {
+    pub async fn start(
+        config: &RtcConfig,
+        subscriber_bwe: Option<BweSettings>,
+    ) -> anyhow::Result<Self> {
         let crypto = TransportCrypto::new()?;
         let bind: IpAddr = config.bind_address.parse()?;
         let udp = bind_ice_socket(config, bind).await?;
@@ -50,6 +54,7 @@ impl MediaEngine {
             fingerprint = %crypto.fingerprint(),
             ice_disconnected_timeout = config.ice_disconnected_timeout,
             negotiation_timeout = config.negotiation_timeout,
+            bwe = subscriber_bwe.is_some(),
             "media transport ready"
         );
 
@@ -63,6 +68,7 @@ impl MediaEngine {
             ice_disconnected_grace: config.ice_disconnected_grace(),
             negotiation_timeout: config.negotiation_grace(),
             keyframe_probe: keyframe_probe(),
+            subscriber_bwe,
         })
     }
 
@@ -81,7 +87,7 @@ impl MediaEngine {
     fn spawn(&self, role: PeerRole) -> Result<SpawnedPeer, TransportError> {
         let base = match role {
             PeerRole::Publisher => PeerConfig::publisher(),
-            PeerRole::Subscriber => PeerConfig::subscriber(),
+            PeerRole::Subscriber => PeerConfig::subscriber(self.subscriber_bwe),
         };
 
         let keyframe_probe = match role {
@@ -112,6 +118,10 @@ impl MediaEngine {
 
     pub fn candidates(&self) -> &[String] {
         &self.candidates
+    }
+
+    pub fn subscriber_bwe(&self) -> Option<BweSettings> {
+        self.subscriber_bwe
     }
 }
 
@@ -245,7 +255,7 @@ mod tests {
         let rtc = config(
             "  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n  bind_address: 127.0.0.1\n",
         );
-        let engine = MediaEngine::start(&rtc).await.unwrap();
+        let engine = MediaEngine::start(&rtc, None).await.unwrap();
 
         assert_eq!(engine.local_addr().ip().to_string(), "127.0.0.1");
         assert_eq!(engine.advertised(), [engine.local_addr()]);

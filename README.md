@@ -8,8 +8,9 @@ wire protocol.
 ## Status
 
 Early. Two participants in a room can see and hear each other: media published to the server is
-forwarded to everyone who is subscribed to it, and a simulcast publisher's layers are picked apart
-so every subscriber gets the one it can use.
+forwarded to everyone who is subscribed to it, a simulcast publisher's layers are picked apart so
+every subscriber gets the one it can use, and — once `video.bwe.enabled` is turned on — the layer a
+subscriber gets is the one its own link can carry.
 
 | Milestone | Scope | State |
 |---|---|---|
@@ -18,7 +19,7 @@ so every subscriber gets the one it can use.
 | M2 | Publisher transport, RTP intake, NACK, PLI | done |
 | M3 | Subscriber transport, packet forwarding | done |
 | M4 | Simulcast, layer selection, dynacast | done |
-| M5 | Bandwidth estimation and allocation | not started |
+| M5 | Bandwidth estimation, allocation and pacing | done, off by default |
 | M6 | Data channels, permissions, own SDKs | not started |
 | M7 | Node registry, signal relay, TURN, drain | not started |
 | M8 | Metrics, load and interop testing | not started |
@@ -109,6 +110,136 @@ leaves the decision uncommitted and is made again on the next pass, so the publi
 disagreeing with the server. Announcements always carry the state committed at the moment they are
 sent, so two decisions taken back to back cannot reach the publisher out of order.
 
+Bandwidth estimation, allocation and pacing are behind `video.bwe.enabled`, off by default. Turned
+on, every **subscriber** transport is built with str0m's congestion controller, which is also what
+installs its leaky-bucket pacer; publisher transports get neither and keep sending only RTCP. The
+estimate is str0m's and the pacing and probing are str0m's — we write neither — but the estimate as
+str0m exports it is a three-second moving average with five percent hysteresis, which is a fine
+budget and a useless alarm. So the reading of the link is ours, and it turns on one question: what
+counts as evidence that the link got worse, as opposed to evidence that we chose to send less, or
+that a lossy link is merely lossy?
+
+Only one observable answers it. A backlog in the pacer's send queue is the difference between what we
+handed the transport and what the transport got out, and nothing else we can measure has that
+property. The estimate does not: it is bounded by what we actually put on the wire, so it falls when
+we cut on purpose and it falls on an idle link, and str0m's loss controller drags it down on a link
+that is fast but lossy — a fifth of packets lost pins it near `100 kbps / (loss − 0.05)` whatever the
+link is really worth. The loss ratio does not either: a link that drops a fifth of everything drops a
+fifth whether we offer a hundred kilobits or five megabits, so loss is a fact about the link and not
+about our offer. So **the queue is the only signal that raises pressure**; the estimate and the
+weighted loss ratio are recorded, logged and used to size and corroborate, and neither can start a
+congestion verdict on its own.
+
+That leaves a three-state interpreter (`Clear` / `Hold` / `Congested`) sampled once a second. One
+sample of backlog holds; two consecutive congest; three consecutive samples of relief return a hold
+to clear. Relief is unanimous: a signal under pressure the queue does not corroborate is discounted
+to indeterminate rather than laundered into recovery, so a drained queue beside a fifth of the
+packets dropped is not three samples of a link that got better. Both non-clear states are claims that need renewing: a hold nothing escalated within
+`5 s` lapses back to clear, and a congestion claim no backlog has renewed for `5 s` lapses too. The
+doors in are strict and consecutive in both cases, the doors out are the same lapse in both cases,
+and there is no second, weaker way into congestion — a link that dips on alternating samples cycles
+between clear and hold, where the budget below keeps working, rather than being escalated by
+evidence the front door would have refused.
+
+There is a committed budget in every state, not only under congestion, and on a clear link it is the
+primary control loop rather than a formality. A subscriber's first budget is `initial_kbps` — the
+same number str0m's estimator is built with, so the allocator and the pacer start from one story and
+a subscriber joining a slow link is capped from its first allocation instead of being handed
+everything for a second. From there the budget tracks the estimate, floored at `min_budget_kbps`: up
+without argument, and down only when the new figure is a real reduction against what we are actually
+spending — under `commit_percent` of it — which is what stops a quiet moment, whose estimate is low
+merely because we are sending little, from costing the room a quality step. Following the estimate
+down on a clear link is not a concession; it is what keeps our offer inside what the pacer will
+drain, and therefore what stops the backlog that would otherwise be read, correctly, as congestion.
+The first cut is sized from the fast evidence that triggered it — the unsmoothed estimate and what is
+actually leaving the socket, whichever is lower — never from the three-second average, which lags by
+a whole rung. A cut that did not help is cut again every `max(2s, 5·rtt)` from what is actually
+leaving, capped by the budget already in force. What proves a cut did not work is not what proved
+the link was congested in the first place. The door in stays the backlog alone; but a bottleneck with
+a shallow buffer answers an offer it cannot carry by dropping rather than by queueing, so a cut whose
+symptom is loss would otherwise be made once and never repeated. The recut therefore asks for a
+backlog **or** for weighted loss still over its pressure threshold — evidence that survives the cut —
+and never for a falling estimate, which is bounded by what we chose to send and falls precisely
+because the cut worked. Loss still cannot start a verdict: it can only decline to certify that one
+the queue started has been discharged, and since nothing but a backlog renews the congestion claim, a
+link that is merely lossy runs out of claim and lapses back to clear.
+
+What the budget buys is decided per subscriber, over the tracks that subscriber actually receives.
+Audio is never enrolled: it is never capped, never paused, and its bitrate is reserved off the top
+before video is priced, with a floor of `video.bwe.audio_reserve_kbps` so a track whose owner is
+silent still books the room it needs to speak. A subscription that cannot carry audio at all —
+publisher muted, or the subscriber's own `disabled` — books nothing, so a large room does not reserve
+a floor per participant for audio nobody is sending. Video is allocated layer-major — every track gets its
+base rung before any track gets its second — in priority order, with a screen share outranking a
+camera and a single-layer screen share paid in full first because it has no rung to fall back on.
+Every layer is priced from what actually arrives from the publisher, windowed and referenced to the
+wire rather than the payload, with the publisher's declared `VideoLayer.bitrate` and then a static
+ladder behind it, so a layer that is momentarily unmeasured is never unallocatable. The wire
+overhead is calibrated per subscriber at runtime from the gap between the bytes str0m put on the
+socket and the RTP payload it counted.
+
+The verdict reaches the forwarder as a second ceiling, never as a replacement for what the
+subscriber asked for: an allowance caps the preference and can never raise it, so a subscriber that
+asked for the small picture keeps getting the small picture, and a subscriber whose link recovers
+returns to the layer it originally asked for without asking again. A bandwidth pause is a separate
+flag from the subscriber's own `disabled`, and both go through the one door that keeps sequence
+numbers continuous — a track paused for bandwidth and resumed continues the sequence space it had,
+exactly as a client-disabled one does. `wanted_layer` deliberately ignores the allowance, so one
+subscriber on bad wifi never pulls the publisher's encoder down and never degrades the room; the
+cost is publisher uplink we do not forward, and the benefit is that recovery needs no renegotiation.
+With `allow_pause` false — the default, and the reference's default — a squeeze steps down and, at
+the bottom rung, overruns the estimate rather than blanking the picture. That overrun is bounded by
+`video.bwe.max_overrun_percent`: refusing to pause is not a licence to hand the pacer two seconds of
+queue with no move left, so past the bound the lowest-priority tracks are paused anyway, and the
+highest-priority track keeps its base rung whatever the bound says. With `allow_pause` true the
+allocator pauses at the first rung it cannot afford instead. Either way the subscriber is told, with
+`StreamStateUpdate` carrying `PAUSED` and later `ACTIVE`, which is the one message the reference
+sends for this and the only one we send. A mute is not a bandwidth pause and stays silent, as it
+always did. A track with no rung published at or below the subscriber's own ceiling is not a
+bandwidth decision at all: the allocator has nothing to choose between, so it leaves the selector to
+overshoot to the lowest rung there is, exactly as it did before any of this existed, and books that
+rung's price against the pool. Pricing it at zero would have been the same lie in the other
+direction — the bits leave the socket either way. A track that *becomes* that way while it is holding
+a cap — the last rung under its ceiling stops arriving and the tracker drops it — gives the cap back
+on the spot, congested or not. Letting go is not a raise and must not wait for a clear link: the pool
+is already being charged the rung the selector really forwards, and the alternative is a subscriber
+capped for as long as the congestion lasts on a decision the allocator can no longer make.
+
+Recovery is deliberately slower than reaction. Going down happens on the tick it is decided; going
+up needs the link to have been clear for `video.bwe.recovery_hold_ms`, raises at most one track per
+allocation tick, no track twice inside `video.bwe.recovery_step_ms`, and only when the new rung's
+price fits in the budget beside what every other track is actually granted right now. Measuring that
+room against a hypothetical in which every track had already been upgraded is what makes an
+affordable upgrade look unaffordable forever, and one track per tick means no track ever moves; each
+raise is re-measured against what the earlier ones actually took, so the allowance handed out on the
+third tick knows about the two granted before it. A rung this subscriber has never been granted asks
+for fifteen percent more than its price on top of that, and that margin is not a timidity tax:
+prices are measured on ingress in payload bytes plus a calibrated header constant, they carry no
+retransmission and none of str0m's padding, so a rung that books at ninety-one percent of the budget
+really spends more than that, and a rung nobody here has paid for yet is a price we have never
+checked against this link. A rung the subscriber already held — anything at or below the one it was
+forwarding when the dip cut it down — asks for the room and nothing more. It is not speculation:
+the link carried it, at a price we have since watched it pay. Charging the margin there would pin a
+link one rung below what it can carry for ever, because the wish handed to str0m's prober is the
+ladder itself, and an estimate that reaches the ladder is the most a link worth exactly the ladder
+will ever report — no margin over that price could ever be met. Lifting a bandwidth pause is not
+speculation either — the allocation pass has
+already proved the track fits inside the budget — so a paused track resumes as soon as there is room
+for it, without waiting for a return to `Clear`. The unconstrained wish — what the subscriber would take if
+the link allowed it — is pushed to str0m as the desired bitrate so its prober has something to aim
+at; without that call the estimate can only ever follow what we already send, and a subscriber that
+once dropped to the base layer would never come back. That failure is invisible on a loopback and
+permanent in production, which is why it has its own test.
+
+Known gaps in M5: temporal layers are still not selected, so the smallest move available is a whole
+spatial rung; the congestion signal is one second granular where the reference computes queuing
+delay per packet group, so a capacity cliff is detected in about two seconds rather than a few
+hundred milliseconds; retransmissions and str0m's padding are not attributed to any track's price;
+and an audio-only subscriber never probes, because with our codec set nothing on its transport can
+carry padding — the first video subscription restarts the estimator, which is what rescues it, once
+per transport and not again every time a camera is republished. The
+flag stays off by default until the constrained-link bench in the M5 design has been run.
+
 `JoinResponse.subscriber_primary` stays `false`. The subscriber transport is created lazily, so a
 client that treats it as the primary connection and waits for it before reporting itself connected
 would wait until it has something to receive. Turning it on means offering the subscriber transport
@@ -116,11 +247,12 @@ eagerly at join time, which belongs with session resume in a later milestone.
 
 Known gaps in M4: temporal layers are not selected, only spatial ones; the VP8 payload descriptor is
 not rewritten across a layer switch, which a browser subscriber may notice as a stall on a VP8 track;
-`UpdateTrackSettings.fps` and `priority` are accepted and ignored; and layer choice is driven by
-what the subscriber asks for, not by what its link can carry, which is M5. Known gaps in M3: an
+`UpdateTrackSettings.fps` and `priority` are accepted and ignored; and with `video.bwe.enabled` off,
+layer choice is driven by what the subscriber asks for and nothing else. Known gaps in M3: an
 unsubscribe stops the flow and parks the media section rather than renegotiating it away, so a
 resubscribe reuses it; and the subscriber never renegotiates on codec changes. Known gaps in M2: no
-ICE restart, no bandwidth estimation, and `rtc.use_external_ip` is accepted but not implemented.
+ICE restart, no receive-side estimation towards publishers, and `rtc.use_external_ip` is accepted
+but not implemented.
 Known gaps: session resume (`reconnect=1`) falls back to a full join, the `/rtc/v1` signalling path a
 recent client tries first is not implemented so the client falls back to `/rtc`, and requests outside
 the implemented subset are logged and ignored.
@@ -153,6 +285,18 @@ is told to stop it, and `video.layer_upgrade_hold_ms` is how long a layer that r
 arriving before a subscriber is moved back up onto it. Both only delay taking something away or
 moving up; nothing that a subscriber needs now waits on them.
 
+`video.bwe` is the bandwidth block, off by default and documented field by field in
+`config-sample.yaml`: `initial_kbps` is what the estimator starts from and what the allocator spends
+until the first estimate replaces it, and `max_desired_kbps` the
+ceiling on what it is asked to probe for, `min_budget_kbps` the floor a committed budget never falls
+below, `audio_reserve_kbps` what is taken off the top for each audio subscription,
+`allocation_interval_ms` how often the budget is spent, `allow_pause` whether a squeeze may pause a
+track before it overruns and `max_overrun_percent` how far the overrun may go when it may not,
+track instead of overrunning, `overhead_bytes` the starting point for the per-packet wire overhead,
+and `recovery_hold_ms` / `recovery_step_ms` / `queue_pressure_ms` the hysteresis. Turning `enabled`
+on changes egress timing for every subscriber for the life of the process: str0m's pacer replaces
+the null one in the same switch that creates the estimator.
+
 The media socket binds `rtc.bind_address` on `rtc.udp_port`, or on the first free port in
 `rtc.port_range_start..=rtc.port_range_end` when `udp_port` is `0`, or on an ephemeral port when the
 range is `0` as well. The address put into ICE candidates is the first of: `rtc.advertise_addresses`
@@ -163,7 +307,8 @@ the interface holding the default route. A wildcard bind never advertises the wi
 Endpoints:
 
 - `GET /` — service name
-- `GET /healthz` — room, participant, RTP and forwarding counters, and the ICE socket address
+- `GET /healthz` — room, participant, RTP and forwarding counters, whether bandwidth estimation is
+  on and how many subscribers it is allocating for, and the ICE socket address
 - `GET /rtc/validate?access_token=…` — token check, returns the identity
 - `GET /rtc?access_token=…` — signalling WebSocket. `auto_subscribe=0` joins without subscribing
   to anything; it is on by default.

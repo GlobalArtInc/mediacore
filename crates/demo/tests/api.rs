@@ -172,7 +172,10 @@ async fn a_token_is_issued_that_the_server_accepts() {
     assert!(claims.video.room_join());
     assert!(claims.video.can_publish());
     assert!(claims.video.can_subscribe());
-    assert_eq!(claims.video.can_publish_sources, vec!["microphone"]);
+    assert_eq!(
+        claims.video.can_publish_sources,
+        vec!["microphone", "camera"]
+    );
     assert!(claims.iss == API_KEY);
 }
 
@@ -383,4 +386,192 @@ async fn two_people_with_one_name_get_two_identities() {
         mediacore_auth::verify_join(second["token"].as_str().unwrap(), &keys()).unwrap();
     assert_ne!(first_claims.identity(), second_claims.identity());
     assert_eq!(first_claims.display_name(), second_claims.display_name());
+}
+
+const README: &str = include_str!("../README.md");
+
+fn quoted_after(haystack: &str, marker: &str) -> Vec<String> {
+    haystack
+        .match_indices(marker)
+        .filter_map(|(index, found)| {
+            let rest = &haystack[index + found.len()..];
+            rest.split_once('"').map(|(value, _)| value.to_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_module_the_page_imports_is_served() {
+    let addr = spawn().await;
+    let (_, app) = get(addr, "/app.js").await;
+    let (_, readout) = get(addr, "/readout.js").await;
+
+    let mut imports = quoted_after(&app, "from \"");
+    imports.extend(quoted_after(&readout, "from \""));
+    assert!(
+        imports.contains(&"/bench.js".to_owned()) && imports.contains(&"/readout.js".to_owned()),
+        "the page no longer imports the bench modules: {imports:?}"
+    );
+
+    for path in imports {
+        let (status, body) = get(addr, &path).await;
+        assert_eq!(status, 200, "{path} is imported but not served");
+        assert!(!body.is_empty(), "{path} is served empty");
+
+        let head = head_of(addr, &path).await.to_lowercase();
+        assert!(
+            head.contains("content-type: text/javascript"),
+            "{path} is not served as a module: {head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_page_carries_a_node_for_every_element_the_script_looks_up() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let ids = quoted_after(&js, "getElementById(\"");
+    assert!(ids.len() > 10, "the element table was not found: {ids:?}");
+
+    for id in ids {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "app.js looks up `{id}`, which the page does not contain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_camera_is_off_until_it_is_asked_for() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        page.contains(r#"<input id="with-video" name="with-video" type="checkbox" disabled />"#),
+        "the camera checkbox is missing, or ships already ticked"
+    );
+    assert!(
+        js.contains(r#"query.get("video") === "1""#),
+        "nothing turns the camera on from the query string"
+    );
+    assert!(
+        js.contains("const withVideo = el.video.checked;"),
+        "joining does not consult the camera checkbox"
+    );
+
+    let connect = js
+        .split_once("async function connect(")
+        .expect("connect is defined")
+        .1
+        .split_once("\nasync function")
+        .expect("connect is followed by another function")
+        .0;
+    assert!(
+        !connect.contains("createLocalVideoTrack"),
+        "joining opens the camera whether or not it was asked for"
+    );
+}
+
+#[tokio::test]
+async fn the_camera_is_published_with_three_simulcast_rungs() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    for rung in ["h180", "h360", "h720"] {
+        assert!(
+            js.contains(rung),
+            "the capture ladder does not mention {rung}"
+        );
+    }
+    assert!(js.contains("simulcast: wantsSimulcast"));
+    assert!(
+        js.contains(r#"videoCodec: "vp8""#),
+        "the page would offer a codec the sfu does not forward"
+    );
+    assert!(
+        js.contains("adaptiveStream: false"),
+        "with adaptive streaming on, the client picks layers and the bench measures the client"
+    );
+}
+
+#[tokio::test]
+async fn the_bench_reads_the_browsers_own_numbers() {
+    let addr = spawn().await;
+    let (_, bench) = get(addr, "/bench.js").await;
+
+    for field in [
+        "availableIncomingBitrate",
+        "availableOutgoingBitrate",
+        "bytesReceived",
+        "packetsLost",
+        "frameHeight",
+        "framesPerSecond",
+    ] {
+        assert!(bench.contains(field), "the bench never reads {field}");
+    }
+    assert!(
+        bench.contains("streamState"),
+        "the page cannot show a track the server paused for bandwidth"
+    );
+}
+
+#[tokio::test]
+async fn the_bench_measures_video_apart_from_audio() {
+    let addr = spawn().await;
+    let (_, bench) = get(addr, "/bench.js").await;
+    let (_, app) = get(addr, "/app.js").await;
+    let (_, page) = get(addr, "/").await;
+
+    assert!(
+        bench.contains(r#"entry.kind !== kind"#),
+        "the bench totals every inbound stream together, so audio hides video that stopped"
+    );
+    assert!(
+        bench.contains("link.video ="),
+        "the bench never measures the video rate the whole milestone is about"
+    );
+    assert!(
+        bench.contains("NO_INCOMING_ESTIMATE"),
+        "a browser that reports no incoming estimate is indistinguishable from a broken one"
+    );
+    assert!(
+        app.contains("el.video") && page.contains(r#"id="link-video""#),
+        "the video rate is measured but never shown"
+    );
+}
+
+#[tokio::test]
+async fn a_number_the_browser_did_not_report_is_not_shown_as_a_zero() {
+    let addr = spawn().await;
+    let (_, bench) = get(addr, "/bench.js").await;
+    let (_, readout) = get(addr, "/readout.js").await;
+
+    for (path, module) in [("/bench.js", &bench), ("/readout.js", &readout)] {
+        assert!(
+            !module.contains("|| 0"),
+            "{path} substitutes a zero for a value the browser did not report"
+        );
+    }
+
+    assert!(
+        readout.contains(r#"node.dataset.missing = "true""#),
+        "a missing value is not marked as missing"
+    );
+    assert!(
+        readout.contains("node.title = reason"),
+        "a missing value does not say why it is missing"
+    );
+}
+
+#[tokio::test]
+async fn the_readme_says_how_to_constrain_the_link() {
+    for needle in ["dnctl", "pfctl", "tc qdisc", "netem", "7882"] {
+        assert!(
+            README.contains(needle),
+            "the bench instructions never mention {needle}"
+        );
+    }
 }
