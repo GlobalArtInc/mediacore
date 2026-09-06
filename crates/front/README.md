@@ -1,4 +1,4 @@
-# mediacore-demo
+# mediacore-front
 
 A single-page room. Someone opens the URL, types a name, and hears everyone else in the room.
 Audio only by default; from inside the room you can choose the microphone, choose which noise
@@ -9,7 +9,7 @@ binary serves the page and mints access tokens; it never carries media and never
 itself.
 
 ```
-mediacore-demo
+mediacore-front
 ```
 
 ## Environment
@@ -18,9 +18,9 @@ mediacore-demo
 |---|---|---|---|
 | `MEDIACORE_API_KEY` | yes | | API key, becomes `iss` in the token. Must match a key in the SFU's `keys:` map. |
 | `MEDIACORE_API_SECRET` | yes | | Shared secret the token is signed with. At least 32 characters. Never leaves the process. |
-| `MEDIACORE_DEMO_WS_URL` | yes | | What the browser is told to connect to, e.g. `wss://rooms.example.com`. `ws://` or `wss://` followed by a bare host; a path, a userinfo or a second scheme is refused, because those are what a `MEDIACORE_PUBLIC_HOST` holding a URL turns into. |
-| `MEDIACORE_DEMO_ROOM` | no | `demo` | The room everyone lands in, and the namespace every other room hangs off. Letters, digits, `-`, `_`, `.`. |
-| `MEDIACORE_DEMO_PORT` | no | `8080` | TCP port for the page and the token endpoint. |
+| `MEDIACORE_FRONT_WS_URL` | yes | | What the browser is told to connect to, e.g. `wss://rooms.example.com`. `ws://` or `wss://` followed by a bare host; a path, a userinfo or a second scheme is refused, because those are what a `MEDIACORE_PUBLIC_HOST` holding a URL turns into. |
+| `MEDIACORE_FRONT_ROOM` | no | `demo` | The room everyone lands in, and the namespace every other room hangs off. Letters, digits, `-`, `_`, `.`. |
+| `MEDIACORE_FRONT_PORT` | no | `8080` | TCP port for the page and the token endpoint. |
 
 Anything required and missing, a secret that is too short, a URL that is not a WebSocket URL, a
 port that is not a number and a room name with a space in it are all refused at startup with the
@@ -53,7 +53,7 @@ log through a stray `{config:?}`.
 A refused request answers `400` with `{"error": "..."}`; that string is what the visitor is shown.
 
 Every response carries `Content-Security-Policy: default-src 'none'; script-src 'self'
-'wasm-unsafe-eval'; … connect-src 'self' <MEDIACORE_DEMO_WS_URL>`, plus
+'wasm-unsafe-eval'; … connect-src 'self' <MEDIACORE_FRONT_WS_URL>`, plus
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. The policy is built from the
 configured WebSocket URL at startup, so the one cross-origin connection the page is allowed is the
 signalling socket and nothing else.
@@ -68,18 +68,19 @@ alongside it.
 ## The token endpoint can only reach its own rooms
 
 `POST /api/token` mints a join token for anyone who asks, without a password, a session or a
-rate limit — that is what makes the demo a demo. It therefore must not be able to address a room
-outside its own namespace, or putting it on an SFU that is also serving something real would hand
-every visitor a token for that something.
+rate limit — there is no account system here, and the link to a room is the whole of the
+invitation. It therefore must not be able to address a room outside its own namespace, or putting
+it on an SFU that is also serving something real would hand every visitor a token for that
+something.
 
 So a `room` in the request body is **namespaced, not honoured**: it is checked for charset and
-length and then prefixed with `MEDIACORE_DEMO_ROOM` and a `.`, and the composed name is length-
+length and then prefixed with `MEDIACORE_FRONT_ROOM` and a `.`, and the composed name is length-
 checked again. `?room=standup` with the default configuration reaches `demo.standup`. Nothing a
 caller can put in that field escapes the `demo.` prefix — `.` and `-` are the only punctuation the
 charset allows, and neither can walk up a namespace.
 
 Always issuing the configured room would have been simpler, and was rejected: a shareable link to a
-side room is most of what makes the demo usable in front of a group, and it costs one prefix to
+side room is most of what makes the page usable in front of a group, and it costs one prefix to
 keep it safe. The response's `room` field carries the composed name, so the page shows people the
 room they are actually in.
 
@@ -101,12 +102,12 @@ sets no encoding, so these are what a browser downloads.
 | Route | Bytes | When |
 |---|---:|---|
 | `/vendor/rnnoise-simd-0.4.0.wasm` | 157 234 | **every load** |
-| `/denoise.js` | 24 436 | **every load** |
+| `/denoise.js` | 24 434 | **every load** |
 | `/vendor/rnnoise-worklet-0.4.0.js` | 64 389 | only once it is switched on |
 | `/denoise-probe.js` | 11 372 | only once it is switched on |
 | `/denoise-gate.js` | 3 928 | only once it is switched on |
-| **every load** | **181 670** | |
-| **once it is switched on** | **261 359** | |
+| **every load** | **181 668** | |
+| **once it is switched on** | **261 357** | |
 
 Most of it is not conditional. The wasm is fetched on **every** page load whether or not anybody
 turns the denoiser on, because the gate that decides whether to offer the option at all validates
@@ -116,8 +117,8 @@ build (152 656 bytes) is fetched instead of the SIMD one on a browser without SI
 For comparison the page already carries `/vendor/livekit-client-2.22.2.esm.js` at 1 365 927 bytes.
 Against that, the denoiser adds about an eighth on every load and about a fifth once somebody turns
 it on. The "about 150 KB" this file used to quote was the wasm alone, and it called the rest
-conditional: a load that uses the denoiser fetches 261 359 bytes, seventy per cent more than that,
-and 181 670 of them are fetched whether anybody uses it or not.
+conditional: a load that uses the denoiser fetches 261 357 bytes, seventy per cent more than that,
+and 181 668 of them are fetched whether anybody uses it or not.
 
 `the_page_weight_in_the_readme_is_the_page_weight` in `src/http.rs` fails if any of those numbers
 stops matching the bytes this binary serves.
@@ -132,7 +133,7 @@ projects, four licences: `livekit-client` (Apache-2.0), `@sapphi-red/web-noise-s
 the AudioWorklet wrapper), `@shiguredo/rnnoise-wasm` (Apache-2.0, the emscripten build whose bytes
 are actually shipped) and `xiph/rnnoise` (BSD-3-Clause, the algorithm and the weights). Apache-2.0
 section 4(d) and the MIT permission notice both require that notice to travel with the thing; a
-file sitting in the repository does not. `cargo test -p mediacore-demo` fails if the notice stops
+file sitting in the repository does not. `cargo test -p mediacore-front` fails if the notice stops
 being compiled in, stops being served, stops naming any of the four, or stops carrying the licence
 texts.
 
@@ -344,7 +345,7 @@ latency is 10 ms, and the vendored AudioWorklet wrapper buffers another 512 samp
 turn 128-sample render quanta into 480-sample frames. Both are in what the room hears; only the
 first is in the data sheet.
 
-992 is measured, not derived. `cargo test -p mediacore-demo` drives the vendored worklet and the
+992 is measured, not derived. `cargo test -p mediacore-front` drives the vendored worklet and the
 vendored `.wasm` this repository ships, through the same tap-and-probe chain the page uses, and
 fails if the answer moves — see *measures what the vendored worklet and the vendored wasm really
 add* in `tests/browser-modules.test.mjs`. The bench panel measures the same thing in the browser,
@@ -465,6 +466,58 @@ pressing it steps through the values on offer — and the audio menu behind the 
 same setting as a radio group with a sentence about each. When somebody is sharing a screen it takes the main area and the participants
 shrink to a strip beneath it; when nobody is, the participants fill it. Two people with the same
 name keep the last four characters of their identity beside it, as they always have.
+
+### Putting one thing in the middle
+
+Press a tile and that one thing fills the stage, with everything else in a strip down the right that
+scrolls. Press it again, or press Escape, and the room goes back to the grid it was. Anything on the
+stage can go there — a camera, a shared screen, and a participant with no camera as their avatar
+tile, large, because the point of choosing somebody is *I want to look at this one*, which is as
+true of a name as it is of a picture.
+
+A shared screen keeps the precedence it has: it takes the stage on its own as soon as it starts,
+without anybody pressing anything, and putting a person in the middle beside it **never** throws it
+away. It moves to the top of the strip, one press from coming back. When the person in the middle
+leaves, the screen is back in the middle where it was.
+
+The choice is the viewer's, and the room cannot take it: it survives a re-render, a reorder, the
+bench being opened and closed over the top of it, and a publisher swapping a window for a whole
+screen — a share is chosen as *the share* and never as a track, so the new track that swap mints
+carries on in the middle. It is let go of only when what was being looked at has gone: the person
+left, or the screen ended. A room that is reconnecting has dropped every remote participant without
+saying a word about any of them, so while the link is down the choice is held rather than concluded
+from, exactly as the shared screen is.
+
+**Fullscreen outranks it.** The roster, the tiles and the strip are all behind a fullscreen picture,
+so a person in the middle under it is in the middle of nothing anybody can see. The choice is held
+rather than dropped, the control that sets it is taken off the picture while fullscreen is up, and
+leaving fullscreen puts the viewer back exactly where they were. Escape follows the same order it
+reads in: the audio menu first, then the fullscreen this page drew itself, then the middle — one
+press each, so coming out of a picture never rearranges the room behind it in the same breath.
+
+**Every tile is a real control.** The picture is a `button`: in the tab order, answering Enter and
+Space, carrying `aria-pressed`, with an accessible name that says what pressing it does — `Focus
+Bob`, and `Exit focus on Bob` for the one already there. The name and the state underneath stay
+*outside* the button, because a button's own name is what a screen reader reads instead of its
+contents, and wrapping the whole tile would have swapped "Bob, speaking" for the name of the action.
+They are still selectable and still carry the sentence on hover that says why a state is unknown.
+The shared screen has the same control as a pill in its corner beside `Fullscreen`, because it is
+the one tile that cannot answer a plain click: a double click on the picture is already fullscreen,
+and a click bound beside it would fire on the way there.
+
+Nothing is hidden by this layout, so nothing is detached for it: every tile is in the strip, showing
+who is speaking, which is how you know which one is worth pressing. **Narrower than 64rem** a column
+beside the picture leaves neither of them worth looking at, so the strip goes along the bottom and
+scrolls sideways inside itself — the bottom rather than the top because it is beside the control
+bar, and so under the thumb that is already there. That is its own breakpoint and not the one where
+the roster stops being a column: a window can be too narrow for two columns on the stage and still
+wide enough for the roster beside them. Nothing anywhere scrolls the page sideways.
+
+Only one node ever moves in the document to do any of this — the tile in the middle, out of the
+strip and back. `#share` and `#cards` stay where they are written and the grid places them, because
+a video element taken out of the document is a video the browser is entitled to pause. The tile that
+does move takes the keyboard's focus with it and is handed it back, so pressing a tile does not send
+the next Tab to the top of the page.
 
 ### The shared screen
 
@@ -627,7 +680,7 @@ above.
 
 ## Testing it
 
-`cargo test -p mediacore-demo` runs everything, and the split between the two halves is deliberate.
+`cargo test -p mediacore-front` runs everything, and the split between the two halves is deliberate.
 
 **The Rust tests are statements about bytes**: that each artefact is served, with its version in the
 path and the right content type, that the module graph the page imports resolves to routes this
@@ -658,7 +711,12 @@ bundler and no browser, and it drives the real modules:
   that a pinned share survives the room being reordered under it, that a share ending names whose it
   was, that a browser with no fullscreen and one that refuses and one that silently ignores the
   request all land on the path that fills the window, and that the corner badge prints a half it has,
-  nothing at all when it has neither, and never `0×0`.
+  nothing at all when it has neither, and never `0×0`. The middle is decided in the same file and
+  argued with the same way: that the layouts reached without pressing anything are the ones that
+  were there before there was a middle, that a screen starting joins the strip instead of displacing
+  somebody out of it, that somebody leaving is let go of and a reconnect is not, that fullscreen
+  takes the stage without forgetting what was in the middle, and that pressing the tile already
+  there puts it back — which is the only way out on a phone, where there is no Escape key.
 - `bench.js` against a fake `RTCStatsReport`, on the join that attributes an outbound stream to a
   local track: a screen share and a camera going out together keep their own numbers, a stream the
   browser did not join to a track is left out, and one sample yields no rate.
@@ -692,7 +750,7 @@ would make the page measure the client instead.
 ## Running the bench against a constrained link
 
 Shape the **SFU host's egress on the UDP media port**, `rtc.udp_port`, which defaults to **7882**.
-Not the demo's HTTP port, and not the signalling port: signalling is TCP on 7880, and shaping it
+Not the front end's HTTP port, and not the signalling port: signalling is TCP on 7880, and shaping it
 kills the session for reasons that have nothing to do with congestion. Egress from the SFU is the
 direction that matters — it is the direction the allocator spends.
 
@@ -802,11 +860,11 @@ missing; hover it before assuming the bench is broken.
 ## Deployment
 
 The page must be served over TLS: a browser hands out the microphone only in a secure context, and
-a TLS page can only open `wss`. Put the demo and the SFU's `/rtc*` behind one TLS origin, so the
-certificate the visitor accepted covers both. `deploy/` in the repository root does exactly that,
-and its README covers the case that actually bites — a host with a public IP and no domain name.
-Media does not pass through the proxy; it is UDP straight to the host, and the SFU advertises that
-address itself through `rtc.advertise_addresses`.
+a TLS page can only open `wss`. Put the front end and the SFU's `/rtc*` behind one TLS origin, so
+the certificate the visitor accepted covers both. `deploy/` in the repository root does exactly
+that, and its README covers the case that actually bites — a host with a public IP and no domain
+name. Media does not pass through the proxy; it is UDP straight to the host, and the SFU advertises
+that address itself through `rtc.advertise_addresses`.
 
 ## Who is speaking
 

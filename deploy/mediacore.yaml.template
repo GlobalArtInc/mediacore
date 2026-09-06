@@ -8,7 +8,7 @@ bind_addresses:
 
 log_level: ${MEDIACORE_LOG_LEVEL}
 
-# The API key is the `iss` of every token, the secret signs it. The demo app
+# The API key is the `iss` of every token, the secret signs it. The front end
 # mints tokens with the same pair, from the same two variables.
 keys:
   "${MEDIACORE_API_KEY}": "${MEDIACORE_API_SECRET}"

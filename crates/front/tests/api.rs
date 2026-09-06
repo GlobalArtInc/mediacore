@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use mediacore_demo::config::{Config, TOKEN_TTL};
-use mediacore_demo::http;
+use mediacore_front::config::{Config, TOKEN_TTL};
+use mediacore_front::http;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -109,7 +109,7 @@ async fn the_page_is_served() {
 
     let (status, body) = get(addr, "/").await;
     assert_eq!(status, 200);
-    assert!(body.contains("<title>mediacore demo</title>"));
+    assert!(body.contains("<title>mediacore</title>"));
     assert!(body.contains(r#"id="join-form""#));
     assert!(body.contains(r#"src="/app.js""#));
 
@@ -175,7 +175,8 @@ async fn a_token_is_issued_that_the_server_accepts() {
     assert_eq!(
         claims.video.can_publish_sources,
         vec!["microphone", "camera", "screen_share", "screen_share_audio"],
-        "the demo mints the only token it can publish with, so the grant is the whole permission"
+        "the front end mints the only token it can publish with, so the grant is the whole \
+         permission"
     );
     assert!(
         claims
@@ -230,7 +231,7 @@ async fn a_requested_room_is_namespaced_under_the_configured_one() {
 }
 
 #[tokio::test]
-async fn a_caller_cannot_name_a_room_outside_the_demo_namespace() {
+async fn a_caller_cannot_name_a_room_outside_the_configured_namespace() {
     let addr = spawn().await;
 
     for requested in ["board", "demo", "..", "ops.private", "-", "_"] {
@@ -245,7 +246,7 @@ async fn a_caller_cannot_name_a_room_outside_the_demo_namespace() {
         assert_eq!(
             claims.video.room,
             format!("{ROOM}.{requested}"),
-            "`{requested}` reached a room the demo does not own"
+            "`{requested}` reached a room the front end does not own"
         );
         assert!(claims.video.room.starts_with(&format!("{ROOM}.")));
         assert_ne!(claims.video.room, requested);
@@ -1485,5 +1486,233 @@ async fn nothing_of_the_fullscreen_view_reaches_a_room_with_no_share() {
     assert!(
         leave.contains("leaveFullscreen()"),
         "leaving the room leaves the browser in fullscreen"
+    );
+}
+
+#[tokio::test]
+async fn a_tile_you_can_press_is_a_control_and_not_a_picture_that_answers_a_click() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let build = body_of(&js, "\nfunction buildCard(");
+    assert!(
+        build.contains(r#"document.createElement("button")"#)
+            && build.contains(r#"press.type = "button""#)
+            && build.contains(r#"press.addEventListener("click""#),
+        "the tile answers a click without being a button, so a keyboard reaches every control on \
+         this page except the one that chooses what fills the stage: {build}"
+    );
+    assert!(
+        !build.contains("node.addEventListener"),
+        "the press is bound to the list item rather than to the button inside it, so Enter and \
+         Space do nothing at all: {build}"
+    );
+
+    let paint = body_of(&js, "\nfunction paintCard(");
+    assert!(
+        paint.contains(r#"card.press.setAttribute("aria-pressed", String(middle))"#),
+        "a tile never says whether it is the one in the middle: {paint}"
+    );
+    for name in ["Exit focus on ${who}", "Focus ${who}"] {
+        assert!(
+            paint.contains(name),
+            "a tile never reads `{name}`, so the one already in the middle is a control that \
+             cannot say what pressing it will do"
+        );
+    }
+
+    assert!(
+        page.contains(r#"id="share-focus""#),
+        "the shared screen has no control of its own, so the one tile on the stage that answers \
+         a double click rather than a click cannot be chosen at all"
+    );
+
+    let focus = body_of(&js, "\nfunction paintFocusControl(");
+    for name in [
+        "Exit focus and show everybody again",
+        "Focus the shared screen",
+    ] {
+        assert!(
+            focus.contains(name),
+            "the shared screen's control never reads `{name}`"
+        );
+    }
+    assert!(
+        focus.contains(r#"el.shareFocus.setAttribute("aria-pressed", String(held))"#),
+        "the shared screen's control never reports its state to a screen reader: {focus}"
+    );
+}
+
+#[tokio::test]
+async fn the_middle_fills_the_stage_and_the_strip_is_the_only_thing_that_scrolls() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let stage = rule_of(&css, r#".stage[data-layout="focus"]"#);
+    assert!(
+        stage.contains("grid-template-columns: minmax(0, 1fr) 15rem"),
+        "the middle and the strip are not a wide column and a narrow one beside it: {stage}"
+    );
+    assert!(
+        stage.contains("overflow: hidden"),
+        "the stage scrolls in this layout, so the tile somebody asked to look at scrolls out of \
+         the window and takes the strip with it: {stage}"
+    );
+
+    for strip in [
+        r#".stage[data-layout="focus"][data-main="person"] .reel"#,
+        r#".stage[data-layout="focus"][data-main="share"] .cards"#,
+    ] {
+        let rule = rule_of(&css, strip);
+        assert!(
+            rule.contains("overflow-y: auto") && rule.contains("min-height: 0"),
+            "{strip} does not scroll on its own, so a room with more people than fit is a room \
+             whose last few are simply not there: {rule}"
+        );
+    }
+
+    let reel = rule_of(&css, "\n.reel");
+    assert!(
+        reel.contains("display: contents"),
+        "the wrapper this one layout needs is a box in the other three as well, so the grid and \
+         the share view are laid out by rules that were never written for them: {reel}"
+    );
+}
+
+#[tokio::test]
+async fn a_window_too_narrow_for_a_column_beside_the_picture_puts_the_strip_underneath() {
+    let addr = spawn().await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let narrow = css
+        .split_once("@media (max-width: 64rem) {")
+        .expect("the page no longer adapts to a window too narrow for two columns on the stage")
+        .1;
+    let focus = narrow
+        .split_once(r#".stage[data-layout="focus"] {"#)
+        .expect("the focus layout is not adapted for a narrow window")
+        .1
+        .split_once('}')
+        .expect("the rule is closed")
+        .0;
+    assert!(
+        focus.contains("grid-template-columns: minmax(0, 1fr)")
+            && focus.contains("grid-template-rows: minmax(0, 1fr) auto"),
+        "a phone keeps the strip in a column beside the picture, which leaves neither of them \
+         wide enough to be worth looking at: {focus}"
+    );
+    assert!(
+        narrow.contains("overflow-x: auto"),
+        "the strip along the bottom does not scroll sideways, so everybody past the third person \
+         is off the edge of the screen with no way to reach them"
+    );
+
+    for owner in ["body", ".page", ".shell", ".main"] {
+        let rule = rule_of(&css, owner);
+        assert!(
+            !rule.contains("overflow-x"),
+            "`{owner}` scrolls sideways, and a page that scrolls sideways on a phone is a page \
+             half of whose controls are off the edge of it: {rule}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn putting_a_person_in_the_middle_does_not_throw_the_shared_screen_away() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, stage) = get(addr, "/stage.js").await;
+
+    let plan = body_of(&stage, "\nexport function stagePlan(");
+    assert!(
+        plan.contains(r#"strip.push({ kind: "share", key: null })"#),
+        "a screen somebody is sharing has nowhere to go once a person is in the middle, so \
+         choosing a face ends the share for the one person who chose it: {plan}"
+    );
+    assert!(
+        !plan.contains("speaking"),
+        "what fills the stage depends on who is talking, which is the one thing both a shared \
+         screen and a tile somebody pressed exist to override: {plan}"
+    );
+
+    let render = body_of(&js, "\nfunction render(");
+    assert!(
+        render.contains("stagePlan(stageFocus,") && render.contains("stageFocus = plan.focus;"),
+        "what fills the stage is decided somewhere `node --test` cannot argue with it, or is \
+         worked out and then forgotten between renders: {render}"
+    );
+    assert!(
+        render.contains("layoutStage(plan)") && render.contains("syncCards(entries, plan)"),
+        "the plan is worked out and then not laid out: {render}"
+    );
+
+    let layout = body_of(&js, "\nfunction layoutStage(");
+    assert!(
+        !layout.contains("el.share"),
+        "the shared screen is moved in the document to get it into the strip, and a video \
+         element taken out of the document is a video the browser is entitled to pause: {layout}"
+    );
+}
+
+#[tokio::test]
+async fn the_tile_in_the_middle_is_the_same_tile_that_was_in_the_strip() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let sync = body_of(&js, "\nfunction syncCards(");
+    assert!(
+        sync.contains("el.spotlight.replaceChildren(cards.get(middle).node)"),
+        "the middle is a second tile built beside the one in the strip, so one camera is \
+         attached in two places and whichever detaches first tears the picture out of the \
+         other: {sync}"
+    );
+    assert!(
+        sync.contains("standing.focus()"),
+        "moving the tile takes it out of the document and the keyboard's focus with it, so \
+         pressing a tile sends the next Tab back to the top of the page: {sync}"
+    );
+
+    let speaking = rule_of(&css, r#".card-tile[data-speaking="true"]"#);
+    assert!(
+        speaking.contains("outline-color"),
+        "a tile in the strip no longer shows that its person is talking, which is how somebody \
+         knows which one is worth pressing: {speaking}"
+    );
+
+    let bench = body_of(&js, "\nfunction onBenchToggle(");
+    assert!(
+        !bench.contains("stageFocus"),
+        "opening the bench forgets what somebody put in the middle, so closing it again leaves \
+         them looking at a grid they will have to rebuild by hand: {bench}"
+    );
+}
+
+#[tokio::test]
+async fn escape_leaves_whatever_is_on_top_before_whatever_is_underneath_it() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let escape = body_of(&js, "\nfunction onKeydown(");
+    let menu = escape
+        .find("el.audioMenu.hidden")
+        .expect("Escape no longer closes the audio menu");
+    let full = escape
+        .find(r#"fullscreen !== "off""#)
+        .expect("Escape no longer leaves the fullscreen this page drew itself");
+    let middle = escape
+        .find("stageFocus")
+        .expect("Escape does not leave the middle at all, so a keyboard has no way out of it");
+
+    assert!(
+        menu < full && full < middle,
+        "Escape reaches past a menu that is standing open, or lets go of the tile in the middle \
+         while a shared screen is filling the screen over the top of it: {escape}"
+    );
+    assert!(
+        escape[full..middle].contains("return;"),
+        "one press of Escape both leaves fullscreen and lets go of the middle, so somebody \
+         coming out of a picture finds the room rearranged behind it as well: {escape}"
     );
 }

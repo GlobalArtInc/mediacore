@@ -42,11 +42,11 @@ https://{$MEDIACORE_PUBLIC_HOST} {
 		reverse_proxy sfu:7880
 	}
 
-	# Everything else is the demo app: /, /app.css, /app.js, the vendored
-	# client SDK, /api/config, /api/token, /healthz. The app sets its own
+	# Everything else is the front end: /, /app.css, /app.js, the vendored
+	# client SDK, /api/config, /api/token, /healthz. It sets its own
 	# content security policy; nothing here rewrites response headers.
 	handle {
-		reverse_proxy demo:8080
+		reverse_proxy front:8080
 	}
 
 	log {

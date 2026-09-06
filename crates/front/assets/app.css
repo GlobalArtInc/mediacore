@@ -445,10 +445,15 @@ li[data-speaking="true"] .state {
   font-size: 0.72rem;
 }
 
-.share-full {
+.share-acts {
   position: absolute;
   top: 0.55rem;
   right: 0.55rem;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.share-act {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -460,11 +465,16 @@ li[data-speaking="true"] .state {
   font-size: 0.78rem;
 }
 
-.share-full:hover {
+.share-act:hover {
   border-color: #38424e;
 }
 
-.share-full .icon {
+.share-act[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+.share-act .icon {
   width: 16px;
   height: 16px;
   flex: none;
@@ -585,6 +595,21 @@ li[data-speaking="true"] .state {
   border-color: #3a444f;
 }
 
+/*
+ * The picture is the button and the caption underneath is not, so the ring a
+ * keyboard user sees is drawn around the picture rather than around the tile.
+ */
+.card-press {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-sm);
+}
+
 .card-frame {
   aspect-ratio: 16 / 9;
   border-radius: var(--radius-sm);
@@ -602,6 +627,10 @@ li[data-speaking="true"] .state {
 
 .card-tile[data-video="true"] .avatar {
   display: none;
+}
+
+.card-tile[data-middle="true"] {
+  border-color: var(--accent-line);
 }
 
 .avatar {
@@ -635,6 +664,143 @@ li[data-speaking="true"] .state {
 
 .card-foot .who {
   font-size: 0.85rem;
+}
+
+/* ------------------------------------------------------------ the middle */
+
+/*
+ * One tile fills the stage and everything else goes to a strip that scrolls.
+ * Only the tile in the middle ever moves in the DOM; `#share` and `#cards` stay
+ * where they were written and the grid places them, which is why a shared
+ * screen dropping to the strip does not take its video out of the document.
+ *
+ * `.reel` exists for the one layout that needs the shared screen and the tiles
+ * to scroll together, and is `display: contents` in every other, so the three
+ * layouts that were here before focus was are laid out by exactly the rules
+ * they always were.
+ */
+.reel {
+  display: contents;
+}
+
+.spotlight {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.stage[data-layout="focus"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 15rem;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0.9rem;
+  overflow: hidden;
+}
+
+.stage[data-layout="focus"] .spotlight {
+  grid-area: 1 / 1;
+}
+
+.stage[data-layout="focus"] .cards {
+  margin: 0;
+  max-width: none;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.spotlight .card-tile {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+.spotlight .card-press {
+  flex: 1;
+  min-height: 0;
+}
+
+.spotlight .card-frame {
+  flex: 1;
+  min-height: 0;
+  aspect-ratio: auto;
+}
+
+/* A face is not a screen: filling the frame with it would cut the top of the
+   head off, which is exactly what somebody asking to look at one person does
+   not want. */
+.spotlight .card-frame video {
+  object-fit: contain;
+}
+
+/* Somebody with no camera is a name, and the point of asking to look at one
+   person is as true of a name as of a picture -- so it is drawn at the size of
+   the space it was given rather than at the size it had in the grid. */
+.spotlight .avatar {
+  width: min(9rem, 26%);
+  height: auto;
+  aspect-ratio: 1;
+  font-size: clamp(1.4rem, 3vw, 2.6rem);
+}
+
+.spotlight .card-foot .who {
+  font-size: 0.95rem;
+}
+
+/* A person in the middle: the shared screen and the tiles scroll together on
+   the right, so one press on the small picture brings the screen back. */
+.stage[data-layout="focus"][data-main="person"] .reel {
+  grid-area: 1 / 2;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.stage[data-layout="focus"][data-main="person"] .share {
+  flex: none;
+}
+
+.stage[data-layout="focus"][data-main="person"] .share-stats {
+  display: none;
+}
+
+.stage[data-layout="focus"][data-main="person"] .act-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The shared screen in the middle: it is a child of the stage in its own
+   right, so the grid puts it in the first column without anything moving. */
+.stage[data-layout="focus"][data-main="share"] .share {
+  grid-area: 1 / 1;
+  min-height: 0;
+}
+
+.stage[data-layout="focus"][data-main="share"] .share-view {
+  flex: 1;
+  min-height: 0;
+}
+
+.stage[data-layout="focus"][data-main="share"] .share-frame {
+  aspect-ratio: auto;
+  max-height: none;
+  height: 100%;
+}
+
+.stage[data-layout="focus"][data-main="share"] .cards {
+  grid-area: 1 / 2;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* ------------------------------------------------------------ bench view */
@@ -1022,7 +1188,7 @@ li[data-speaking="true"] .state {
   left: 0.9rem;
 }
 
-#room[data-fullscreen]:not([data-fullscreen="off"]) .share-full {
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-acts {
   top: 0.9rem;
   right: 0.9rem;
 }
@@ -1190,6 +1356,63 @@ li[data-speaking="true"] .state {
 }
 
 /* ----------------------------------------------------------- adaptations */
+
+@media (max-width: 64rem) {
+  /*
+   * Narrower than this, a column beside the picture leaves neither of them
+   * worth looking at: take the roster and the strip off a 1024px window and
+   * about 300px are left for the thing somebody asked to look at. So the strip
+   * goes along the bottom instead and scrolls sideways -- inside itself, which
+   * is the whole point, because nothing here may put a sideways scrollbar on
+   * the page. The bottom rather than the top: it is beside the control bar, and
+   * so under the thumb that is already there.
+   *
+   * This is its own breakpoint and not the one below, which is where the roster
+   * stops being a column. A window can be too narrow for two columns on the
+   * stage while it is still wide enough for the roster beside them.
+   */
+  .stage[data-layout="focus"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    gap: 0.7rem;
+  }
+
+  .stage[data-layout="focus"] .spotlight,
+  .stage[data-layout="focus"][data-main="share"] .share {
+    grid-area: 1 / 1;
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel,
+  .stage[data-layout="focus"][data-main="share"] .cards {
+    grid-area: 2 / 1;
+  }
+
+  .stage[data-layout="focus"] .cards {
+    grid-auto-flow: column;
+    grid-auto-columns: 9.5rem;
+    grid-template-columns: none;
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel {
+    flex-direction: row;
+    align-items: stretch;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel .share {
+    width: 12rem;
+  }
+
+  .stage[data-layout="focus"][data-main="person"] .reel .cards {
+    overflow: visible;
+  }
+
+  .stage[data-layout="focus"][data-main="share"] .cards {
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+}
 
 @media (max-width: 52rem) {
   .shell {

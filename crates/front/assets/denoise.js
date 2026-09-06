@@ -16,7 +16,7 @@
  * `createMediaStreamSource`.
  *
  * Nothing here reaches a third party. The wasm and all three worklets are
- * served by the demo binary from its own origin.
+ * served by the front end from its own origin.
  *
  * Usage:
  *

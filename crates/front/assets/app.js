@@ -21,9 +21,11 @@ import {
   afterRequest,
   frameArea,
   fullscreenPlan,
+  nextFocus,
   nextShare,
   shareBadge,
   sizeChange,
+  stagePlan,
 } from "/stage.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
@@ -77,7 +79,7 @@ const NOISE_ROWS = [
     short: "browser",
     note:
       "getUserMedia's noiseSuppression, plus voiceIsolation where Chrome offers it. A light " +
-      "attenuator for steady noise, and what this demo has always used.",
+      "attenuator for steady noise, and what this page has always used.",
   },
   {
     engine: "mediacore",
@@ -128,10 +130,14 @@ const el = {
   roomState: document.getElementById("room-state"),
   roomError: document.getElementById("room-error"),
   participants: document.getElementById("participants"),
+  stage: document.getElementById("stage"),
+  spotlight: document.getElementById("spotlight"),
   cards: document.getElementById("cards"),
   share: document.getElementById("share"),
   shareFrame: document.getElementById("share-frame"),
   shareStats: document.getElementById("share-stats"),
+  shareFocus: document.getElementById("share-focus"),
+  shareFocusLabel: document.getElementById("share-focus-label"),
   shareFullscreen: document.getElementById("share-fullscreen"),
   shareFullscreenLabel: document.getElementById("share-fullscreen-label"),
   shareWho: document.getElementById("share-who"),
@@ -205,6 +211,7 @@ let tiles = null;
 let showBench = false;
 let pinnedShare = null;
 let stageShare = null;
+let stageFocus = null;
 let shareSignature = "";
 let deviceSignature = "";
 let sharedElement = null;
@@ -233,6 +240,7 @@ async function start() {
   });
   el.micSelect.addEventListener("change", onSelectMicrophone);
   el.shareScreen.addEventListener("click", onShareScreen);
+  el.shareFocus.addEventListener("click", () => onFocus({ kind: "share", key: null }));
   el.shareFullscreen.addEventListener("click", onToggleFullscreen);
   el.shareFrame.addEventListener("dblclick", onToggleFullscreen);
   document.addEventListener("fullscreenchange", onFullscreenChange);
@@ -249,6 +257,7 @@ async function start() {
 
   buildSwitches();
   buildNoiseChoices();
+  paintFocusControl();
   paintFullscreenControl();
   buildDenoiseReadout();
   paintBenchToggle();
@@ -262,7 +271,7 @@ async function start() {
   if (!window.isSecureContext || !navigator.mediaDevices) {
     block(
       "This page is not a secure context, so the browser will not hand over the microphone. " +
-        "Open the demo over https, or over http://localhost while developing.",
+        "Open the page over https, or over http://localhost while developing.",
     );
     return;
   }
@@ -273,7 +282,7 @@ async function start() {
     console.error("the livekit-client module failed to load", error);
     block(
       "The page could not load the client library it needs. Reload the page; if it keeps " +
-        "happening the demo server is serving a broken build.",
+        "happening this server is serving a broken build.",
     );
     return;
   }
@@ -325,7 +334,7 @@ async function loadSettings() {
     const response = await fetch("/api/config");
     if (response.ok) return await response.json();
   } catch (error) {
-    console.warn("could not read the demo configuration", error);
+    console.warn("could not read the page configuration", error);
   }
   return settings;
 }
@@ -393,14 +402,14 @@ async function mintToken(name) {
     });
   } catch {
     throw new Error(
-      "The demo server did not answer. Check that it is still running, then press Join again.",
+      "This server did not answer. Check that it is still running, then press Join again.",
     );
   }
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(
-      payload.error || `The demo server refused the request (HTTP ${response.status}).`,
+      payload.error || `This server refused the request (HTTP ${response.status}).`,
     );
   }
   return payload;
@@ -466,6 +475,9 @@ async function leave(reason) {
   el.audio.replaceChildren();
   speaking = new Set();
   pinnedShare = null;
+  stageFocus = null;
+  layoutStage({ mode: "grid", main: null });
+  paintFocusControl();
   toggleMenu(false);
   clearNotice();
   el.room.hidden = true;
@@ -721,11 +733,27 @@ function onKeydown(event) {
     return;
   }
 
-  // A fullscreen the browser granted is the browser's to leave, and it does.
-  // One the page had to draw itself is the page's, and nothing else would.
-  if (fullscreen === "fallback") {
-    leaveFullscreen();
-    el.shareFullscreen.focus();
+  // A fullscreen the browser granted is the browser's to leave, and it does --
+  // the key is usually eaten before the page ever sees it. One the page drew
+  // itself is the page's, and nothing else would leave it.
+  //
+  // Either way the shared screen is the whole of what is on the screen, and the
+  // tile somebody put in the middle is behind it, so this key is not about that
+  // tile yet. It becomes about it on the next press, once the picture is gone
+  // and the strip is back.
+  if (fullscreen !== "off") {
+    if (fullscreen === "fallback") {
+      leaveFullscreen();
+      el.shareFullscreen.focus();
+    }
+    return;
+  }
+
+  // Leaving the middle puts the tile back in the strip; `syncCards` carries the
+  // keyboard to it, so somebody who got here by pressing it is still on it.
+  if (stageFocus) {
+    stageFocus = null;
+    render();
   }
 }
 
@@ -999,25 +1027,41 @@ function render() {
   scheduleShareRecheck(step.waitFor);
   paintShareTabs(shares);
 
+  // The stage is holding a share while it is waiting for one too: the section
+  // is up, saying so, and the room is laid out around it either way.
+  const holding = Boolean(step.entry) || step.outcome === "waiting";
+  const entries = cardEntries(people, labels);
+  const plan = stagePlan(stageFocus, holding ? step : null, entries, {
+    link: linkState(),
+    fullscreen: fullscreen !== "off",
+  });
+  stageFocus = plan.focus;
+
   // A track attached in two places at once is a track either renderer can rip
   // out from under the other, so the bench owns the video or the stage does.
   if (showBench) {
     clearCards();
     paintShare(null, false);
+    // The bench holds every video, so there is nothing for the stage to lay
+    // out. The choice somebody made is kept, and the stage returns to it when
+    // they close the bench again.
+    layoutStage({ mode: "grid", main: null });
     tiles.sync(videoTiles(people, labels));
   } else {
     tiles.clear();
     paintShare(step.entry, step.outcome === "waiting");
     // A tile behind a fullscreen share is a video this machine keeps decoding
     // into something `display: none`, which buys the share nothing at all.
-    if (fullscreen === "off") syncCards(cardEntries(people, labels));
+    if (fullscreen === "off") syncCards(entries, plan);
     else clearCards();
+    layoutStage(plan);
   }
 
   el.bench.hidden = !showBench;
-  el.cards.dataset.compact = String(Boolean(step.entry) || step.outcome === "waiting");
+  el.cards.dataset.compact = String(plan.mode === "share");
   paintStageSpeaking(people, labels);
   announceShareChange(step);
+  paintFocusControl();
   paintControls();
 
   if (lastReading) paint(lastReading);
@@ -1236,6 +1280,49 @@ function paintShareTabs(shares) {
 }
 
 /**
+ * Pressing a tile, from the picture of a person or from the control on the
+ * shared screen. Nothing else in the room moves the choice: it is the viewer's,
+ * and `stagePlan` lets go of it only when what they were looking at has gone.
+ */
+function onFocus(target) {
+  stageFocus = nextFocus(stageFocus, target);
+  render();
+}
+
+/**
+ * Where the two halves of the stage sit. One node moves and no more -- the tile
+ * in the middle, out of the strip and back -- because `#share` carries a playing
+ * video, and a video element taken out of the document is a video the browser
+ * may pause. Which of `#share` and `#cards` is the strip is left to the
+ * stylesheet, which can place a child of the stage in either column without
+ * anything being moved to get it there.
+ */
+function layoutStage(plan) {
+  el.stage.dataset.layout = plan.mode;
+  el.stage.dataset.main = plan.main ? plan.main.kind : "none";
+}
+
+/**
+ * The shared screen's own way into the middle, and out again. It is the tile
+ * that cannot answer a plain click: a double click on the picture is already
+ * fullscreen, and a click bound beside it would fire twice on the way there.
+ */
+function paintFocusControl() {
+  const held = stageFocus !== null && stageFocus.kind === "share";
+
+  el.shareFocusLabel.textContent = held ? "Exit focus" : "Focus";
+  el.shareFocus.setAttribute("aria-pressed", String(held));
+  el.shareFocus.setAttribute(
+    "aria-label",
+    held ? "Exit focus and show everybody again" : "Focus the shared screen",
+  );
+  el.shareFocus.title = held
+    ? "Everybody goes back to an even grid under the shared screen."
+    : "The shared screen fills the stage and everybody else moves to a strip at the side.";
+  icon(el.shareFocus, held ? "#icon-grid" : "#icon-middle");
+}
+
+/**
  * Fullscreen is asked for on the whole room, not on the video: everything a
  * person reaches for once the picture fills the screen -- mute, the microphone
  * chooser, the tab of the other person's share, leave -- is inside `#room`, and
@@ -1358,6 +1445,12 @@ function paintFullscreenControl() {
     : "The shared screen fills the screen, controls and all. Double-clicking it does the same.";
   icon(el.shareFullscreen, active ? "#icon-collapse" : "#icon-expand");
   el.shareLive.hidden = !active;
+
+  // Fullscreen is the shared screen's whole claim on the stage, so the control
+  // that asks for the middle of it has nothing left to ask for. The choice
+  // itself is kept: this hides the button, not the state behind it.
+  if (active && document.activeElement === el.shareFocus) el.shareFullscreen.focus();
+  el.shareFocus.hidden = active;
 }
 
 /**
@@ -1612,46 +1705,84 @@ function renderParticipant(participant, isLocal, label) {
   return row;
 }
 
-function syncCards(entries) {
+/**
+ * The tiles, and which of them is in the middle. Moving a node takes it out of
+ * the document for the length of one call, and an element that leaves the
+ * document takes the keyboard's focus with it -- so somebody who pressed a tile
+ * would find their next Tab starting again at the top of the page. The one that
+ * was pressed is put back on it afterwards.
+ */
+function syncCards(entries, plan) {
   const keys = new Set(entries.map((entry) => entry.key));
+  const active = document.activeElement;
+  const standing =
+    active && (el.cards.contains(active) || el.spotlight.contains(active)) ? active : null;
 
   for (const [key, card] of [...cards]) {
     if (keys.has(key)) continue;
+    rescueFocus(card.node);
     detachCard(card);
     card.node.remove();
     cards.delete(key);
   }
 
+  const middle = plan.main && plan.main.kind === "person" ? plan.main.key : null;
+
   for (const entry of entries) {
     let card = cards.get(entry.key);
     if (!card) {
-      card = buildCard();
+      card = buildCard(entry.key);
       cards.set(entry.key, card);
       el.cards.appendChild(card.node);
     }
-    paintCard(card, entry);
+    paintCard(card, entry, entry.key === middle);
   }
 
-  const ordered = entries.map((entry) => cards.get(entry.key).node);
+  // The spotlight claims its tile first, so the strip settling below never sees
+  // the node it is about to give up as one of its own children -- and it is
+  // shown before it is filled, because `[hidden]` is `display: none` and an
+  // element moved into one of those is an element the keyboard has just left.
+  el.spotlight.hidden = !middle;
+  if (middle) el.spotlight.replaceChildren(cards.get(middle).node);
+  else el.spotlight.replaceChildren();
+
+  const ordered = entries
+    .filter((entry) => entry.key !== middle)
+    .map((entry) => cards.get(entry.key).node);
   const settled =
     ordered.length === el.cards.children.length &&
     ordered.every((node, index) => el.cards.children[index] === node);
   if (!settled) el.cards.replaceChildren(...ordered);
 
-  el.cards.hidden = entries.length === 0;
+  el.cards.hidden = ordered.length === 0;
+  if (standing && standing.isConnected && document.activeElement !== standing) standing.focus();
 }
 
-function buildCard() {
+/**
+ * The picture is the control, and the name and state underneath are not: a
+ * button's own text is what a screen reader reads instead of its contents, so
+ * wrapping the whole tile would have swapped "Alice, speaking" for the name of
+ * the action. Outside the button they are still read, still selectable, and
+ * still carry the sentence on hover that says why a state is unknown.
+ */
+function buildCard(key) {
   const node = document.createElement("li");
   node.className = "card-tile";
   node.dataset.video = "false";
 
-  const frame = document.createElement("div");
+  const press = document.createElement("button");
+  press.type = "button";
+  press.className = "card-press";
+  press.setAttribute("aria-pressed", "false");
+  press.addEventListener("click", () => onFocus({ kind: "person", key }));
+
+  const frame = document.createElement("span");
   frame.className = "card-frame";
 
   const avatar = document.createElement("span");
   avatar.className = "avatar";
   frame.appendChild(avatar);
+  press.appendChild(frame);
 
   const foot = document.createElement("div");
   foot.className = "card-foot";
@@ -1663,15 +1794,23 @@ function buildCard() {
   state.className = "state";
 
   foot.append(who, state);
-  node.append(frame, foot);
+  node.append(press, foot);
 
-  return { node, frame, avatar, who, state, track: null, video: null };
+  return { node, press, frame, avatar, who, state, track: null, video: null };
 }
 
-function paintCard(card, entry) {
+function paintCard(card, entry, middle) {
   card.node.dataset.speaking = String(entry.speaking);
   card.node.dataset.muted = String(entry.muted);
   card.node.dataset.state = entry.state;
+  card.node.dataset.middle = String(middle);
+
+  const who = entry.local ? "yourself" : entry.label;
+  card.press.setAttribute("aria-pressed", String(middle));
+  card.press.setAttribute("aria-label", middle ? `Exit focus on ${who}` : `Focus ${who}`);
+  card.press.title = middle
+    ? "Everybody goes back to an even grid."
+    : "Fills the stage, with everybody else in a strip at the side.";
 
   card.who.textContent = entry.local ? `${entry.label} - you` : entry.label;
   card.state.textContent = entry.text;
@@ -1707,10 +1846,13 @@ function detachCard(card) {
 
 function clearCards() {
   for (const [key, card] of [...cards]) {
+    rescueFocus(card.node);
     detachCard(card);
     card.node.remove();
     cards.delete(key);
   }
+  el.spotlight.replaceChildren();
+  el.spotlight.hidden = true;
   el.cards.hidden = true;
 }
 

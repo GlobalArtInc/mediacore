@@ -339,7 +339,7 @@ is not one cannot open the signalling WebSocket either. Plain HTTP is enough to
 run the tests and nothing else.
 
 `deploy/` is the deployable shape — Caddy terminating TLS in front of the SFU
-and of `crates/demo`, a single-page audio room that serves the page and mints
+and of `crates/front`, a single-page audio room that serves the page and mints
 tokens. Three containers, one host, one URL to send people:
 
 ```
@@ -352,7 +352,7 @@ docker compose up -d --build
 **[deploy/README.md](deploy/README.md)** is the full account: what each variable
 does, how to get a certificate on a host with no domain name (use
 `<ip>.sslip.io`, not the bare IP), and how to tell apart the three failures that
-cover nearly every silent room. `crates/demo/README.md` documents the demo app
+cover nearly every silent room. `crates/front/README.md` documents the front end
 itself, and the root `Dockerfile` builds both binaries.
 
 ## Layout
@@ -367,7 +367,7 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
 | `crates/server` | HTTP and WebSocket endpoints, binary |
-| `crates/demo` | the browser demo: one page, an audio room, a token endpoint |
+| `crates/front` | the browser front end: one page, an audio room, a token endpoint |
 
 `crates/room` owns all shared state and knows nothing about transport; `crates/transport` speaks
 str0m types and knows nothing about the LiveKit protocol; `crates/sfu` is pure packet arithmetic

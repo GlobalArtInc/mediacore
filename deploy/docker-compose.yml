@@ -1,8 +1,8 @@
 name: mediacore
 
 # Three containers:
-#   caddy  terminates TLS, serves the demo app at / and proxies /rtc to the SFU
-#   demo   the page and the token endpoint
+#   caddy  terminates TLS, serves the front end at / and proxies /rtc to the SFU
+#   front  the page and the token endpoint
 #   sfu    signalling on 7880 and, crucially, media on UDP straight from the host
 #
 # Media never passes through Caddy. The UDP port is published on the host and the
@@ -20,7 +20,7 @@ x-mediacore-image: &mediacore-image
   image: mediacore:local
 
 x-api-secret: &api-secret
-  MEDIACORE_API_SECRET: ${MEDIACORE_API_SECRET:?set MEDIACORE_API_SECRET in deploy/.env; generate one with `openssl rand -hex 32`. Both the SFU and the demo app refuse to start without it, and the stack would crash-loop behind a 502 with nothing readable in the browser}
+  MEDIACORE_API_SECRET: ${MEDIACORE_API_SECRET:?set MEDIACORE_API_SECRET in deploy/.env; generate one with `openssl rand -hex 32`. Both the SFU and the front end refuse to start without it, and the stack would crash-loop behind a 502 with nothing readable in the browser}
 
 services:
   sfu:
@@ -54,12 +54,12 @@ services:
       retries: 5
       start_period: 10s
 
-  demo:
+  front:
     # Same image as the sfu, built once by that service. Two services that both
     # declare the build would race to export the same tag and one of them fails.
     image: mediacore:local
     restart: unless-stopped
-    # No depends_on: the demo app never talks to the SFU. It signs tokens the
+    # No depends_on: the front end never talks to the SFU. It signs tokens the
     # SFU verifies later, and the browser is what connects the two.
     env_file:
       - .env
@@ -68,10 +68,10 @@ services:
       # What the browser is told to connect to. Same origin as the page, so the
       # certificate the visitor accepted for the page also covers the WebSocket.
       # A scheme or a slash in MEDIACORE_PUBLIC_HOST makes this an unusable url
-      # and the demo app refuses to start, naming the variable.
-      MEDIACORE_DEMO_WS_URL: wss://${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
-      MEDIACORE_DEMO_PORT: "8080"
-    command: ["/usr/local/bin/mediacore-demo"]
+      # and the front end refuses to start, naming the variable.
+      MEDIACORE_FRONT_WS_URL: wss://${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
+      MEDIACORE_FRONT_PORT: "8080"
+    command: ["/usr/local/bin/mediacore-front"]
     expose:
       - "8080"
     healthcheck:
@@ -88,7 +88,7 @@ services:
     # first half minute while the two upstreams are still starting, which reads
     # exactly like a broken deployment to whoever opens the URL.
     depends_on:
-      demo:
+      front:
         condition: service_healthy
       sfu:
         condition: service_healthy

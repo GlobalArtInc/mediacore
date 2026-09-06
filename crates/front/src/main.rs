@@ -1,14 +1,15 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::Context as _;
-use mediacore_demo::{Config, http};
+use mediacore_front::{Config, http};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let config = Config::from_env().context("the demo cannot start without its environment")?;
+    let config =
+        Config::from_env().context("the front end cannot start without its environment")?;
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port));
     let room = config.room.clone();
     let ws_url = config.ws_url.clone();
@@ -17,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
 
-    tracing::info!(%addr, %room, %ws_url, "mediacore-demo is listening");
+    tracing::info!(%addr, %room, %ws_url, "mediacore-front is listening");
     axum::serve(listener, http::router(config))
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -26,8 +27,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mediacore_demo=info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("mediacore_front=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

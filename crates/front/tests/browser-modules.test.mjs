@@ -1,8 +1,8 @@
 /**
  * What the page's own modules do, driven without a browser.
  *
- * `node --test crates/demo/tests/browser-modules.test.mjs`, or through
- * `cargo test -p mediacore-demo`, which runs this file for you.
+ * `node --test crates/front/tests/browser-modules.test.mjs`, or through
+ * `cargo test -p mediacore-front`, which runs this file for you.
  *
  * The Rust tests either side of this one prove the artefacts are served and the
  * policy still forbids what it should. Those are statements about bytes. These
@@ -40,9 +40,11 @@ const {
   afterRequest,
   SHARE_GRACE_MS,
   fullscreenPlan,
+  nextFocus,
   nextShare,
   shareBadge,
   sizeChange,
+  stagePlan,
 } = await import(`file://${assetPath("stage.js")}`);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 
@@ -1432,6 +1434,198 @@ describe("the shared screen stays the main view, and says whose it is when it go
     const step = nextShare(null, [], after(1));
     assert.equal(step.outcome, "none");
     assert.equal(step.gone, null, "an audio-only room announced a share that never existed");
+  });
+});
+
+describe("the tile somebody pressed fills the stage, and the rest go to a strip", () => {
+  const alice = { key: "alice" };
+  const bob = { key: "bob" };
+  const carol = { key: "carol" };
+  const room = [alice, bob, carol];
+  const screen = { key: "sid-screen" };
+  const live = { link: "connected", fullscreen: false };
+
+  const middle = (key) => ({ kind: "person", key });
+
+  it("leaves a room nobody has pressed exactly as it was", () => {
+    assert.equal(
+      stagePlan(null, null, room, live).mode,
+      "grid",
+      "an even grid of people is no longer what a room with nothing shared and nothing pressed " +
+        "lays out, which is every room until somebody asks for something else",
+    );
+    assert.equal(
+      stagePlan(null, screen, room, live).mode,
+      "share",
+      "a shared screen no longer takes the stage on its own, so somebody sharing has to ask a " +
+        "second time to be looked at",
+    );
+    assert.equal(stagePlan(null, screen, room, live).main, null);
+  });
+
+  it("puts the one pressed in the middle and everybody else in the strip", () => {
+    const plan = stagePlan(middle("bob"), null, room, live);
+
+    assert.equal(plan.mode, "focus");
+    assert.deepEqual(plan.main, { kind: "person", key: "bob" });
+    assert.deepEqual(
+      plan.strip.map((slot) => slot.key),
+      ["alice", "carol"],
+      "the strip is not the rest of the room, so pressing one person either hid the others or " +
+        "showed them twice",
+    );
+  });
+
+  it("keeps the middle whatever order the room comes back in", () => {
+    for (const order of [room, [carol, bob, alice], [bob, carol, alice]]) {
+      const plan = stagePlan(middle("bob"), null, order, live);
+      assert.deepEqual(
+        plan.main,
+        { kind: "person", key: "bob" },
+        "a re-render moved the middle to somebody else, which is the page taking the view back " +
+          "from the person who chose it",
+      );
+    }
+  });
+
+  it("sends a screen that starts to the strip rather than over the top", () => {
+    const plan = stagePlan(middle("bob"), screen, room, live);
+
+    assert.deepEqual(plan.main, { kind: "person", key: "bob" });
+    assert.deepEqual(
+      plan.strip[0],
+      { kind: "share", key: null },
+      "somebody started sharing and the screen went nowhere at all, so the room can see it and " +
+        "this viewer cannot",
+    );
+    assert.deepEqual(
+      plan.strip.map((slot) => slot.key),
+      [null, "alice", "carol"],
+      "the screen displaced somebody from the strip instead of joining it",
+    );
+  });
+
+  it("lets go of somebody who has left, and puts the room back as it was", () => {
+    const plan = stagePlan(middle("bob"), null, [alice, carol], live);
+    assert.equal(plan.focus, null, "the stage is still holding the middle for somebody who left");
+    assert.equal(
+      plan.mode,
+      "grid",
+      "the person in the middle left and the stage kept their empty half of the screen",
+    );
+  });
+
+  it("puts the screen back in the middle when the person in it leaves", () => {
+    const plan = stagePlan(middle("bob"), screen, [alice, carol], live);
+    assert.equal(plan.focus, null);
+    assert.equal(
+      plan.mode,
+      "share",
+      "the screen that was in the strip was dropped along with the person who displaced it",
+    );
+  });
+
+  it("holds the middle while the room is not there to say anybody has gone", () => {
+    const plan = stagePlan(middle("bob"), null, [alice], { link: "waiting", fullscreen: false });
+    assert.deepEqual(
+      plan.focus,
+      { kind: "person", key: "bob" },
+      "a reconnect drops every remote participant, and reading that as everyone leaving would " +
+        "throw the viewer back to a grid they will have to rebuild by hand",
+    );
+  });
+
+  it("lets go once the room that ended has ended", () => {
+    const plan = stagePlan(middle("bob"), null, [alice], { link: "gone", fullscreen: false });
+    assert.equal(plan.focus, null, "a room that ended is still holding somebody in the middle");
+  });
+
+  it("holds a screen in the middle across the publisher swapping what they share", () => {
+    const swapped = { key: "sid-screen-2" };
+    const held = { kind: "share", key: null };
+
+    const plan = stagePlan(held, swapped, room, live);
+    assert.deepEqual(
+      plan.main,
+      held,
+      "the middle is keyed to a track, so a publisher going from a window to a whole screen " +
+        "drops the viewer back to the grid for the most ordinary thing a sharer does",
+    );
+    assert.deepEqual(
+      plan.strip.map((slot) => slot.key),
+      ["alice", "bob", "carol"],
+      "the room is not in the strip beside the screen it is watching",
+    );
+  });
+
+  it("lets go of a screen that ended, and shows the room again", () => {
+    const plan = stagePlan({ kind: "share", key: null }, null, room, live);
+    assert.equal(plan.focus, null);
+    assert.equal(
+      plan.mode,
+      "grid",
+      "the screen ended and the stage kept a middle with nothing in it",
+    );
+  });
+
+  it("hands the stage to fullscreen without forgetting what was in the middle", () => {
+    const plan = stagePlan(middle("bob"), screen, room, { link: "connected", fullscreen: true });
+
+    assert.equal(
+      plan.mode,
+      "share",
+      "the roster, the tiles and the strip are all behind a fullscreen picture, so a person in " +
+        "the middle under it is in the middle of nothing anybody can see",
+    );
+    assert.equal(plan.main, null, "fullscreen asked the page to move a tile it has hidden");
+    assert.deepEqual(
+      plan.focus,
+      { kind: "person", key: "bob" },
+      "leaving fullscreen drops the viewer somewhere they never asked to be",
+    );
+  });
+
+  it("has something to put in the middle in a room where nobody has a camera", () => {
+    const plan = stagePlan(middle("alice"), null, [alice, bob], live);
+    assert.deepEqual(
+      plan.main,
+      { kind: "person", key: "alice" },
+      "an audio-only room cannot put anybody in the middle, so the one thing it has to look " +
+        "at -- a name -- is the one thing that cannot be looked at",
+    );
+  });
+});
+
+describe("pressing a tile chooses it, and pressing it again lets it go", () => {
+  it("takes the tile that was pressed", () => {
+    assert.deepEqual(nextFocus(null, { kind: "person", key: "bob" }), {
+      kind: "person",
+      key: "bob",
+    });
+  });
+
+  it("lets go when the one already in the middle is pressed again", () => {
+    assert.equal(
+      nextFocus({ kind: "person", key: "bob" }, { kind: "person", key: "bob" }),
+      null,
+      "pressing the tile in the middle a second time does nothing, which leaves a phone with " +
+        "no Escape key no way back to the grid at all",
+    );
+  });
+
+  it("moves to another tile rather than letting go of both", () => {
+    assert.deepEqual(nextFocus({ kind: "person", key: "bob" }, { kind: "person", key: "alice" }), {
+      kind: "person",
+      key: "alice",
+    });
+  });
+
+  it("tells the shared screen from a person of the same name", () => {
+    assert.deepEqual(nextFocus({ kind: "person", key: "share" }, { kind: "share", key: null }), {
+      kind: "share",
+      key: null,
+    });
+    assert.equal(nextFocus({ kind: "share", key: null }, { kind: "share", key: "sid-2" }), null);
   });
 });
 

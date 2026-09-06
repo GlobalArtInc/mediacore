@@ -1,16 +1,16 @@
 [package]
-name = "mediacore-demo"
+name = "mediacore-front"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "mediacore_demo"
+name = "mediacore_front"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mediacore-demo"
+name = "mediacore-front"
 path = "src/main.rs"
 
 [dependencies]

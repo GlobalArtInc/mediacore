@@ -20,7 +20,7 @@ done
 : "${MEDIACORE_LOG_LEVEL:=info}"
 export MEDIACORE_LOG_LEVEL
 
-# A secret shorter than this is refused by the demo app, so refuse it here too
+# A secret shorter than this is refused by the front end, so refuse it here too
 # rather than let the two halves disagree about which tokens are valid.
 if [ "${#MEDIACORE_API_SECRET}" -lt 32 ]; then
 	fail "MEDIACORE_API_SECRET is shorter than 32 characters"

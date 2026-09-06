@@ -1,8 +1,9 @@
 /**
  * The stage's own decisions, kept out of the DOM so `node --test` can argue
- * with them: which share the stage is holding, whether this browser will hand
- * the page fullscreen at all, and what may honestly be printed in the corner of
- * a shared screen.
+ * with them: which share the stage is holding, which tile somebody pressed and
+ * what that pushes to the side, whether this browser will hand the page
+ * fullscreen at all, and what may honestly be printed in the corner of a shared
+ * screen.
  *
  * Nothing here imports anything, on purpose: the behaviour suite loads this
  * file straight off disk, where the page's absolute `/module.js` paths do not
@@ -135,6 +136,93 @@ function waitingOn(held, since, waitFor) {
 
 function over(outcome, gone) {
   return { pinned: null, key: null, entry: null, outcome, gone, waitFor: null };
+}
+
+/**
+ * Pressing a tile. Pressing the one that is already in the middle takes it out
+ * again, which is the only way back to the grid on a phone, where there is no
+ * Escape key to press.
+ *
+ * A share is focused as "the share" and never as a track: `nextShare` above has
+ * already decided which screen the stage is holding, and a publisher swapping a
+ * window mints a new track. Keyed by track, that swap would drop the viewer
+ * back to the grid for the most ordinary thing a sharer does.
+ */
+export function nextFocus(focus, target) {
+  if (!target || typeof target.kind !== "string") return null;
+  const key = target.kind === "share" ? null : target.key || null;
+  if (focus && focus.kind === target.kind && focus.key === key) return null;
+  return { kind: target.kind, key };
+}
+
+/**
+ * What fills the stage, and what has been pushed to the side for it.
+ *
+ * Three layouts, and only the third is new. `grid` and `share` are what the
+ * page did before anybody could press a tile -- an even grid of people, or a
+ * shared screen with the room beneath it -- and they are reached by exactly the
+ * conditions they always were, so a room where nobody presses anything looks
+ * and behaves as it did. `focus` is the one somebody asked for: `main` fills
+ * the stage and `strip` is everything else, in the order it goes there.
+ *
+ * `main` is set in `focus` and nowhere else. The other two layouts have a main
+ * view in the ordinary sense of the words, but it is not a thing this function
+ * moves, so saying so here would be inviting the page to move it.
+ *
+ * A share never leaves the stage for a focus. Somebody sharing is asking the
+ * room to look at one thing, and a viewer who wants to look at a face instead
+ * is not asking for the screen to be thrown away -- it goes to the strip, where
+ * one press brings it back.
+ *
+ * `share` is whatever the stage is holding, or null, and only whether there is
+ * one is read here. Which screen it is was settled by `nextShare` above, and
+ * asking that question twice is how the two answers come apart.
+ */
+export function stagePlan(focus, share, people, world) {
+  const roster = Array.isArray(people) ? people : [];
+  const link = (world && world.link) || "connected";
+  const held = stillThere(focus, share, roster, link);
+
+  // Fullscreen is the shared screen's whole claim on the stage, and it outranks
+  // anybody's: the roster, the tiles and the strip are all behind it, so a
+  // person in the middle underneath is in the middle of nothing anyone can see.
+  // The focus is held rather than dropped, so leaving fullscreen puts the
+  // viewer back where they were instead of somewhere they never asked for.
+  if (world && world.fullscreen && share) {
+    return { focus: held, mode: "share", main: null, strip: [] };
+  }
+
+  if (!held) {
+    return { focus: null, mode: share ? "share" : "grid", main: null, strip: [] };
+  }
+
+  const strip = [];
+  if (held.kind !== "share" && share) strip.push({ kind: "share", key: null });
+  for (const person of roster) {
+    if (held.kind === "person" && person.key === held.key) continue;
+    strip.push({ kind: "person", key: person.key });
+  }
+
+  return { focus: held, mode: "focus", main: { ...held }, strip };
+}
+
+/**
+ * Whether what the viewer chose is still on the stage to be chosen.
+ *
+ * A room that is reconnecting has dropped every remote participant without
+ * saying a word about any of them, which is the same absence of news that makes
+ * `nextShare` wait. There is nothing to show meanwhile -- the tiles went with
+ * the participants -- so the choice is simply held until the room is in a
+ * position to say the person has gone, and the strip comes back with them.
+ */
+function stillThere(focus, share, roster, link) {
+  if (!focus) return null;
+  if (focus.kind === "share") return share ? { kind: "share", key: null } : null;
+  if (roster.some((person) => person.key === focus.key)) {
+    return { kind: "person", key: focus.key };
+  }
+  if (link === "connected" || link === "gone") return null;
+  return { kind: "person", key: focus.key };
 }
 
 export function resolutionOf(reading) {

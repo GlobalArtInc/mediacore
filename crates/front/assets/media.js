@@ -1,5 +1,5 @@
 /**
- * The capture side of the demo page: the microphone, the browser's own audio
+ * The capture side of the page: the microphone, the browser's own audio
  * processing, the choice of input device, and the screen share.
  *
  * Nothing in here draws anything. The interface calls these functions and reads
@@ -103,7 +103,7 @@ export const NOISE_ENGINES = Object.freeze([NOISE_OFF, NOISE_BROWSER, NOISE_MEDI
 
 /**
  * The capture defaults. These match what livekit-client would apply on its own,
- * so leaving them alone changes nothing about how the demo has always sounded.
+ * so leaving them alone changes nothing about how the page has always sounded.
  */
 export const DEFAULT_PROCESSING = Object.freeze({
   echoCancellation: true,
@@ -1058,8 +1058,8 @@ function publishMessage(what, error) {
   const detail = message(error);
   if (/not.?allowed|permission/i.test(detail)) {
     return (
-      `The server refused the ${what}: this token does not grant that source. The demo mints ` +
-      "its own tokens, so the grant is in the demo server, not in the browser."
+      `The server refused the ${what}: this token does not grant that source. The front end ` +
+      "mints its own tokens, so the grant is in the front end, not in the browser."
     );
   }
   return `The ${what} could not be published: ${detail}.`;

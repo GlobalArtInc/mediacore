@@ -23,7 +23,7 @@ fn the_pages_own_modules_do_what_they_say() {
         Ok(child) => child,
         Err(error) => panic!(
             "node could not be run ({error}), and the page's javascript is not covered without \
-             it. Install node, or run `node --test crates/demo/{SUITE}` yourself."
+             it. Install node, or run `node --test crates/front/{SUITE}` yourself."
         ),
     };
 

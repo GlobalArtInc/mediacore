@@ -19,9 +19,9 @@ RUN cargo chef cook --release --recipe-path /recipe.json
 COPY . .
 # The protobufs under crates/proto/protobufs are compiled in process by protox,
 # so no protoc is installed here.
-RUN cargo build --release -p mediacore-server -p mediacore-demo \
+RUN cargo build --release -p mediacore-server -p mediacore-front \
     && mkdir -p /out \
-    && cp target/release/mediacore target/release/mediacore-demo /out/
+    && cp target/release/mediacore target/release/mediacore-front /out/
 
 FROM debian:bookworm-slim AS runtime
 # gettext-base is envsubst, used by deploy/start-sfu.sh to render the config;
@@ -30,9 +30,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gettext-base \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home --uid 10001 mediacore
-COPY --from=builder /out/mediacore /out/mediacore-demo /usr/local/bin/
+COPY --from=builder /out/mediacore /out/mediacore-front /usr/local/bin/
 USER mediacore
 WORKDIR /home/mediacore
-# 7880 signalling, 8080 demo app, 7882/udp media.
+# 7880 signalling, 8080 front end, 7882/udp media.
 EXPOSE 7880 8080 7882/udp
 CMD ["/usr/local/bin/mediacore"]

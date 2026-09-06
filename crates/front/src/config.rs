@@ -6,9 +6,9 @@ use crate::name::{RoomError, clean_room};
 
 pub const API_KEY: &str = "MEDIACORE_API_KEY";
 pub const API_SECRET: &str = "MEDIACORE_API_SECRET";
-pub const WS_URL: &str = "MEDIACORE_DEMO_WS_URL";
-pub const ROOM: &str = "MEDIACORE_DEMO_ROOM";
-pub const PORT: &str = "MEDIACORE_DEMO_PORT";
+pub const WS_URL: &str = "MEDIACORE_FRONT_WS_URL";
+pub const ROOM: &str = "MEDIACORE_FRONT_ROOM";
+pub const PORT: &str = "MEDIACORE_FRONT_PORT";
 
 pub const DEFAULT_ROOM: &str = "demo";
 pub const DEFAULT_PORT: u16 = 8080;

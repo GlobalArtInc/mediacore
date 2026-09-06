@@ -1,14 +1,15 @@
 # Deploying mediacore
 
 Three containers, one host, one URL. Someone opens it, types a name, and hears
-everyone else in the room. Audio only; the demo never asks for a camera.
+everyone else in the room. Audio by default; the camera stays off unless
+somebody ticks the box in the lobby.
 
 ```
                               the host
         ┌──────────────────────────────────────────────────┐
         │  caddy   80/tcp, 443/tcp   terminates TLS        │
-        │    ├── /rtc*  ──►  sfu  :7880   signalling       │
-        │    └── /      ──►  demo :8080   page, /api/token │
+        │    ├── /rtc*  ──► sfu   :7880   signalling       │
+        │    └── /      ──► front :8080   page, /api/token │
         │                                                  │
         │  sfu     7882/udp          media, not proxied    │
         └──────────────────────────────────────────────────┘
@@ -70,12 +71,12 @@ their own. `docker compose up -d --build` again after changing any code. Every
 variable is explained in `.env.example`, including what breaks when it is
 missing.
 
-Everyone who opens the URL lands in `MEDIACORE_DEMO_ROOM`. Adding `?room=standup`
-to the link puts that visitor in `demo.standup` instead; rooms are created on
-demand and disappear when the last person leaves. The prefix is not decoration:
-the demo mints tokens without asking anyone who they are, so it is confined to
-`MEDIACORE_DEMO_ROOM` and the namespace hanging off it, and cannot issue a token
-for a room named anything else on the same SFU.
+Everyone who opens the URL lands in `MEDIACORE_FRONT_ROOM`. Adding
+`?room=standup` to the link puts that visitor in `demo.standup` instead; rooms
+are created on demand and disappear when the last person leaves. The prefix is
+not decoration: the front end mints tokens without asking anyone who they are,
+so it is confined to `MEDIACORE_FRONT_ROOM` and the namespace hanging off it,
+and cannot issue a token for a room named anything else on the same SFU.
 
 Ports the host must accept:
 
@@ -88,12 +89,12 @@ Ports the host must accept:
 On a cloud host that means a security group rule for **UDP** 7882. A TCP rule
 for that port does nothing at all.
 
-Nothing else is fetched. The browser SDK is compiled into the demo binary and
+Nothing else is fetched. The browser SDK is compiled into the front end and
 served from the same origin as the page, so a host with no route to the
 internet still works, and the page's content security policy (`default-src
 'none'`, `script-src 'self'`) forbids third-party scripts outright. The only
 cross-origin thing the page is permitted to open is the signalling WebSocket at
-`MEDIACORE_DEMO_WS_URL`, which is this same origin anyway.
+`MEDIACORE_FRONT_WS_URL`, which is this same origin anyway.
 
 ## TLS without a domain
 
@@ -224,9 +225,9 @@ above it: for a public VPS, `<ip>.sslip.io` replaces all of it with nothing.
 ## Check that it works
 
 ```
-curl -k https://$MEDIACORE_PUBLIC_HOST/healthz     # -> ok      (the demo app)
+curl -k https://$MEDIACORE_PUBLIC_HOST/healthz     # -> ok      (the front end)
 curl -s 127.0.0.1:7880/healthz                     # -> counters (the SFU, host only)
-docker compose ps                                  # three services, sfu and demo healthy
+docker compose ps                                  # three services, sfu and front healthy
 ```
 
 That first line is the TLS check as well as the health check. `curl` sends no
@@ -255,11 +256,11 @@ can the browser send a UDP packet there? Ignore the `ice socket bound` line just
 above it, which reports the socket's own view (`advertise=[0.0.0.0:7882]`) and
 not what clients are told.
 
-And the demo container prints the URL it will hand to browsers:
+And the front end's container prints the URL it will hand to browsers:
 
 ```
-docker compose logs demo | grep listening
-... mediacore-demo is listening addr=0.0.0.0:8080 room=demo ws_url=wss://meet.example.com
+docker compose logs front | grep listening
+... mediacore-front is listening addr=0.0.0.0:8080 room=demo ws_url=wss://meet.example.com
 ```
 
 Then the real test, which needs two people or two devices — one browser talking
@@ -430,14 +431,14 @@ decides.
   service deliberately does not read `.env` — it is given only the two variables
   it uses, so the signing secret is never in its environment.
 - **The browser SDK is vendored**, not fetched. It lives in
-  `crates/demo/assets/vendor/`, is compiled into `mediacore-demo` and is served
-  from this origin under a version-stamped path, so there is no CDN in the
-  runtime path and no third-party script for the content security policy to
+  `crates/front/assets/vendor/`, is compiled into `mediacore-front` and is
+  served from this origin under a version-stamped path, so there is no CDN in
+  the runtime path and no third-party script for the content security policy to
   allow. See that directory's README to move to another version.
 - **What this is not.** One node, no TURN, no recording, no room management API,
   and a room that anyone with the URL can join under any name. The token
   endpoint is unauthenticated, which is why it is confined to
-  `MEDIACORE_DEMO_ROOM` and the namespace below it: put the demo on an SFU that
-  is also serving something real and the demo still cannot reach that
-  something's rooms. It is a demo you can put in front of people, not a service
-  to run a business on.
+  `MEDIACORE_FRONT_ROOM` and the namespace below it: put the front end on an SFU
+  that is also serving something real and it still cannot reach that something's
+  rooms. It is a stack you can put in front of people, not a service to run a
+  business on.

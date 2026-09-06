@@ -339,7 +339,7 @@ async fn token(
     };
 
     let token = mediacore_auth::issue(&config.api_secret, &claims)?;
-    tracing::info!(%identity, %room, "issued a demo token");
+    tracing::info!(%identity, %room, "issued a token");
 
     Ok(Json(TokenResponse {
         url: config.ws_url.clone(),

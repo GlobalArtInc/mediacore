@@ -2,7 +2,7 @@
 # Checks MEDIACORE_PUBLIC_HOST before Caddy ever reads it, then hands over.
 #
 # The variable is pasted into two places that want two different shapes: the
-# Caddy site address (a host, optionally with a port) and, in the demo
+# Caddy site address (a host, optionally with a port) and, in the front end's
 # container, `wss://<this>`. A scheme or a trailing slash is accepted by both
 # and corrupts both, so it is refused here with the reason.
 set -eu

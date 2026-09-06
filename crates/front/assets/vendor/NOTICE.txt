@@ -1,6 +1,6 @@
-Third-party notices for the browser assets mediacore-demo serves.
+Third-party notices for the browser assets mediacore-front serves.
 
-Everything under crates/demo/assets/vendor is compiled into the demo binary and
+Everything under crates/front/assets/vendor is compiled into the front end and
 served from its own origin, so this file is compiled in and served with them, at
 /NOTICE.txt. It is a condition of two of the licences below, not a courtesy.
 

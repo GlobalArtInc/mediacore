@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>mediacore demo</title>
+    <title>mediacore</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
@@ -70,6 +70,17 @@
         <path d="M20 15h-5v5" />
         <path d="M4 15h5v5" />
       </symbol>
+      <symbol id="icon-middle" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="11" height="14" rx="2" />
+        <rect x="16" y="5" width="5" height="6" rx="1.5" />
+        <rect x="16" y="13" width="5" height="6" rx="1.5" />
+      </symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="8" height="7" rx="1.5" />
+        <rect x="13" y="4" width="8" height="7" rx="1.5" />
+        <rect x="3" y="13" width="8" height="7" rx="1.5" />
+        <rect x="13" y="13" width="8" height="7" rx="1.5" />
+      </symbol>
     </svg>
 
     <main class="page">
@@ -134,39 +145,55 @@
         </aside>
 
         <div class="main">
-          <div class="stage">
-            <section id="share" class="share" aria-label="Shared screen" hidden>
-              <div class="share-view">
-                <div id="share-frame" class="share-frame"></div>
-                <p id="share-stats" class="share-stats" hidden></p>
-                <button
-                  id="share-fullscreen"
-                  class="share-full"
-                  type="button"
-                  aria-pressed="false"
-                  aria-label="Show the shared screen fullscreen"
-                >
-                  <svg class="icon" aria-hidden="true"><use href="#icon-expand" /></svg>
-                  <span id="share-fullscreen-label">Fullscreen</span>
-                </button>
-              </div>
-              <div class="share-foot">
-                <p id="share-who" class="share-who"></p>
-                <div id="share-live" class="share-live" hidden>
-                  <span id="share-state" class="pill">connecting</span>
-                  <p id="share-speaking" class="share-speaking"></p>
-                </div>
-                <div
-                  id="share-tabs"
-                  class="share-tabs"
-                  role="group"
-                  aria-label="Screens being shared"
-                  hidden
-                ></div>
-              </div>
-            </section>
+          <div id="stage" class="stage" data-layout="grid" data-main="none">
+            <ul id="spotlight" class="spotlight" aria-label="In the middle" hidden></ul>
 
-            <ul id="cards" class="cards"></ul>
+            <div class="reel">
+              <section id="share" class="share" aria-label="Shared screen" hidden>
+                <div class="share-view">
+                  <div id="share-frame" class="share-frame"></div>
+                  <p id="share-stats" class="share-stats" hidden></p>
+                  <div class="share-acts">
+                    <button
+                      id="share-focus"
+                      class="share-act"
+                      type="button"
+                      aria-pressed="false"
+                      aria-label="Focus the shared screen"
+                    >
+                      <svg class="icon" aria-hidden="true"><use href="#icon-middle" /></svg>
+                      <span class="act-label" id="share-focus-label">Focus</span>
+                    </button>
+                    <button
+                      id="share-fullscreen"
+                      class="share-act"
+                      type="button"
+                      aria-pressed="false"
+                      aria-label="Show the shared screen fullscreen"
+                    >
+                      <svg class="icon" aria-hidden="true"><use href="#icon-expand" /></svg>
+                      <span class="act-label" id="share-fullscreen-label">Fullscreen</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="share-foot">
+                  <p id="share-who" class="share-who"></p>
+                  <div id="share-live" class="share-live" hidden>
+                    <span id="share-state" class="pill">connecting</span>
+                    <p id="share-speaking" class="share-speaking"></p>
+                  </div>
+                  <div
+                    id="share-tabs"
+                    class="share-tabs"
+                    role="group"
+                    aria-label="Screens being shared"
+                    hidden
+                  ></div>
+                </div>
+              </section>
+
+              <ul id="cards" class="cards"></ul>
+            </div>
 
             <section id="bench" class="bench" aria-label="Bandwidth bench" hidden>
               <h2 class="bench-head">Bandwidth bench</h2>
