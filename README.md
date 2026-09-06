@@ -240,6 +240,20 @@ carry padding — the first video subscription restarts the estimator, which is 
 per transport and not again every time a camera is republished. The
 flag stays off by default until the constrained-link bench in the M5 design has been run.
 
+Two more, found by verification and left deliberately. The fifteen percent of headroom an upgrade
+must clear is inert on the ordinary path: a track remembers the highest rung it has ever been
+granted, and that memory is seeded at construction from the rung the forwarder sends before the first
+allocation tick, which is the top one, so the carve-out meant for restoring a rung after a dip applies
+to every climb. Making the seed honest reintroduces the defect it was written to fix, because the wish
+handed to str0m's prober is the ladder itself: on a link worth exactly the top rung's price a
+multiplicative margin over that price is unreachable, since the estimate never exceeds what we send.
+The way out is to probe above the ladder rather than at it, which is what probing is for, and it is a
+change to make deliberately, with the four allocator tests that encode the present premise rewritten
+alongside it. Second, only a backlog in the send queue starts a verdict; the estimate and the loss
+ratio size cuts and decline to certify that a cut worked, but neither can originate one. That is the
+intended rule, and its cost is that a bottleneck which drops rather than queues is detected later than
+one that queues.
+
 `JoinResponse.subscriber_primary` stays `false`. The subscriber transport is created lazily, so a
 client that treats it as the primary connection and waits for it before reporting itself connected
 would wait until it has something to receive. Turning it on means offering the subscriber transport
