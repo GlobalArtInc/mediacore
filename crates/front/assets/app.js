@@ -14,7 +14,20 @@ import {
   formatPercent,
   write,
 } from "/readout.js";
-import { createMedia } from "/media.js";
+import {
+  DEFAULT_NOISE_ENGINE,
+  DIRECT_PROCESSING_KEYS,
+  NOISE_ENGINES,
+  createMedia,
+} from "/media.js";
+import {
+  MICROPHONE_GONE,
+  NOTHING_REMEMBERED,
+  chooseMicrophone,
+  readPrefs,
+  storageOf,
+  writePrefs,
+} from "/prefs.js";
 import { createDenoiser } from "/denoise.js";
 import {
   afterRefusal,
@@ -79,16 +92,17 @@ const NOISE_ROWS = [
     short: "browser",
     note:
       "getUserMedia's noiseSuppression, plus voiceIsolation where Chrome offers it. A light " +
-      "attenuator for steady noise, and what this page has always used.",
+      "attenuator for steady noise, and where this page lands whenever ours cannot run.",
   },
   {
     engine: "mediacore",
     label: "mediacore (RNNoise)",
     short: "mediacore",
     note:
-      "RNNoise, running in this page as WebAssembly between the microphone and the encoder. " +
-      "Steady noise -- fans, hiss, traffic -- comes out further down than the browser manages. " +
-      "It does not remove other people's voices, and it treats music as noise.",
+      "RNNoise, running in this page as WebAssembly between the microphone and the encoder, and " +
+      "what a call starts on unless you choose otherwise. Steady noise -- fans, hiss, traffic -- " +
+      "comes out further down than the browser manages. It does not remove other people's " +
+      "voices, and it treats music as noise.",
   },
 ];
 
@@ -184,6 +198,24 @@ const query = new URLSearchParams(location.search);
 const requestedRoom = query.get("room");
 const wantsSimulcast = query.get("simulcast") !== "0";
 
+/**
+ * What this browser is allowed to remember, and where. The offer travels with
+ * the read because a stored value is only worth restoring while it is still one
+ * of the choices this page makes -- see `prefs.js`.
+ */
+const store = storageOf(globalThis);
+const ON_OFFER = { engines: NOISE_ENGINES, processing: DIRECT_PROCESSING_KEYS };
+
+let prefs = NOTHING_REMEMBERED;
+let storageComplained = false;
+
+/**
+ * Something the page worked out before anybody joined. The notice slot is
+ * inside the room, so a sentence shown at load is painted into a panel nobody
+ * is looking at and has timed out by the time they are.
+ */
+let arrivalNotice = null;
+
 let lk = null;
 let media = null;
 let settings = {
@@ -227,7 +259,13 @@ start();
 
 async function start() {
   tiles = createTiles(el.tiles);
-  el.withVideo.checked = query.get("video") === "1";
+  prefs = readPrefs(store, ON_OFFER);
+
+  // A link that names the camera is an instruction for this visit and outranks
+  // what the box was left at last time; `?video=0` is such an instruction too.
+  el.withVideo.checked = query.has("video")
+    ? query.get("video") === "1"
+    : prefs.camera === true;
   showBench = query.get("bench") === "1";
 
   el.form.addEventListener("submit", onJoin);
@@ -266,6 +304,9 @@ async function start() {
   settings = await loadSettings();
   el.lobbyRoom.textContent = roomLabel();
   el.name.maxLength = settings.maxNameLength;
+  // `maxLength` only binds what a person types, so a longer name out of storage
+  // would sit in the field and be refused by the server on submit.
+  if (prefs.name) el.name.value = prefs.name.slice(0, settings.maxNameLength);
   el.footUrl.textContent = settings.wsUrl;
 
   if (!window.isSecureContext || !navigator.mediaDevices) {
@@ -311,8 +352,63 @@ async function start() {
   ready();
 
   // Asked once, before anyone is offered the choice: a machine that cannot run
-  // the denoiser is never shown a switch that would silently do nothing.
-  media.prepareDenoiser().then(paintControls);
+  // the denoiser is never shown a switch that would silently do nothing. What
+  // this browser remembered is applied on the far side of that answer, so a
+  // remembered engine meets the same probe a chosen one does -- and there is
+  // one probe rather than two racing each other for the same wasm.
+  media.prepareDenoiser().then(restoreChoices).then(paintControls);
+}
+
+/**
+ * The choices this browser made last time, put back through the same calls the
+ * controls make. A remembered suppressor is not treated as truer than a chosen
+ * one: it meets the same probe, the same attach and the same fallbacks, so a
+ * machine that cannot run ours lands on the browser's own here exactly as it
+ * would have if somebody had pressed the row by hand.
+ *
+ * Nothing here is awaited by the lobby. The form is usable while it runs, and
+ * everything it touches is a capture setting that is applied at the moment the
+ * microphone opens.
+ */
+async function restoreChoices() {
+  if (!media) return;
+
+  if (prefs.noise) await media.setNoiseEngine(prefs.noise);
+  if (prefs.processing) await media.setProcessing(prefs.processing);
+  await restoreMicrophone();
+
+  paintDevices();
+}
+
+/**
+ * A remembered device id is only asked for when the browser will say whether it
+ * is still there. Until the microphone has been granted once every entry comes
+ * back with a blank id and the list cannot answer at all, so the id is asked
+ * for anyway and the capture module catches it if the device is gone: it drops
+ * the device from the request, opens the default and says so.
+ */
+async function restoreMicrophone() {
+  const devices = await media.listMicrophones();
+  const choice = chooseMicrophone(prefs.microphone, devices.list);
+
+  if (choice.outcome === "gone") {
+    arrivalNotice = MICROPHONE_GONE;
+    return;
+  }
+  if (choice.deviceId) await media.selectMicrophone(choice.deviceId);
+}
+
+/**
+ * Keep the whole blob, and say once per load when this browser will not have
+ * it. Silence there would leave a page promising to remember something it is
+ * quietly dropping every time.
+ */
+function remember(patch) {
+  prefs = { ...prefs, ...patch };
+  const written = writePrefs(store, prefs);
+  if (written.saved || storageComplained) return;
+  storageComplained = true;
+  showNotice(written.reason);
 }
 
 function ready() {
@@ -352,6 +448,7 @@ async function onJoin(event) {
   }
 
   const withVideo = el.withVideo.checked;
+  remember({ name, camera: withVideo });
   busy(true, "Asking for the microphone...");
 
   const opened = await media.openMicrophone();
@@ -454,6 +551,10 @@ function enterRoom(credentials) {
   paintControls();
   paintDevices();
   render();
+  if (arrivalNotice) {
+    showNotice(arrivalNotice);
+    arrivalNotice = null;
+  }
   el.mute.focus();
 }
 
@@ -610,6 +711,7 @@ async function applyProcessing(key) {
   const wanted = !media.state().processing[key];
   const result = await media.setProcessing({ [key]: wanted });
   const label = PROCESSING_ROWS.find((row) => row.key === key).label;
+  remember({ processing: media.state().processing });
 
   if (result.applied) {
     showNotice(`${label} is now ${wanted ? "on" : "off"}.`);
@@ -644,6 +746,12 @@ async function applyNoiseEngine(engine) {
   if (!media || pending.noise) return;
   hide(el.roomError);
 
+  // What is remembered is what a person chose, not where a fallback put them.
+  // The overload watch pulling our node out is a measurement of this machine at
+  // this moment; writing that down as the choice would quietly answer the
+  // question on their behalf every time they reloaded.
+  remember({ noise: engine });
+
   pending.noise = true;
   paintControls();
   const result = await media.setNoiseEngine(engine);
@@ -676,6 +784,7 @@ async function onSelectMicrophone() {
   hide(el.roomError);
 
   const chosen = el.micSelect.value;
+  remember({ microphone: chosen === SYSTEM_DEFAULT ? null : chosen });
   const result = await media.selectMicrophone(chosen === SYSTEM_DEFAULT ? null : chosen);
 
   if (result.applied) {
@@ -1926,7 +2035,7 @@ function paintControls() {
  * it.
  */
 function paintNoise(state) {
-  const engine = state ? state.noise.engine : "browser";
+  const engine = state ? state.noise.engine : DEFAULT_NOISE_ENGINE;
   const row = NOISE_ROWS.find((entry) => entry.engine === engine);
   const held = Boolean(state && state.microphone.pendingWhileMuted);
   const pendingRow = state && state.noise.pending
@@ -2029,7 +2138,7 @@ function buildNoiseChoices() {
 }
 
 function paintNoiseChoices(state) {
-  const engine = state ? state.noise.engine : "browser";
+  const engine = state ? state.noise.engine : DEFAULT_NOISE_ENGINE;
   const open = Boolean(state && state.microphone.open);
   const available = state ? state.noise.available : null;
 

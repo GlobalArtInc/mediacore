@@ -22,6 +22,7 @@ const MEDIA_JS: &str = include_str!("../assets/media.js");
 const BENCH_JS: &str = include_str!("../assets/bench.js");
 const READOUT_JS: &str = include_str!("../assets/readout.js");
 const STAGE_JS: &str = include_str!("../assets/stage.js");
+const PREFS_JS: &str = include_str!("../assets/prefs.js");
 const DENOISE_JS: &str = include_str!("../assets/denoise.js");
 const DENOISE_GATE_JS: &str = include_str!("../assets/denoise-gate.js");
 const DENOISE_PROBE_JS: &str = include_str!("../assets/denoise-probe.js");
@@ -69,6 +70,7 @@ pub fn router(config: Config) -> Router {
         .route("/bench.js", get(bench))
         .route("/readout.js", get(readout))
         .route("/stage.js", get(stage))
+        .route("/prefs.js", get(prefs))
         .route("/denoise.js", get(denoise))
         .route(DENOISE_GATE_PATH, get(denoise_gate))
         .route(DENOISE_PROBE_PATH, get(denoise_probe))
@@ -155,6 +157,10 @@ async fn readout() -> impl IntoResponse {
 
 async fn stage() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, STAGE_JS)
+}
+
+async fn prefs() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, PREFS_JS)
 }
 
 async fn denoise() -> impl IntoResponse {
@@ -375,6 +381,7 @@ mod tests {
             ("/bench.js", BENCH_JS),
             ("/readout.js", READOUT_JS),
             ("/stage.js", STAGE_JS),
+            ("/prefs.js", PREFS_JS),
             ("/media.js", MEDIA_JS),
             ("/denoise.js", DENOISE_JS),
             (DENOISE_GATE_PATH, DENOISE_GATE_JS),
@@ -389,7 +396,11 @@ mod tests {
             }
         }
 
-        for (path, module) in [("/bench.js", BENCH_JS), ("/stage.js", STAGE_JS)] {
+        for (path, module) in [
+            ("/bench.js", BENCH_JS),
+            ("/stage.js", STAGE_JS),
+            ("/prefs.js", PREFS_JS),
+        ] {
             assert!(
                 imports(module).is_empty(),
                 "{path} is meant to be a leaf of the module graph, so the behaviour suite can \
@@ -528,6 +539,7 @@ mod tests {
             ("denoise-gate.js", DENOISE_GATE_JS),
             ("denoise-probe.js", DENOISE_PROBE_JS),
             ("app.js", APP_JS),
+            ("prefs.js", PREFS_JS),
         ] {
             for host in ["cdn.jsdelivr.net", "unpkg.com", "cdn.mezon.ai", "https://"] {
                 assert!(
@@ -606,7 +618,7 @@ mod tests {
         let first: usize = every_load.iter().map(|(_, bytes)| bytes).sum();
         let total: usize = first + on_demand.iter().map(|(_, bytes)| bytes).sum::<usize>();
 
-        for (label, bytes) in [("every load", first), ("once it is switched on", total)] {
+        for (label, bytes) in [("every load", first), ("once the node goes in", total)] {
             let row = format!("| **{label}** | **{}** |", grouped(bytes));
             assert!(
                 README_MD.contains(&row),

@@ -1716,3 +1716,223 @@ async fn escape_leaves_whatever_is_on_top_before_whatever_is_underneath_it() {
          coming out of a picture finds the room rearranged behind it as well: {escape}"
     );
 }
+
+#[tokio::test]
+async fn the_preferences_module_is_served_as_its_own_module() {
+    let addr = spawn().await;
+
+    let (status, prefs) = get(addr, "/prefs.js").await;
+    assert_eq!(status, 200, "/prefs.js is not served");
+    assert!(
+        prefs.contains("export function readPrefs(")
+            && prefs.contains("export function writePrefs("),
+        "the interface has nothing to import"
+    );
+
+    let head = head_of(addr, "/prefs.js").await.to_lowercase();
+    assert!(
+        head.contains("content-type: text/javascript"),
+        "/prefs.js is not served as a module: {head}"
+    );
+    assert!(
+        head.contains("content-security-policy: default-src 'none';"),
+        "/prefs.js was served without a policy"
+    );
+}
+
+/// A display name and a device id are preferences about one browser. A token,
+/// an identity and the room they were minted for are credentials, they expire,
+/// and a copy of one on disk outlives the call it was issued for. The list of
+/// what may be written is a single line in `prefs.js` for exactly this reason,
+/// and the write side of the page goes through it or through nothing.
+#[tokio::test]
+async fn nothing_the_server_minted_is_ever_written_to_this_browser() {
+    let addr = spawn().await;
+    let (_, prefs) = get(addr, "/prefs.js").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        prefs
+            .contains(r#"const FIELDS = ["name", "camera", "noise", "microphone", "processing"];"#),
+        "the list of what may be stored has changed; every field on it is written to disk verbatim"
+    );
+
+    assert_eq!(
+        js.matches("writePrefs(").count(),
+        1,
+        "the page writes storage from more than one place, so what it stores can no longer be \
+         read off one function"
+    );
+    assert!(
+        js.contains("const written = writePrefs(store, prefs);"),
+        "the one write is not the one in `remember`"
+    );
+
+    for value in ["credentials.token", "credentials.identity", "payload.token"] {
+        assert!(
+            !js.contains(&format!("remember({{ {value}")),
+            "{value} is minted for one call and is being remembered between them"
+        );
+    }
+}
+
+/// One key, read in one place, written in one place. A scattering of keys
+/// written from wherever is a storage surface nobody can audit, and this page's
+/// is meant to be as easy to read as the settings it holds.
+#[tokio::test]
+async fn everything_remembered_lives_under_one_versioned_key() {
+    let addr = spawn().await;
+    let (_, prefs) = get(addr, "/prefs.js").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        prefs.contains(r#"export const PREFS_KEY = "mediacore.front.v1";"#),
+        "the storage key is gone, or is no longer versioned"
+    );
+    assert_eq!(
+        prefs.matches("PREFS_KEY").count(),
+        3,
+        "prefs.js names its key somewhere other than its declaration, its read and its write"
+    );
+    assert!(
+        !js.contains("localStorage"),
+        "app.js reaches for localStorage itself, so a value is being stored outside the one blob \
+         and outside the try/catch that keeps a private window from white-screening the page"
+    );
+    assert!(
+        js.contains("readPrefs(store, ON_OFFER)")
+            && js.contains(
+                "const ON_OFFER = { engines: NOISE_ENGINES, processing: DIRECT_PROCESSING_KEYS };"
+            ),
+        "the page validates stored values against something other than what the capture module \
+         actually offers"
+    );
+}
+
+/// Every read and every write, including the accessor itself: a browser told to
+/// block site data throws on `window.localStorage` before a method is called,
+/// and a page that white-screens in a private window is worse than one that
+/// forgets.
+#[tokio::test]
+async fn every_touch_of_storage_is_wrapped() {
+    let addr = spawn().await;
+    let (_, prefs) = get(addr, "/prefs.js").await;
+
+    for function in [
+        "export function storageOf(scope) {",
+        "export function readPrefs(store, offer) {",
+        "export function writePrefs(store, prefs) {",
+    ] {
+        let body = body_of(&prefs, function);
+        assert!(
+            body.contains("try {") && body.contains("catch"),
+            "{function} can throw out of the page: {body}"
+        );
+    }
+
+    assert!(
+        body_of(&prefs, "export function storageOf(scope) {").contains(".localStorage"),
+        "the accessor is read outside the try, which is the one place a blocked browser throws"
+    );
+}
+
+/// A remembered choice is not truer than a chosen one. It goes in through the
+/// same calls the controls make, so it meets the same probe, the same attach
+/// and the same fallbacks -- including a machine that cannot run our denoiser.
+#[tokio::test]
+async fn a_remembered_choice_is_applied_through_the_controls_own_calls() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let restore = body_of(&js, "async function restoreChoices() {");
+    for call in [
+        "media.setNoiseEngine(prefs.noise)",
+        "media.setProcessing(prefs.processing)",
+    ] {
+        assert!(
+            restore.contains(call),
+            "the restore sets a capture setting behind the capture module's back: {restore}"
+        );
+    }
+
+    assert!(
+        js.contains("media.prepareDenoiser().then(restoreChoices)"),
+        "the remembered engine is applied without waiting for the probe, so two of them race for \
+         the same wasm and a refusal can land after the choice"
+    );
+
+    let microphone = body_of(&js, "async function restoreMicrophone() {");
+    assert!(
+        microphone.contains("chooseMicrophone(prefs.microphone, devices.list)")
+            && microphone.contains("media.selectMicrophone(choice.deviceId)"),
+        "a remembered device id is asked for without checking whether the browser can still see \
+         it: {microphone}"
+    );
+    assert!(
+        microphone.contains("arrivalNotice = MICROPHONE_GONE"),
+        "a microphone that is gone is swapped for another one silently: {microphone}"
+    );
+    assert!(
+        body_of(&js, "function enterRoom(credentials) {").contains("showNotice(arrivalNotice)"),
+        "what the page found out before there was a room to say it in is never said"
+    );
+}
+
+#[tokio::test]
+async fn the_lobby_comes_back_the_way_it_was_left() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        js.contains("if (prefs.name) el.name.value = prefs.name.slice(0, settings.maxNameLength);"),
+        "the name is not put back, or is put back at a length this server would refuse"
+    );
+    assert!(
+        js.contains(r#"query.has("video")"#) && js.contains("prefs.camera === true"),
+        "the camera box is not put back, or a link that names the camera no longer outranks it"
+    );
+
+    for setting in [
+        "remember({ name, camera: withVideo });",
+        "remember({ noise: engine });",
+        "remember({ microphone: chosen === SYSTEM_DEFAULT ? null : chosen });",
+        "remember({ processing: media.state().processing });",
+    ] {
+        assert!(
+            js.contains(setting),
+            "`{setting}` is gone, so that setting is set again on every visit"
+        );
+    }
+}
+
+/// Ours is the default, which is only safe because every way out of it still
+/// ends on the browser's own suppressor. These are those ways out. A change
+/// that makes the default look better by softening one of them is the change
+/// this test exists to fail.
+#[tokio::test]
+async fn our_denoiser_is_the_default_and_every_way_out_of_it_lands_on_the_browsers() {
+    let addr = spawn().await;
+    let (_, media) = get(addr, "/media.js").await;
+
+    assert!(
+        media.contains("export const DEFAULT_NOISE_ENGINE = NOISE_MEDIACORE;"),
+        "the page no longer starts on our denoiser"
+    );
+    assert_eq!(
+        media.matches("noiseEngine = NOISE_BROWSER;").count(),
+        2,
+        "the two places a denoiser that cannot be had gives way to the browser's -- the probe \
+         answering no, and the node refusing to attach as the microphone opens -- are no longer \
+         both there"
+    );
+    assert!(
+        media.contains(r#"switchNoiseEngine(NOISE_BROWSER, "denoiser-overloaded")"#),
+        "a render thread that cannot keep up no longer puts the browser's suppressor back"
+    );
+    assert!(
+        !media.contains("setTimeout") && !media.contains("setInterval"),
+        "something in the capture module is on a timer, and the only thing a timer could be for \
+         here is putting our denoiser back after a machine gave up on it -- a suppressor that \
+         switches on and off mid-sentence is worse than either state"
+    );
+}

@@ -23,9 +23,26 @@ import vm from "node:vm";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const assetPath = (name) => `${here}../assets/${name}`;
 
-const { createMedia, NOISE_BROWSER, NOISE_MEDIACORE, NOISE_OFF } = await import(
+const {
+  DIRECT_PROCESSING_KEYS,
+  NOISE_BROWSER,
+  NOISE_ENGINES,
+  NOISE_MEDIACORE,
+  NOISE_OFF,
+  createMedia,
+} = await import(
   `file://${assetPath("media.js")}`
 );
+const {
+  NOTHING_REMEMBERED,
+  PREFS_KEY,
+  STORAGE_REFUSED,
+  chooseMicrophone,
+  readPrefs,
+  sanitize,
+  storageOf,
+  writePrefs,
+} = await import(`file://${assetPath("prefs.js")}`);
 const { createDenoiser, createOverloadWatch, keepingUp, measureAgainst, readingFrom } =
   await import(`file://${assetPath("denoise.js")}`);
 const { monoDestination } = await import(`file://${assetPath("denoise.js")}`);
@@ -204,7 +221,20 @@ class FakeMediaTrack {
   }
 }
 
-function fakeLk(screen = {}) {
+/**
+ * `faults` is armed on every capture track before it is handed back. Ours is
+ * the default engine, so the node goes in during `openMicrophone` itself --
+ * before a test can reach the track and break it -- and a failure that happens
+ * at the first open can only be set up from here.
+ *
+ * `absent` names device ids this browser no longer has. Asking for one by
+ * `exact` fails the whole call with a `NotFoundError`, which is what a device
+ * id remembered from a previous visit turns into once the device is unplugged.
+ */
+function fakeLk(options = {}) {
+  const screen = options.screen || {};
+  const faults = options.faults || {};
+  const absent = options.absent || [];
   const opened = [];
   const captured = [];
   return {
@@ -215,7 +245,13 @@ function fakeLk(screen = {}) {
     ScreenSharePresets: { h1080fps15: { resolution: {}, encoding: { maxBitrate: 3_000_000 } } },
     DeviceUnsupportedError: class DeviceUnsupportedError extends Error {},
     async createLocalAudioTrack(constraints) {
-      const track = new FakeAudioTrack(constraints);
+      const wanted = constraints.deviceId ? constraints.deviceId.exact : null;
+      if (wanted && absent.includes(wanted)) {
+        const error = new Error("Requested device not found");
+        error.name = "NotFoundError";
+        throw error;
+      }
+      const track = Object.assign(new FakeAudioTrack(constraints), faults);
       opened.push(track);
       return track;
     },
@@ -313,6 +349,30 @@ function fakeDenoiser({ available = true, reason = null } = {}) {
   };
 }
 
+/**
+ * A `Storage` in the three shapes the page has to survive: one that holds a
+ * value, one that throws on the way out, and one that throws on the way in.
+ * All three are real browsers -- a private window answers `getItem` happily and
+ * then throws from `setItem` when its small quota fills, and a browser told to
+ * block site data throws from the accessor before any method is called.
+ */
+function fakeStore(seed = null, faults = {}) {
+  const store = {
+    value: seed === null ? null : JSON.stringify(seed),
+    writes: 0,
+    getItem(key) {
+      if (faults.read) throw faults.read;
+      return key === PREFS_KEY ? store.value : null;
+    },
+    setItem(key, written) {
+      if (faults.write) throw faults.write;
+      store.writes += 1;
+      if (key === PREFS_KEY) store.value = written;
+    },
+  };
+  return store;
+}
+
 /** Stands in for the page's own AudioContext, which is all this module does with it. */
 function fakeAudioContext() {
   return { id: "page-audio-context" };
@@ -320,7 +380,7 @@ function fakeAudioContext() {
 
 async function openMedia(options = {}) {
   globalThis.isSecureContext = true;
-  const lk = fakeLk(options.screen);
+  const lk = fakeLk(options);
   const notices = [];
   const context = options.audioContext === undefined ? fakeAudioContext() : options.audioContext;
   const media = createMedia(lk, {
@@ -344,12 +404,9 @@ describe("the capture module's settings reach the browser as constraints", () =>
   it("hands the browser its own suppressors only while the browser is the engine", async () => {
     const { media, track } = await openMedia();
 
-    assert.equal(media.state().noise.engine, NOISE_BROWSER);
-    assert.equal(track().latest.noiseSuppression, true);
-    assert.equal(track().latest.voiceIsolation, true);
-
-    const ours = await media.setNoiseEngine(NOISE_MEDIACORE);
-    assert.equal(ours.applied, true, ours.reason);
+    // Ours is the default, so this is where a first visit starts: our node in
+    // front of the encoder and the browser's two suppressors handed `false`,
+    // without anybody having chosen anything.
     assert.equal(media.state().noise.engine, NOISE_MEDIACORE);
     assert.equal(
       track().latest.noiseSuppression,
@@ -363,15 +420,22 @@ describe("the capture module's settings reach the browser as constraints", () =>
       "echo cancellation was turned off, and nothing on this page can replace it",
     );
 
+    const theirs = await media.setNoiseEngine(NOISE_BROWSER);
+    assert.equal(theirs.applied, true, theirs.reason);
+    assert.equal(media.state().noise.engine, NOISE_BROWSER);
+    assert.equal(track().latest.noiseSuppression, true);
+    assert.equal(track().latest.voiceIsolation, true);
+
     const off = await media.setNoiseEngine(NOISE_OFF);
     assert.equal(off.applied, true, off.reason);
     assert.equal(track().latest.noiseSuppression, false);
     assert.equal(track().latest.voiceIsolation, false);
 
-    const back = await media.setNoiseEngine(NOISE_BROWSER);
+    const back = await media.setNoiseEngine(NOISE_MEDIACORE);
     assert.equal(back.applied, true, back.reason);
-    assert.equal(track().latest.noiseSuppression, true);
-    assert.equal(track().latest.voiceIsolation, true);
+    assert.equal(media.state().noise.engine, NOISE_MEDIACORE);
+    assert.equal(track().latest.noiseSuppression, false);
+    assert.equal(track().latest.voiceIsolation, false);
   });
 
   it("asks for one channel, because RNNoise is mono", async () => {
@@ -415,11 +479,15 @@ describe("the capture module's settings reach the browser as constraints", () =>
     const gain = await media.setProcessing({ autoGainControl: false });
     assert.equal(gain.applied, true);
     assert.equal(track().latest.autoGainControl, false);
-    assert.equal(track().latest.noiseSuppression, true, "the engine was changed behind our back");
+    assert.equal(track().latest.noiseSuppression, false, "the engine was changed behind our back");
   });
 
   it("holds the change while muted and applies it on unmute", async () => {
     const { media, track } = await openMedia();
+
+    // Away from the default first, so the change being held is the one with an
+    // attach in it: that is the half of unmuting that can still fail.
+    await media.setNoiseEngine(NOISE_BROWSER);
     await media.setMuted(true);
 
     const held = await media.setNoiseEngine(NOISE_MEDIACORE);
@@ -494,9 +562,40 @@ describe("a denoiser that cannot run lands the call on the browser's own", () =>
     );
   });
 
+  it("opens the microphone on the browser's when the default node will not start", async () => {
+    const denoiser = fakeDenoiser();
+    const { media, track, notices } = await openMedia({
+      denoiser,
+      faults: { setProcessorError: new Error("worklet refused") },
+    });
+
+    assert.equal(
+      media.state().noise.engine,
+      NOISE_BROWSER,
+      "a first visit whose worklet refuses kept our engine named over a capture it never touched",
+    );
+    assert.equal(media.state().noise.attached, false);
+    assert.equal(
+      track().latest.noiseSuppression,
+      true,
+      "the capture opened with the browser's suppression off for a node that never started, so " +
+        "the call is running with nothing suppressing at all",
+    );
+    assert.match(
+      notices.map((entry) => entry.text).join(" "),
+      /browser's own suppressor is running instead/,
+      "the engine changed under somebody who never chose it and nothing said so",
+    );
+    assert.equal(denoiser.last.destroyed, 1, "the half-started node was left holding its context");
+  });
+
   it("leaves the browser suppressing when the node refuses to attach", async () => {
     const denoiser = fakeDenoiser();
     const { media, track } = await openMedia({ denoiser });
+
+    // Off the default first: the refusal under test is the one that answers a
+    // person pressing the row, not the attach that already succeeded at open.
+    await media.setNoiseEngine(NOISE_BROWSER);
     track().setProcessorError = new Error("worklet refused");
 
     const result = await media.setNoiseEngine(NOISE_MEDIACORE);
@@ -566,6 +665,22 @@ describe("a denoiser that cannot run lands the call on the browser's own", () =>
       media.state().noise.fallback.reason,
       /could not keep up/,
       "the record of the fallback was erased when it was overridden",
+    );
+  });
+
+  it("lets the default go as soon as the probe says this machine cannot have it", async () => {
+    const denoiser = fakeDenoiser({ available: false, reason: "this browser has no AudioWorklet" });
+    const { media } = await openMedia({ denoiser, open: false });
+
+    assert.equal(media.state().noise.engine, NOISE_MEDIACORE, "the default stopped being ours");
+
+    await media.prepareDenoiser();
+
+    assert.equal(
+      media.state().noise.engine,
+      NOISE_BROWSER,
+      "the page names a suppressor this browser cannot run, over the same row greyed out in the " +
+        "menu as not on offer here",
     );
   });
 
@@ -1079,6 +1194,11 @@ describe("the engine only ever names the suppressor that is running", () => {
   it("puts the node back out when the constraint change does not land", async () => {
     const denoiser = fakeDenoiser();
     const { media, track } = await openMedia({ denoiser });
+
+    // From the browser's, so "what it was" is a state the page can honestly go
+    // back to. Asking for ours while ours is already running is the one case
+    // where it is not, and the test below this one is that one.
+    await media.setNoiseEngine(NOISE_BROWSER);
     track().applyConstraintsError = new Error("the device would not take it");
     track().restartError = new Error("the device would not re-open either");
 
@@ -1164,8 +1284,11 @@ describe("the denoiser survives leaving the room and joining it again", () => {
   it("attaches to a track that has never been published", async () => {
     const { media, lk, track } = await openMedia();
 
-    await media.setNoiseEngine(NOISE_MEDIACORE);
-    assert.equal(media.state().noise.attached, true);
+    assert.equal(
+      media.state().noise.attached,
+      true,
+      "the default did not put our node in at the first open, so what follows proves nothing",
+    );
 
     await media.release();
 
@@ -1182,13 +1305,225 @@ describe("the denoiser survives leaving the room and joining it again", () => {
   });
 
   it("says so, rather than going quiet, when it truly cannot attach", async () => {
-    const { media, notices } = await openMedia({ audioContext: null });
+    const { media, track, notices } = await openMedia({ audioContext: null });
+
+    // A page with no audio context to lend cannot have our node at all, and the
+    // default is the first thing to find that out.
+    assert.equal(media.state().noise.engine, NOISE_BROWSER);
+    assert.equal(track().latest.noiseSuppression, true, "nothing is suppressing this call");
+    assert.match(notices.map((entry) => entry.text).join(" "), /Audio context/);
 
     const result = await media.setNoiseEngine(NOISE_MEDIACORE);
     assert.equal(result.applied, false);
     assert.match(result.reason, /Audio context/);
     assert.equal(media.state().noise.engine, NOISE_BROWSER);
-    assert.equal(notices.length >= 0, true);
+  });
+});
+
+// ------------------------------------------------------------- preferences
+
+describe("what this browser remembers between visits", () => {
+  const OFFER = { engines: NOISE_ENGINES, processing: DIRECT_PROCESSING_KEYS };
+
+  it("gives back the choices the last visit made, and writes nothing the server minted", () => {
+    const store = fakeStore();
+
+    writePrefs(store, {
+      name: "Alice",
+      camera: true,
+      noise: NOISE_BROWSER,
+      microphone: "mic-2",
+      processing: { echoCancellation: true, autoGainControl: false },
+      token: "eyJhbGciOiJIUzI1NiJ9.a-real-join-token",
+      identity: "alice-1a2b3c4d",
+    });
+
+    assert.deepEqual(readPrefs(store, OFFER), {
+      name: "Alice",
+      camera: true,
+      noise: NOISE_BROWSER,
+      microphone: "mic-2",
+      processing: { echoCancellation: true, autoGainControl: false },
+    });
+
+    const written = JSON.parse(store.value);
+    assert.equal(
+      "token" in written,
+      false,
+      "a token minted for one call was left on this browser's disk, where it outlives the call " +
+        "and every script this origin ever runs can read it",
+    );
+    assert.equal("identity" in written, false, "the identity the server issued was written down");
+  });
+
+  it("remembers nothing at all when there is nothing stored", () => {
+    assert.deepEqual(readPrefs(fakeStore(), OFFER), NOTHING_REMEMBERED);
+    assert.deepEqual(readPrefs(null, OFFER), NOTHING_REMEMBERED);
+  });
+
+  it("comes back empty rather than throwing when the browser refuses to be read", () => {
+    const blocked = fakeStore({ name: "Alice" }, { read: new Error("The operation is insecure.") });
+    assert.deepEqual(
+      readPrefs(blocked, OFFER),
+      NOTHING_REMEMBERED,
+      "a browser that blocks site data would have taken the page down with it",
+    );
+  });
+
+  it("says a setting will not be remembered rather than throwing over it", () => {
+    const full = fakeStore(null, { write: new Error("QuotaExceededError") });
+    const result = writePrefs(full, { noise: NOISE_OFF });
+
+    assert.equal(result.saved, false);
+    assert.equal(result.reason, STORAGE_REFUSED, "nothing the page could tell a person with");
+  });
+
+  it("finds no store at all where reading the property is what throws", () => {
+    const blocked = {
+      get localStorage() {
+        throw new Error("The operation is insecure.");
+      },
+    };
+
+    assert.equal(
+      storageOf(blocked),
+      null,
+      "the accessor throws before any method is called, so it has to be read inside the try",
+    );
+    assert.deepEqual(readPrefs(storageOf(blocked), OFFER), NOTHING_REMEMBERED);
+    assert.equal(writePrefs(storageOf(blocked), { noise: NOISE_OFF }).saved, false);
+  });
+
+  it("drops a suppressor that is no longer one of the choices and keeps the rest", () => {
+    const store = fakeStore({
+      name: "Alice",
+      camera: false,
+      noise: "rnnoise-v3",
+      microphone: "mic-2",
+    });
+
+    const prefs = readPrefs(store, OFFER);
+    assert.equal(
+      prefs.noise,
+      null,
+      "the page would have been asked to run a suppressor it does not have",
+    );
+    assert.equal(prefs.name, "Alice", "one value nothing could be done with cost the other four");
+    assert.equal(prefs.camera, false);
+    assert.equal(prefs.microphone, "mic-2");
+  });
+
+  it("refuses to carry a processing key the capture module would reject outright", () => {
+    const prefs = sanitize(
+      { processing: { noiseSuppression: false, autoGainControl: false } },
+      OFFER,
+    );
+
+    assert.deepEqual(
+      prefs.processing,
+      { autoGainControl: false },
+      "setProcessing refuses a whole patch that names a suppression flag, so one stored key like " +
+        "that would take the gain setting down with it",
+    );
+  });
+
+  it("survives a blob that is not the shape anything here writes", () => {
+    const nonsense = [
+      "not json at all",
+      '"a string"',
+      "[1, 2, 3]",
+      "null",
+      '{"name": 42, "camera": "yes", "processing": 7, "microphone": ""}',
+    ];
+
+    for (const junk of nonsense) {
+      const store = fakeStore();
+      store.value = junk;
+      assert.deepEqual(
+        readPrefs(store, OFFER),
+        NOTHING_REMEMBERED,
+        `${junk} reached the page as something it would have tried to apply`,
+      );
+    }
+  });
+
+  it("keeps the name a person typed, trimmed and bounded", () => {
+    assert.equal(readPrefs(fakeStore({ name: "  Alice  " }), OFFER).name, "Alice");
+    assert.equal(
+      readPrefs(fakeStore({ name: "x".repeat(5000) }), OFFER).name.length,
+      200,
+      "a stored value of any length at all was put straight into the field",
+    );
+    assert.equal(readPrefs(fakeStore({ name: "   " }), OFFER).name, null);
+  });
+
+  it("asks for a remembered microphone only while the browser can still see it", () => {
+    const list = [{ deviceId: "mic-1" }, { deviceId: "mic-2" }];
+
+    assert.deepEqual(chooseMicrophone("mic-2", list), { deviceId: "mic-2", outcome: "kept" });
+    assert.deepEqual(chooseMicrophone("mic-9", list), { deviceId: null, outcome: "gone" });
+    assert.deepEqual(chooseMicrophone(null, list), { deviceId: null, outcome: "none" });
+  });
+
+  it("does not read a browser that will not say as a browser with no microphones", () => {
+    // Until the microphone has been granted once every entry comes back with a
+    // blank id. That list is real, and it is not an answer to this question.
+    assert.deepEqual(chooseMicrophone("mic-2", [{ deviceId: "" }, { deviceId: "" }]), {
+      deviceId: "mic-2",
+      outcome: "unproven",
+    });
+    assert.deepEqual(chooseMicrophone("mic-2", []), { deviceId: "mic-2", outcome: "unproven" });
+  });
+
+  it("puts a remembered suppressor through the refusal a chosen one gets", async () => {
+    const store = fakeStore({ noise: NOISE_MEDIACORE });
+    const denoiser = fakeDenoiser({ available: false, reason: "no WebAssembly here" });
+    const { media, track } = await openMedia({ denoiser, open: false });
+
+    await media.setNoiseEngine(readPrefs(store, OFFER).noise);
+    const opened = await media.openMicrophone();
+
+    assert.equal(opened.opened, true, opened.reason);
+    assert.equal(
+      media.state().noise.engine,
+      NOISE_BROWSER,
+      "a suppressor out of storage was trusted further than one somebody pressed",
+    );
+    assert.equal(
+      track().latest.noiseSuppression,
+      true,
+      "the call is running with nothing suppressing at all",
+    );
+  });
+
+  it("opens the system default when the microphone it remembered is unplugged", async () => {
+    const { media, lk, notices } = await openMedia({ absent: ["mic-gone"], open: false });
+
+    // The first load of a visit is the case that matters: the browser has said
+    // nothing about any device yet, so the id is asked for and the open is
+    // where it is found out.
+    const choice = chooseMicrophone("mic-gone", []);
+    assert.equal(choice.outcome, "unproven");
+    await media.selectMicrophone(choice.deviceId);
+
+    const opened = await media.openMicrophone();
+
+    assert.equal(
+      opened.opened,
+      true,
+      "a device id remembered from a previous visit stopped somebody joining at all",
+    );
+    assert.equal(media.state().microphone.deviceId, null, "the page still wants a dead device");
+    assert.equal(
+      lk.opened[0].constraints.deviceId,
+      undefined,
+      "the device that is not there was named again on the second attempt",
+    );
+    assert.match(
+      notices.map((entry) => entry.text).join(" "),
+      /system default/,
+      "the call moved to a different microphone and nothing said so",
+    );
   });
 });
 

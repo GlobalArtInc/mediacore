@@ -2,8 +2,10 @@
 
 A single-page room. Someone opens the URL, types a name, and hears everyone else in the room.
 Audio only by default; from inside the room you can choose the microphone, choose which noise
-suppressor runs -- the browser's, ours, or none -- change the rest of the browser's audio
-processing, share a screen, and tick one box in the lobby to publish the camera with simulcast. Behind the **Bench** button in the control bar is the bandwidth bench — per remote
+suppressor runs -- ours, the browser's, or none -- change the rest of the browser's audio
+processing, share a screen, and tick one box in the lobby to publish the camera with simulcast.
+Calls start on our own denoiser, and every one of those choices is remembered by the browser that
+made it. Behind the **Bench** button in the control bar is the bandwidth bench — per remote
 track, which layer is arriving and what it costs, next to the browser's own view of the link. The
 binary serves the page and mints access tokens; it never carries media and never talks to the SFU
 itself.
@@ -39,6 +41,7 @@ log through a stray `{config:?}`.
 | `GET /media.js` | the capture side: microphone, processing, device choice, screen share; no DOM |
 | `GET /bench.js` | reads the browser's WebRTC statistics; no DOM |
 | `GET /readout.js` | draws the video tiles and the numbers; no statistics |
+| `GET /prefs.js` | what this browser remembers between visits; no DOM, no storage of its own |
 | `GET /denoise.js` | our denoiser: the support probe, the audio graph, the overload watch |
 | `GET /denoise-probe.js` | the two AudioWorklet processors that measure the node; loaded by `addModule`, not imported |
 | `GET /denoise-gate.js` | wraps the vendored processor so it says when its wasm is live; loaded by `addModule` *before* it |
@@ -103,22 +106,24 @@ sets no encoding, so these are what a browser downloads.
 |---|---:|---|
 | `/vendor/rnnoise-simd-0.4.0.wasm` | 157 234 | **every load** |
 | `/denoise.js` | 24 434 | **every load** |
-| `/vendor/rnnoise-worklet-0.4.0.js` | 64 389 | only once it is switched on |
-| `/denoise-probe.js` | 11 372 | only once it is switched on |
-| `/denoise-gate.js` | 3 928 | only once it is switched on |
+| `/vendor/rnnoise-worklet-0.4.0.js` | 64 389 | when the node goes into a call |
+| `/denoise-probe.js` | 11 372 | when the node goes into a call |
+| `/denoise-gate.js` | 3 928 | when the node goes into a call |
 | **every load** | **181 668** | |
-| **once it is switched on** | **261 357** | |
+| **once the node goes in** | **261 357** | |
 
-Most of it is not conditional. The wasm is fetched on **every** page load whether or not anybody
-turns the denoiser on, because the gate that decides whether to offer the option at all validates
-the binary rather than assuming it, and a gate that assumed would be the dishonest kind. The plain
-build (152 656 bytes) is fetched instead of the SIMD one on a browser without SIMD; never both.
+None of it is conditional in the way it reads. The wasm is fetched on **every** page load, whether
+or not anybody ever joins, because the gate that decides whether ours can run at all validates the
+binary rather than assuming it, and a gate that assumed would be the dishonest kind. The other
+three are fetched when the node is built — which, now that ours is the default, is every call
+whose microphone opens on a machine that can run it. The plain build (152 656 bytes) is fetched
+instead of the SIMD one on a browser without SIMD; never both.
 
 For comparison the page already carries `/vendor/livekit-client-2.22.2.esm.js` at 1 365 927 bytes.
-Against that, the denoiser adds about an eighth on every load and about a fifth once somebody turns
-it on. The "about 150 KB" this file used to quote was the wasm alone, and it called the rest
-conditional: a load that uses the denoiser fetches 261 357 bytes, seventy per cent more than that,
-and 181 668 of them are fetched whether anybody uses it or not.
+Against that, the denoiser adds about an eighth on a page load that goes no further, and about a
+fifth on an ordinary call. The "about 150 KB" this file used to quote was the wasm alone, and it
+called the rest conditional: a call that runs the denoiser fetches 261 357 bytes, seventy per cent
+more than that, and 181 668 of them are fetched by a browser that only ever looks at the lobby.
 
 `the_page_weight_in_the_readme_is_the_page_weight` in `src/http.rs` fails if any of those numbers
 stops matching the bytes this binary serves.
@@ -143,7 +148,7 @@ texts.
 | Parameter | Default | Effect |
 |---|---|---|
 | `?room=<name>` | the configured room | joins `<configured>.<name>`; see the namespacing section above |
-| `?video=1` | off | ticks the camera box in the lobby, so joining publishes the camera as well as the microphone |
+| `?video=1` | off | ticks the camera box in the lobby, so joining publishes the camera as well as the microphone; `?video=0` unticks it, and either one outranks what the box was left at last time |
 | `?res=180\|360\|720` | `720` | capture resolution for the camera |
 | `?simulcast=0` | simulcast on | publishes a single encoding instead of a ladder |
 | `?bench=1` | off | opens the bandwidth bench straight away, instead of waiting for the Bench button |
@@ -212,8 +217,10 @@ stopped from our button.
 ## The denoiser
 
 The browser's own noise suppression is a lightweight attenuator for stationary noise, and it sounds
-like one. The page can put a real denoiser in front of the encoder instead: **RNNoise**, compiled to
-WebAssembly, driven from an `AudioWorklet`.
+like one. The page puts a real denoiser in front of the encoder instead: **RNNoise**, compiled to
+WebAssembly, driven from an `AudioWorklet`. It is what a call starts on — `DEFAULT_NOISE_ENGINE` in
+`assets/media.js` — and the browser's own is one press away in the same control, for anybody who
+wants it back.
 
 It runs in the browser and it has to. The SFU forwards encoded packets and never decodes them, so
 denoising on the server would make it a transcoder — roughly a core per participant, a decode and
@@ -301,10 +308,17 @@ indicator behind somebody who believes they are muted.
 
 ### Degrading honestly
 
+Ours being the default is only defensible because of the three gates below: it means a page that
+loads on a machine nobody has tested puts a WebAssembly node in the capture path before anybody has
+asked for anything, and every way that can go wrong has to end on the browser's own suppressor
+without a person doing anything about it. The default decides which suppressor is *tried* first and
+nothing else. It costs a page load nothing either — the wasm is fetched on every load whichever
+engine is the default, because the first gate validates the binary rather than assuming it.
+
 Three gates, and every one of them lands on the browser's own suppressor rather than on a broken
 track or on silence.
 
-1. **Before it is offered.** The page probes once at load: Web Audio, `AudioWorklet`, WebAssembly,
+1. **Before it is used at all.** The page probes once at load: Web Audio, `AudioWorklet`, WebAssembly,
    whether this browser will run a graph at 48 kHz — RNNoise is a 48 kHz model, and at any other
    rate it is not the thing we tested — and whether the binary can actually be fetched from this
    server and validated. The rate is part of that gate rather than a surprise at attach time, for
@@ -316,6 +330,12 @@ track or on silence.
    disabled, with the reason written under it** rather than in a tooltip nobody on a touchscreen
    will see. Removing the row outright was rejected: a radio group that quietly loses an option
    tells you nothing, and the reason is the useful part.
+
+   Since ours is also the default, that probe is what the **default itself** falls back from: the
+   engine goes to the browser's the moment the answer comes back, before anybody has joined
+   anything. A page naming ours as the engine over the same row greyed out underneath as not on
+   offer here would be arguing with itself, and a remembered choice of ours on a machine that
+   cannot have it lands in exactly the same place.
 2. **While it runs.** The two worklets either side of the node measure it, twice a second.
 3. **When it is losing.** Three triggers, and the node comes out on any of them: the processor is
    stopped, the capture restarts with the browser's suppression back on, and a notice says why.
@@ -455,6 +475,67 @@ output, not the room's: whatever the operating system did to the signal before `
 handed it over is already in "level in". And `getSettings()` reporting `noiseSuppression: false` is
 the browser's claim, not a measurement — on some platforms hardware or OS suppression runs whatever
 the constraint says. The menu labels that line "the browser says" for exactly that reason.
+
+## What this browser remembers
+
+A person who chooses the mediacore denoiser, picks the headset they actually use and types their
+name should not have to do it again on the next reload. Those choices are kept in `localStorage`
+under **one key, `mediacore.front.v1`**, as one JSON object, written whole whenever any of it
+changes:
+
+| Remembered | Put back by |
+|---|---|
+| the noise suppressor | `media.setNoiseEngine()`, the call the row in the menu makes |
+| the microphone's `deviceId` | `media.selectMicrophone()`, once the browser will say the device is still there |
+| echo cancellation and automatic gain | `media.setProcessing()` |
+| the name typed in the lobby | the field, cut to the length this server will accept |
+| the camera box in the lobby | the checkbox, unless `?video=` says otherwise for this visit |
+
+**Nothing the server minted is ever written.** Not the token, not the identity, not the room they
+were for. A token expires, a copy of one on disk outlives the call it was issued for, and every
+script this origin ever runs can read it — and all it would save anybody is one press of Join. The
+list of fields that may be stored is a single line in `assets/prefs.js`, and a test fails if it
+grows one.
+
+Some things are deliberately **not** remembered, and each one is a decision rather than an
+oversight. **Muted or not**: this page has no "join muted" control, so restoring it would mean
+arriving silent with nothing in the lobby having said so — the failure being "nobody could hear me
+for the first minute". **The bandwidth bench**: it is a diagnostic view that takes every video onto
+its own tiles, `?bench=1` already opens it for the people who want it that way, and a room that
+opens into a panel of statistics looks broken. **The tile in the middle and the pinned share**:
+both name somebody who was in the room at the time, which is not a fact about this browser. **The
+room**: that is the link, not a preference.
+
+A remembered choice is not treated as truer than a chosen one. It goes back in through the same
+calls the controls make, on the far side of the same denoiser probe, so a machine that cannot run
+ours lands on the browser's own exactly as it would if somebody had pressed the row by hand — and
+the reason is under the row in the menu either way.
+
+**A remembered `deviceId` is not a promise.** The device can be gone, the same microphone can come
+back under a different id after a replug, and the browser hides ids and labels alike until the
+microphone has been granted once. So `chooseMicrophone()` gives three answers and the page needs all
+three: the device is on the list, so ask for it; the list can answer and it is not on it, so use
+the default and say so; or the browser has not said yet — ask for it anyway and be ready, because
+`getUserMedia` given an exact device that is not there fails the whole call for it, in Chrome as a
+`NotFoundError` that reads exactly like having no microphone at all. That last one is why the
+capture module drops the device and asks again rather than reporting "no microphone was found" to
+somebody with one plugged in.
+
+**Storage is input, not truth, and it is allowed to throw.** Every read and every write is wrapped,
+including the accessor itself: a browser told to block site data throws on `window.localStorage`
+before a method is called, and a private window can answer `getItem` happily and then throw from
+`setItem` when its small quota fills. All of those paths end with the page rendering and the
+settings lasting until the tab is closed; the first refused write says so once, and then stops
+saying it.
+
+Values are **validated on read**, field by field, and a field nothing can be done with comes back as
+"nothing was remembered about that" without costing the other four. That is the check that matters,
+and a version number could not have done it: a version says which shape wrote a value, not whether
+the value is still one of the choices the page offers — a suppressor that was withdrawn, a
+processing key that is no longer settable, a name of a length this server would refuse. The `v1` in
+the key is there for the one thing validation cannot do, which is a future layout that means
+something different by the same field names: it is written under another key and never reads this
+one.
 
 ## The interface
 
@@ -707,6 +788,13 @@ bundler and no browser, and it drives the real modules:
   is published beside it when the browser offers it and said to be missing when it does not, that a
   closed picker and a blocked permission are reported as the pair the browser makes of them, and
   that a share stopped from the browser's own bar unpublishes and reports itself.
+- `prefs.js`, on a `Storage` that holds a value, one that throws on the way in and one that throws
+  on the way out: that a blob written by one visit is the choices that visit made, that a token
+  handed to it is not written down, that a suppressor which is no longer on offer comes back as
+  nothing without costing the four fields beside it, that a blob of the wrong shape entirely is not
+  a broken page, and that a remembered microphone the browser can see is gone is never asked for —
+  while one it will not say anything about is asked for, and the capture module opens the default
+  and says so when it turns out to be missing.
 - `stage.js`, which is where the stage's decisions live precisely so they can be argued with here:
   that a pinned share survives the room being reordered under it, that a share ending names whose it
   was, that a browser with no fullscreen and one that refuses and one that silently ignores the

@@ -92,8 +92,13 @@ const PROCESSING_KEYS = [
   "voiceIsolation",
 ];
 
-/** The two the interface sets directly. The other two follow the noise engine. */
-const DIRECT_PROCESSING_KEYS = ["echoCancellation", "autoGainControl"];
+/**
+ * The two the interface sets directly. The other two follow the noise engine.
+ * Exported because it is also the list of what may be remembered between
+ * visits: a page that stored a fifth key would be storing a setting nothing
+ * here can apply.
+ */
+export const DIRECT_PROCESSING_KEYS = Object.freeze(["echoCancellation", "autoGainControl"]);
 
 export const NOISE_OFF = "off";
 export const NOISE_BROWSER = "browser";
@@ -110,7 +115,21 @@ export const DEFAULT_PROCESSING = Object.freeze({
   autoGainControl: true,
 });
 
-export const DEFAULT_NOISE_ENGINE = NOISE_BROWSER;
+/**
+ * Ours, from the first load, before anybody has asked for anything. The wasm is
+ * fetched on every load whatever this is set to -- the gate validates the binary
+ * rather than assuming it -- so making ours the default costs a page nothing it
+ * was not already paying, and it puts the better suppressor in front of the
+ * person who never opens the menu.
+ *
+ * It decides which suppressor is *tried* first and nothing else. Every way ours
+ * can fail still lands the call on the browser's own: a probe that says this
+ * machine cannot have it, a worklet that will not start, and a render thread
+ * that cannot keep up with the one that did. Those three are the reason a
+ * default this side of the choice is safe to ship, so none of them may be
+ * softened to make it look better.
+ */
+export const DEFAULT_NOISE_ENGINE = NOISE_MEDIACORE;
 
 export const SYSTEM_DEFAULT_MICROPHONE = null;
 
@@ -394,7 +413,7 @@ export function createMedia(lk, options = {}) {
     try {
       mic = await lk.createLocalAudioTrack(captureOptions());
     } catch (error) {
-      if (isOverconstrained(error) && wantedDevice) {
+      if (wantedDevice && isWrongDevice(error)) {
         wantedDevice = SYSTEM_DEFAULT_MICROPHONE;
         notice(
           "device",
@@ -412,8 +431,10 @@ export function createMedia(lk, options = {}) {
     await refreshDevices();
 
     // The engine can have been chosen before there was a microphone to put it
-    // on. Attaching now, rather than at the next restart, is what keeps the
-    // capture from running with our suppressor asked for and nothing in place.
+    // on, and on a first visit it was never chosen at all -- ours is the
+    // default, so this is the ordinary path rather than the odd one. Attaching
+    // now, rather than at the next restart, is what keeps the capture from
+    // running with our suppressor asked for and nothing in place.
     if (noiseEngine === NOISE_MEDIACORE) {
       const attached = await attachDenoiser();
       if (!attached.attached) {
@@ -543,7 +564,25 @@ export function createMedia(lk, options = {}) {
     return { available: support.available, reason: support.reason };
   }
 
+  /**
+   * Probe ours once, and let the engine go if the answer is that this machine
+   * cannot have it at all. Ours being the default is what makes that second
+   * half necessary: without it a browser with no AudioWorklet would sit there
+   * with `mediacore` named as the engine and the same word greyed out in the
+   * menu underneath as not on offer here. Nothing is in the path this early to
+   * contradict -- the probe runs before there is a microphone -- so the field
+   * is a claim about a suppressor that cannot exist on this machine, and it
+   * goes back to the browser's before anybody reads it.
+   */
   async function ensureDenoiser() {
+    const support = await probeDenoiser();
+    if (!support.available && noiseEngine === NOISE_MEDIACORE && !denoiserProcessor) {
+      noiseEngine = NOISE_BROWSER;
+    }
+    return support;
+  }
+
+  async function probeDenoiser() {
     if (!denoiser) return { available: false, reason: NO_DENOISER };
     if (!denoiserSupport) {
       try {
@@ -790,7 +829,7 @@ export function createMedia(lk, options = {}) {
     try {
       await mic.restartTrack(captureOptions());
     } catch (error) {
-      if (isOverconstrained(error) && wantedDevice) {
+      if (wantedDevice && isWrongDevice(error)) {
         wantedDevice = SYSTEM_DEFAULT_MICROPHONE;
         notice(
           "device",
@@ -1023,8 +1062,25 @@ function message(error) {
   return (error && (error.message || error.name)) || String(error);
 }
 
-function isOverconstrained(error) {
-  return Boolean(error) && (error.name === "OverconstrainedError" || error.name === "ConstraintNotSatisfiedError");
+/**
+ * The browser refusing the device that was asked for, rather than refusing to
+ * hand over a microphone at all. `NotFoundError` is in here because a device id
+ * outlives the device: one remembered from a previous visit, or one the person
+ * chose before unplugging the thing, names something that is not there any
+ * more, and Chrome answers an exact id it cannot find with `NotFoundError` --
+ * the same name it uses for a machine with no microphone whatsoever. Told
+ * apart by whether a device was named at all: with one, the answer is to stop
+ * naming it and ask again, and if there really is no microphone the second
+ * attempt says so with nothing left to blame.
+ */
+function isWrongDevice(error) {
+  const name = error && error.name;
+  return (
+    name === "OverconstrainedError" ||
+    name === "ConstraintNotSatisfiedError" ||
+    name === "NotFoundError" ||
+    name === "DevicesNotFoundError"
+  );
 }
 
 function isPickerRefusal(error) {
