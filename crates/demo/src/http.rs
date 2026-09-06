@@ -18,10 +18,14 @@ use crate::name::{NameError, RoomError, clean_name, identity_for, namespaced_roo
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
+const MEDIA_JS: &str = include_str!("../assets/media.js");
 const BENCH_JS: &str = include_str!("../assets/bench.js");
 const READOUT_JS: &str = include_str!("../assets/readout.js");
 const SDK_JS: &str = include_str!("../assets/vendor/livekit-client.esm.js");
 const TOKEN_BODY_LIMIT: usize = 4 * 1024;
+
+pub const PUBLISH_SOURCES: [&str; 4] =
+    ["microphone", "camera", "screen_share", "screen_share_audio"];
 
 pub const SDK_VERSION: &str = "2.22.2";
 pub const SDK_PATH: &str = "/vendor/livekit-client-2.22.2.esm.js";
@@ -36,6 +40,7 @@ pub fn router(config: Config) -> Router {
         .route("/", get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(script))
+        .route("/media.js", get(media))
         .route("/bench.js", get(bench))
         .route("/readout.js", get(readout))
         .route(SDK_PATH, get(sdk))
@@ -96,6 +101,10 @@ async fn stylesheet() -> impl IntoResponse {
 
 async fn script() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, APP_JS)
+}
+
+async fn media() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, MEDIA_JS)
 }
 
 async fn bench() -> impl IntoResponse {
@@ -235,7 +244,7 @@ async fn token(
             can_publish: Some(true),
             can_subscribe: Some(true),
             can_publish_data: Some(false),
-            can_publish_sources: vec!["microphone".to_owned(), "camera".to_owned()],
+            can_publish_sources: PUBLISH_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             ..VideoGrant::default()
         },
         ..Claims::default()
@@ -275,6 +284,7 @@ mod tests {
             ("/app.js", APP_JS),
             ("/bench.js", BENCH_JS),
             ("/readout.js", READOUT_JS),
+            ("/media.js", MEDIA_JS),
         ];
 
         for (path, module) in served {
@@ -301,6 +311,80 @@ mod tests {
             })
             .filter(|path| path.ends_with(".js") && !path.contains("/vendor/"))
             .collect()
+    }
+
+    #[test]
+    fn the_grant_covers_a_screen_share_and_stops_there() {
+        assert!(
+            PUBLISH_SOURCES.contains(&"screen_share"),
+            "the server refuses a screen share the token does not name"
+        );
+        assert!(
+            PUBLISH_SOURCES.contains(&"screen_share_audio"),
+            "the screen would be shared without the sound the browser offered with it"
+        );
+
+        for source in PUBLISH_SOURCES {
+            assert!(
+                ["microphone", "camera", "screen_share", "screen_share_audio"].contains(&source),
+                "`{source}` is granted but nothing on the page publishes it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capture_module_reads_the_devices_the_browser_reports() {
+        assert!(
+            MEDIA_JS.contains("enumerateDevices"),
+            "the capture module never lists the inputs it offers to choose between"
+        );
+        assert!(
+            MEDIA_JS.contains(r#"addEventListener("devicechange""#),
+            "unplugging the chosen microphone would leave a dead track behind"
+        );
+        assert!(
+            MEDIA_JS.contains("getDisplayMedia") || MEDIA_JS.contains("createLocalScreenTracks"),
+            "the capture module never asks for a screen"
+        );
+
+        for flag in ["echoCancellation", "noiseSuppression", "autoGainControl"] {
+            assert!(
+                MEDIA_JS.contains(flag),
+                "the capture module cannot change {flag} while a call is running"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capture_module_invents_no_value_the_browser_withheld() {
+        assert!(
+            !MEDIA_JS.contains("|| 0"),
+            "media.js substitutes a zero for a value the browser did not report"
+        );
+        assert!(
+            MEDIA_JS.contains("in settings ? Boolean(settings[key]) : null"),
+            "a processing flag the browser does not report must read as unknown, not as off"
+        );
+    }
+
+    #[test]
+    fn the_capture_module_stands_alone() {
+        assert!(
+            !MEDIA_JS.lines().any(|line| line.starts_with("import ")),
+            "media.js loads a module of its own instead of being handed the sdk it is given"
+        );
+        assert!(
+            !MEDIA_JS.contains("/vendor/"),
+            "media.js pins a copy of the sdk, so the page would load two of them"
+        );
+        assert!(
+            !MEDIA_JS.contains("document."),
+            "media.js touches the dom, so the interface cannot be redesigned without it"
+        );
+        assert!(
+            MEDIA_JS.contains("export function createMedia("),
+            "media.js does not expose the entry point the interface is documented to call"
+        );
     }
 
     #[test]

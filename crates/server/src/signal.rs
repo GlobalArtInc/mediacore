@@ -455,18 +455,23 @@ fn permission_from(grant: &VideoGrant) -> livekit::ParticipantPermission {
     }
 }
 
+const UNRECOGNISED_SOURCE: i32 = -1;
+
 fn publish_sources(grant: &VideoGrant) -> Vec<i32> {
     grant
         .can_publish_sources
         .iter()
-        .filter_map(|source| match source.as_str() {
-            "camera" => Some(livekit::TrackSource::Camera as i32),
-            "microphone" => Some(livekit::TrackSource::Microphone as i32),
-            "screen_share" => Some(livekit::TrackSource::ScreenShare as i32),
-            "screen_share_audio" => Some(livekit::TrackSource::ScreenShareAudio as i32),
+        .map(|source| match source.as_str() {
+            "camera" => livekit::TrackSource::Camera as i32,
+            "microphone" => livekit::TrackSource::Microphone as i32,
+            "screen_share" => livekit::TrackSource::ScreenShare as i32,
+            "screen_share_audio" => livekit::TrackSource::ScreenShareAudio as i32,
             unknown => {
-                tracing::warn!(source = %unknown, "unknown publish source in token");
-                None
+                tracing::warn!(
+                    source = %unknown,
+                    "unknown publish source in token, keeping the restriction"
+                );
+                UNRECOGNISED_SOURCE
             }
         })
         .collect()
@@ -499,4 +504,36 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_naming_only_sources_we_do_not_know_still_restricts() {
+        let grant = VideoGrant {
+            can_publish_sources: vec!["hologram".to_owned()],
+            ..VideoGrant::default()
+        };
+
+        let sources = publish_sources(&grant);
+
+        assert!(
+            !sources.is_empty(),
+            "an empty list means unrestricted, so dropping every unknown source turns a token that \
+             restricts publishing into one that permits everything"
+        );
+        assert!(
+            !sources.contains(&(livekit::TrackSource::Camera as i32))
+                && !sources.contains(&(livekit::TrackSource::Microphone as i32))
+                && !sources.contains(&(livekit::TrackSource::ScreenShare as i32)),
+            "an unknown source must match nothing publishable"
+        );
+    }
+
+    #[test]
+    fn a_token_that_names_no_sources_stays_unrestricted() {
+        assert!(publish_sources(&VideoGrant::default()).is_empty());
+    }
 }

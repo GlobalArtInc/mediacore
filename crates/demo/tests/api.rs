@@ -174,9 +174,70 @@ async fn a_token_is_issued_that_the_server_accepts() {
     assert!(claims.video.can_subscribe());
     assert_eq!(
         claims.video.can_publish_sources,
-        vec!["microphone", "camera"]
+        vec!["microphone", "camera", "screen_share", "screen_share_audio"],
+        "the demo mints the only token it can publish with, so the grant is the whole permission"
+    );
+    assert!(
+        claims
+            .video
+            .can_publish_sources
+            .contains(&"screen_share".to_owned()),
+        "the server would refuse the screen share the page offers"
+    );
+    assert!(
+        !claims
+            .video
+            .can_publish_sources
+            .iter()
+            .any(|source| source == "data" || source == "unknown"),
+        "the grant names a source nothing on the page publishes"
     );
     assert!(claims.iss == API_KEY);
+}
+
+#[tokio::test]
+async fn the_capture_module_is_served_as_its_own_module() {
+    let addr = spawn().await;
+
+    let (status, media) = get(addr, "/media.js").await;
+    assert_eq!(status, 200, "/media.js is not served");
+    assert!(
+        media.contains("export function createMedia("),
+        "the interface has nothing to import"
+    );
+
+    let head = head_of(addr, "/media.js").await.to_lowercase();
+    assert!(
+        head.contains("content-type: text/javascript"),
+        "/media.js is not served as a module: {head}"
+    );
+    assert!(
+        head.contains("content-security-policy: default-src 'none';"),
+        "/media.js was served without a policy"
+    );
+}
+
+#[tokio::test]
+async fn the_capture_module_names_the_screen_share_source_the_grant_allows() {
+    let addr = spawn().await;
+    let (_, media) = get(addr, "/media.js").await;
+
+    assert!(
+        media.contains("createLocalScreenTracks"),
+        "the screen is never captured"
+    );
+    assert!(
+        media.contains("ScreenSharePresets"),
+        "the screen share is published without a capture ceiling"
+    );
+    assert!(
+        media.contains("TrackEvent.Ended"),
+        "a share stopped from the browser's own bar would stay published"
+    );
+    assert!(
+        media.contains("restartTrack"),
+        "switching microphone would drop the publication and the subscriptions with it"
+    );
 }
 
 #[tokio::test]
@@ -458,7 +519,7 @@ async fn the_camera_is_off_until_it_is_asked_for() {
         "nothing turns the camera on from the query string"
     );
     assert!(
-        js.contains("const withVideo = el.video.checked;"),
+        js.contains("const withVideo = el.withVideo.checked;"),
         "joining does not consult the camera checkbox"
     );
 
@@ -572,6 +633,349 @@ async fn the_readme_says_how_to_constrain_the_link() {
         assert!(
             README.contains(needle),
             "the bench instructions never mention {needle}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_element_table_names_each_node_once() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let table = js
+        .split_once("const el = {")
+        .expect("the element table is defined")
+        .1
+        .split_once("\n};")
+        .expect("the element table is closed")
+        .0;
+
+    let mut keys: Vec<&str> = table
+        .lines()
+        .filter_map(|line| line.trim().split_once(": document.getElementById"))
+        .map(|(key, _)| key)
+        .collect();
+
+    let named = keys.len();
+    keys.sort_unstable();
+    keys.dedup();
+
+    assert!(named > 10, "the element table was not found: {keys:?}");
+    assert_eq!(
+        named,
+        keys.len(),
+        "two entries in the element table share a key, so one node silently replaces the other \
+         and the control that reads it acts on the wrong element"
+    );
+}
+
+#[tokio::test]
+async fn the_room_is_a_roster_a_stage_and_a_bar() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    for id in [
+        "participants",
+        "cards",
+        "share",
+        "share-frame",
+        "audio-menu",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the room has no `{id}`, so the layout the brief asked for is not there"
+        );
+    }
+
+    for control in [
+        "mute",
+        "audio-settings",
+        "mic-select",
+        "noise",
+        "share-screen",
+        "leave",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{control}\"")),
+            "the control bar is missing `{control}`"
+        );
+    }
+
+    let bar = page
+        .split_once(r#"<div class="bar""#)
+        .expect("the control bar is in the page")
+        .1;
+    for control in [
+        "id=\"mute\"",
+        "id=\"noise\"",
+        "id=\"share-screen\"",
+        "id=\"leave\"",
+    ] {
+        assert!(
+            bar.contains(control),
+            "{control} is in the page but not in the control bar"
+        );
+    }
+
+    assert!(
+        css.contains(".roster"),
+        "the persistent list of who is present is unstyled"
+    );
+    assert!(css.contains(".bar"), "the control bar is unstyled");
+}
+
+#[tokio::test]
+async fn who_is_speaking_is_measured_from_the_audio() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    assert!(
+        js.contains("createAnalyser()") && js.contains("getByteTimeDomainData"),
+        "the speaking indicator no longer measures the audio itself"
+    );
+    assert!(
+        !js.contains("ActiveSpeakersChanged"),
+        "the page waits for a speakers message this server does not send, so the ring would \
+         stay dark for ever"
+    );
+    assert!(
+        js.contains(r#"media.on("microphonetrack""#),
+        "restarting the capture replaces the MediaStreamTrack, and a meter left on the old one \
+         would report silence for ever"
+    );
+    assert!(
+        css.contains(r#"[data-speaking="true"]"#),
+        "nothing lights up around whoever is speaking"
+    );
+}
+
+#[tokio::test]
+async fn a_participant_the_page_cannot_measure_does_not_look_fine() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    assert!(
+        js.contains("function unknownState("),
+        "every participant is reported as either speaking or listening, including the ones \
+         nothing on this page can measure"
+    );
+
+    for unmeasurable in ["not subscribed", "level unknown", "no microphone"] {
+        assert!(
+            js.contains(unmeasurable),
+            "a participant who is `{unmeasurable}` is not distinguished from a healthy one"
+        );
+    }
+
+    assert!(
+        css.contains(r#"[data-state="unknown"]"#),
+        "an unknown participant is styled exactly like a fine one"
+    );
+}
+
+#[tokio::test]
+async fn every_control_states_what_it_will_do_and_what_happened() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    for pair in [
+        ("Mute", "Unmute"),
+        ("Share screen", "Stop sharing"),
+        ("Start camera", "Stop camera"),
+    ] {
+        assert!(
+            js.contains(pair.0) && js.contains(pair.1),
+            "`{}` never becomes `{}`, so the button does not say what pressing it will do",
+            pair.0,
+            pair.1
+        );
+    }
+
+    assert!(
+        page.contains(r#"id="notice""#) && js.contains("function showNotice("),
+        "nothing tells the person what just happened"
+    );
+    assert!(
+        js.contains(r#"result.outcome === "cancelled""#),
+        "a cancelled screen picker is reported as a failure, or not at all"
+    );
+    assert!(
+        js.contains("fail(el.roomError, result.reason)"),
+        "a failed screen share never says what failed"
+    );
+    assert!(
+        js.contains("microphoneMessage") || js.contains("opened.reason"),
+        "a refused microphone does not say what to do about it"
+    );
+}
+
+#[tokio::test]
+async fn the_page_says_when_the_browser_reported_nothing() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        !js.contains("|| 0"),
+        "app.js substitutes a zero for a value the browser did not report"
+    );
+    assert!(
+        js.contains("reported === null"),
+        "a processing flag the browser does not report is painted as though it were off"
+    );
+    for sentence in [
+        "does not report whether it applied this",
+        "does not report which device it opened",
+    ] {
+        assert!(
+            js.contains(sentence),
+            "the page shows a value instead of saying `{sentence}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_capture_module_drives_every_audio_control() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        js.contains(r#"from "/media.js""#) && js.contains("createMedia(lk)"),
+        "the interface does not use the capture module at all"
+    );
+
+    for call in [
+        "media.openMicrophone()",
+        "media.publishMicrophone()",
+        "media.toggleMuted()",
+        "media.setProcessing(",
+        "media.selectMicrophone(",
+        "media.startScreenShare(",
+        "media.stopScreenShare()",
+    ] {
+        assert!(js.contains(call), "nothing on the page calls {call}");
+    }
+
+    assert!(
+        !js.contains("createLocalAudioTrack"),
+        "the page opens its own microphone behind the capture module's back, so muting, the \
+         device choice and the processing switches would act on different tracks"
+    );
+    assert!(
+        js.contains("noiseSuppression"),
+        "the noise suppression switch is not wired to anything"
+    );
+}
+
+#[tokio::test]
+async fn the_bench_view_survives_the_redesign() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    for id in [
+        "bench",
+        "bench-toggle",
+        "tiles",
+        "link-estimate",
+        "link-arriving",
+        "link-video",
+        "link-rtt",
+        "link-sending",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the bench lost `{id}`, and with it the way the bandwidth work is judged"
+        );
+    }
+
+    assert!(
+        js.contains(r#"query.get("bench") === "1""#),
+        "the bench cannot be opened from the address bar"
+    );
+    assert!(
+        js.contains("function onBenchToggle()"),
+        "the bench cannot be opened from the page"
+    );
+    assert!(
+        js.contains("createBench(room)") && js.contains("tiles.sync("),
+        "the bench is in the markup but nothing feeds it"
+    );
+}
+
+#[tokio::test]
+async fn a_video_track_is_never_attached_in_two_places_at_once() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let render = js
+        .split_once("\nfunction render(")
+        .expect("render is defined")
+        .1
+        .split_once("\nfunction ")
+        .expect("render is followed by another function")
+        .0;
+
+    assert!(
+        render.contains("if (showBench) {") && render.contains("tiles.sync("),
+        "render no longer chooses between the stage and the bench"
+    );
+    assert!(
+        render.contains("clearCards();") && render.contains("tiles.clear();"),
+        "the stage and the bench can hold the same track at once, and whichever detaches first \
+         tears the video out of the other"
+    );
+}
+
+#[tokio::test]
+async fn every_control_is_a_real_control() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    assert!(
+        !page.contains("onclick="),
+        "the page carries an inline handler, which the content security policy blocks anyway"
+    );
+    assert!(
+        !page.contains(r#"tabindex="-1""#),
+        "a control was taken out of the tab order"
+    );
+    assert!(
+        !page.contains(r#"role="button""#),
+        "something that is not a button is pretending to be one, so it answers a click but not \
+         a keypress"
+    );
+    assert!(
+        page.contains(r#"aria-expanded="false""#) && page.contains(r#"aria-pressed="false""#),
+        "the toggles do not report their state to a screen reader"
+    );
+    assert!(
+        css.contains(":focus-visible"),
+        "a keyboard user cannot see what is focused"
+    );
+    assert!(
+        css.contains("prefers-reduced-motion"),
+        "the speaking animation cannot be turned off"
+    );
+}
+
+#[tokio::test]
+async fn every_icon_the_script_swaps_in_exists_in_the_page() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let icons = quoted_after(&js, "\"#icon-");
+    assert!(!icons.is_empty(), "no icon is ever swapped");
+
+    for icon in icons {
+        assert!(
+            page.contains(&format!("id=\"icon-{icon}\"")),
+            "app.js swaps in `#icon-{icon}`, which the page does not define"
         );
     }
 }

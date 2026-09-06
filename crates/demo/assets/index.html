@@ -7,97 +7,251 @@
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
-    <main data-wide="false">
-      <header class="brand">
-        <span class="brand-dot" aria-hidden="true"></span>
-        <span class="brand-name">mediacore</span>
-      </header>
+    <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="icon-mic" viewBox="0 0 24 24">
+        <rect x="9" y="3" width="6" height="10" rx="3" />
+        <path d="M5 11a7 7 0 0 0 14 0" />
+        <path d="M12 18v3" />
+      </symbol>
+      <symbol id="icon-mic-off" viewBox="0 0 24 24">
+        <rect x="9" y="3" width="6" height="10" rx="3" />
+        <path d="M5 11a7 7 0 0 0 14 0" />
+        <path d="M12 18v3" />
+        <path d="M4 4l16 16" />
+      </symbol>
+      <symbol id="icon-screen" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="12" rx="2" />
+        <path d="M9 20h6" />
+        <path d="M12 16v4" />
+      </symbol>
+      <symbol id="icon-screen-off" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="12" rx="2" />
+        <path d="M9 20h6" />
+        <path d="M12 16v4" />
+        <path d="M4 4l16 16" />
+      </symbol>
+      <symbol id="icon-camera" viewBox="0 0 24 24">
+        <rect x="3" y="6" width="12" height="12" rx="2" />
+        <path d="M15 10.5l6-3.5v10l-6-3.5z" />
+      </symbol>
+      <symbol id="icon-camera-off" viewBox="0 0 24 24">
+        <rect x="3" y="6" width="12" height="12" rx="2" />
+        <path d="M15 10.5l6-3.5v10l-6-3.5z" />
+        <path d="M4 4l16 16" />
+      </symbol>
+      <symbol id="icon-levels" viewBox="0 0 24 24">
+        <path d="M3 12h2" />
+        <path d="M8 8v8" />
+        <path d="M12 4v16" />
+        <path d="M16 9v6" />
+        <path d="M20 11v2" />
+      </symbol>
+      <symbol id="icon-gauge" viewBox="0 0 24 24">
+        <path d="M4 17a8 8 0 1 1 16 0" />
+        <path d="M12 17l4-5" />
+      </symbol>
+      <symbol id="icon-leave" viewBox="0 0 24 24">
+        <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" />
+        <path d="M10 8l-4 4 4 4" />
+        <path d="M6 12h9" />
+      </symbol>
+      <symbol id="icon-chevron" viewBox="0 0 24 24">
+        <path d="M6 15l6-6 6 6" />
+      </symbol>
+    </svg>
 
-      <section id="lobby" class="card">
-        <h1>Join the room</h1>
-        <p class="lede">
-          Everyone in <code id="lobby-room">&hellip;</code> hears everyone else.
-          Audio only unless you ask for the camera.
-        </p>
+    <main class="page">
+      <section id="lobby" class="lobby">
+        <div class="card">
+          <header class="brand">
+            <span class="brand-dot" aria-hidden="true"></span>
+            <span class="brand-name">mediacore</span>
+          </header>
 
-        <form id="join-form" novalidate>
-          <label for="name">Your name</label>
-          <input
-            id="name"
-            name="name"
-            type="text"
-            maxlength="40"
-            placeholder="Alice"
-            autocomplete="off"
-            autocapitalize="words"
-            spellcheck="false"
-            disabled
-          />
+          <h1>Join the room</h1>
+          <p class="lede">
+            Everyone in <code id="lobby-room">&hellip;</code> hears everyone else.
+            Audio only unless you ask for the camera.
+          </p>
 
-          <label class="toggle" for="with-video">
-            <input id="with-video" name="with-video" type="checkbox" disabled />
-            <span>Publish my camera too, with simulcast</span>
-          </label>
+          <form id="join-form" novalidate>
+            <label for="name">Your name</label>
+            <input
+              id="name"
+              name="name"
+              type="text"
+              maxlength="40"
+              placeholder="Alice"
+              autocomplete="off"
+              autocapitalize="words"
+              spellcheck="false"
+              disabled
+            />
 
-          <button id="join" type="submit" disabled>Join</button>
-        </form>
+            <label class="toggle" for="with-video">
+              <input id="with-video" name="with-video" type="checkbox" disabled />
+              <span>Publish my camera too, with simulcast</span>
+            </label>
 
-        <p id="lobby-status" class="status" role="status">Loading the client&hellip;</p>
-        <div id="lobby-error" class="alert" role="alert" hidden></div>
+            <button id="join" type="submit" disabled>Join</button>
+          </form>
+
+          <p id="lobby-status" class="status" role="status">Loading the client&hellip;</p>
+          <div id="lobby-error" class="alert" role="alert" hidden></div>
+        </div>
       </section>
 
-      <section id="room" class="card" hidden>
-        <div class="room-head">
-          <div>
-            <h1 id="room-name">&hellip;</h1>
-            <p id="room-count" class="lede">&hellip;</p>
+      <div id="room" class="shell" hidden>
+        <aside class="roster" aria-label="People in the room">
+          <header class="roster-head">
+            <div class="roster-title">
+              <h1 id="room-name">&hellip;</h1>
+              <p id="room-count" class="lede">&hellip;</p>
+            </div>
+            <span id="room-state" class="pill">connecting</span>
+          </header>
+
+          <ul id="participants" class="participants"></ul>
+
+          <footer class="foot"><span id="foot-url"></span></footer>
+        </aside>
+
+        <div class="main">
+          <div class="stage">
+            <section id="share" class="share" aria-label="Shared screen" hidden>
+              <div id="share-frame" class="share-frame"></div>
+              <div class="share-foot">
+                <p id="share-who" class="share-who"></p>
+                <div
+                  id="share-tabs"
+                  class="share-tabs"
+                  role="group"
+                  aria-label="Screens being shared"
+                  hidden
+                ></div>
+              </div>
+            </section>
+
+            <ul id="cards" class="cards"></ul>
+
+            <section id="bench" class="bench" aria-label="Bandwidth bench" hidden>
+              <h2 class="bench-head">Bandwidth bench</h2>
+              <dl id="link" class="link">
+                <div>
+                  <dt>browser estimate in</dt>
+                  <dd id="link-estimate">&mdash;</dd>
+                </div>
+                <div>
+                  <dt>arriving now</dt>
+                  <dd id="link-arriving">&mdash;</dd>
+                </div>
+                <div>
+                  <dt>video arriving</dt>
+                  <dd id="link-video">&mdash;</dd>
+                </div>
+                <div>
+                  <dt>round trip</dt>
+                  <dd id="link-rtt">&mdash;</dd>
+                </div>
+                <div>
+                  <dt>browser estimate out</dt>
+                  <dd id="link-sending">&mdash;</dd>
+                </div>
+              </dl>
+
+              <ul id="tiles" class="tiles" hidden></ul>
+
+              <p class="bench-note">
+                Every number here is the browser's own, sampled once a second. A dash is a value
+                this browser did not report; hover it to read why. The tiles carry the video while
+                this view is open, so a track is never attached twice.
+              </p>
+            </section>
           </div>
-          <span id="room-state" class="pill">connecting</span>
+
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden>
+            <span id="notice-text"></span>
+            <button id="notice-dismiss" class="link-button" type="button">Dismiss</button>
+          </div>
+
+          <div id="room-error" class="alert" role="alert" hidden></div>
+
+          <button id="enable-audio" class="banner" type="button" hidden>
+            This browser is holding back audio playback. Press to let it start.
+          </button>
+
+          <div class="dock">
+            <div id="audio-menu" class="menu" aria-labelledby="audio-settings" hidden>
+              <div class="menu-block">
+                <label for="mic-select">Microphone</label>
+                <select id="mic-select"></select>
+                <p id="mic-note" class="menu-note"></p>
+              </div>
+
+              <div class="menu-block">
+                <h2 class="menu-head">The browser's own processing</h2>
+                <ul id="processing" class="switches"></ul>
+                <p id="processing-note" class="menu-note">
+                  These are constraints handed to the browser before the audio is encoded. The server
+                  forwards encoded packets and never decodes them, so nothing here can be undone or
+                  improved later.
+                </p>
+              </div>
+            </div>
+
+            <div class="bar" role="group" aria-label="Call controls">
+              <button id="mute" class="control" type="button" aria-pressed="false">
+                <svg class="icon" aria-hidden="true"><use href="#icon-mic" /></svg>
+                <span class="control-label" id="mute-label">Mute</span>
+              </button>
+
+              <button
+                id="audio-settings"
+                class="control chevron"
+                type="button"
+                aria-label="Microphone and audio processing"
+                aria-expanded="false"
+                aria-controls="audio-menu"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-chevron" /></svg>
+                <span class="control-label">Audio input</span>
+              </button>
+
+              <button id="noise" class="control" type="button" aria-pressed="true">
+                <svg class="icon" aria-hidden="true"><use href="#icon-levels" /></svg>
+                <span class="control-label">Noise suppression</span>
+                <span class="control-sub" id="noise-sub">&mdash;</span>
+              </button>
+
+              <button id="share-screen" class="control" type="button" aria-pressed="false">
+                <svg class="icon" aria-hidden="true"><use href="#icon-screen" /></svg>
+                <span class="control-label" id="share-label">Share screen</span>
+              </button>
+
+              <button id="camera" class="control" type="button" aria-pressed="false">
+                <svg class="icon" aria-hidden="true"><use href="#icon-camera" /></svg>
+                <span class="control-label" id="camera-label">Start camera</span>
+              </button>
+
+              <button
+                id="bench-toggle"
+                class="control"
+                type="button"
+                aria-pressed="false"
+                aria-controls="bench"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-gauge" /></svg>
+                <span class="control-label">Bench</span>
+              </button>
+
+              <button id="leave" class="control danger" type="button" aria-label="Leave the room">
+                <svg class="icon" aria-hidden="true"><use href="#icon-leave" /></svg>
+                <span class="control-label">Leave</span>
+              </button>
+            </div>
+          </div>
         </div>
-
-        <dl id="link" class="link">
-          <div>
-            <dt>browser estimate in</dt>
-            <dd id="link-estimate">&mdash;</dd>
-          </div>
-          <div>
-            <dt>arriving now</dt>
-            <dd id="link-arriving">&mdash;</dd>
-          </div>
-          <div>
-            <dt>video arriving</dt>
-            <dd id="link-video">&mdash;</dd>
-          </div>
-          <div>
-            <dt>round trip</dt>
-            <dd id="link-rtt">&mdash;</dd>
-          </div>
-          <div>
-            <dt>browser estimate out</dt>
-            <dd id="link-sending">&mdash;</dd>
-          </div>
-        </dl>
-
-        <ul id="tiles" class="tiles" hidden></ul>
-
-        <ul id="participants" class="participants"></ul>
-
-        <button id="enable-audio" class="secondary" type="button" hidden>
-          Enable audio playback
-        </button>
-
-        <div class="controls">
-          <button id="camera" type="button" class="secondary">Start camera</button>
-          <button id="mute" type="button" class="secondary">Mute</button>
-          <button id="leave" type="button" class="ghost">Leave</button>
-        </div>
-
-        <div id="room-error" class="alert" role="alert" hidden></div>
-      </section>
-
-      <footer class="foot">
-        <span id="foot-url"></span>
-      </footer>
+      </div>
     </main>
 
     <div id="audio" class="sink" aria-hidden="true"></div>

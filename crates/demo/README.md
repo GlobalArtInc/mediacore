@@ -1,10 +1,12 @@
 # mediacore-demo
 
 A single-page room. Someone opens the URL, types a name, and hears everyone else in the room.
-Audio only by default; tick one box and the page also publishes the camera with simulcast, which
-turns the same page into a bandwidth bench — it shows, per remote track, which layer is arriving
-and what it costs, next to the browser's own view of the link. The binary serves the page and
-mints access tokens; it never carries media and never talks to the SFU itself.
+Audio only by default; from inside the room you can choose the microphone, change the browser's
+audio processing, share a screen, and tick one box in the lobby to publish the camera with
+simulcast. Behind the **Bench** button in the control bar is the bandwidth bench — per remote
+track, which layer is arriving and what it costs, next to the browser's own view of the link. The
+binary serves the page and mints access tokens; it never carries media and never talks to the SFU
+itself.
 
 ```
 mediacore-demo
@@ -34,6 +36,7 @@ log through a stray `{config:?}`.
 |---|---|
 | `GET /` | the page |
 | `GET /app.css`, `GET /app.js` | the page's assets, compiled into the binary |
+| `GET /media.js` | the capture side: microphone, processing, device choice, screen share; no DOM |
 | `GET /bench.js` | reads the browser's WebRTC statistics; no DOM |
 | `GET /readout.js` | draws the video tiles and the numbers; no statistics |
 | `GET /vendor/livekit-client-<version>.esm.js` | the browser SDK, also compiled into the binary |
@@ -84,6 +87,7 @@ says how to move to another version.
 | `?video=1` | off | ticks the camera box in the lobby, so joining publishes the camera as well as the microphone |
 | `?res=180\|360\|720` | `720` | capture resolution for the camera |
 | `?simulcast=0` | simulcast on | publishes a single encoding instead of a ladder |
+| `?bench=1` | off | opens the bandwidth bench straight away, instead of waiting for the Bench button |
 
 `?res` decides how many rungs there are, and the rule is `livekit-client`'s, not ours: three
 encodings (`q` 320×180, `h` 640×360, `f` 1280×720) only when the capture is at least 960 px on its
@@ -91,14 +95,101 @@ long side. `?res=360` publishes two rungs, `?res=180` publishes one. Run the ben
 unless you are deliberately testing a shorter ladder, and use the same `?res` for every publisher
 in a run or the numbers are not comparable between them.
 
-The token always grants both `microphone` and `camera`, so the camera button works after joining
-audio-only — which is the case worth testing, because it is the one where the SFU has to discover
-bandwidth it never had a reason to measure.
+## What the token grants
+
+Every token this server mints carries the same four publish sources: `microphone`, `camera`,
+`screen_share` and `screen_share_audio`. The SFU enforces that list, so a source missing from it is
+a `NotAllowed` refusal at publish time rather than a client-side check.
+
+`camera` is granted so the camera button works after joining audio-only — the case worth testing,
+because it is the one where the SFU has to discover bandwidth it never had a reason to measure.
+`screen_share` and `screen_share_audio` are two sources for one feature: the video of the screen and
+the tab or system sound the browser hands over with it. Nothing else is granted; `can_publish_data`
+stays off, and the list lives in one place, `PUBLISH_SOURCES` in `src/http.rs`.
+
+## The capture module
+
+`assets/media.js` owns everything the page captures: the microphone, the browser's audio
+processing, the choice of input device, and the screen share. It touches no DOM and imports nothing
+of ours — the interface hands it the already-loaded `livekit-client` namespace, calls its methods,
+and renders `state()`. The header of the file documents the API.
+
+The three audio settings are constraints passed to `getUserMedia`, so the processing is the
+browser's own and happens before Opus encoding. The SFU forwards encoded packets and never decodes
+them, which is why nothing here can be changed after the fact:
+
+| Setting | What it does to the audio | What it costs |
+|---|---|---|
+| `echoCancellation` | subtracts what the speakers are playing from what the microphone hears | needs a reference of the output; can duck the near end during double-talk |
+| `noiseSuppression` | attenuates steady background noise — fans, traffic, hiss | thins quiet speech and can leave watery artefacts on music |
+| `autoGainControl` | rides the level towards a target loudness | pumps the noise floor up between phrases |
+| `voiceIsolation` | Chrome's stronger, model-based separation of voice from everything else | Chrome only; heavier, and it removes anything that is not a voice, music included |
+
+`voiceIsolation` is on the list because `livekit-client` turns it on by default; leaving it out of
+the interface would mean claiming noise suppression is off while a second suppressor is still
+running. What the browser actually applied is read back from `MediaStreamTrack.getSettings()` and
+reported as unknown where the browser reports nothing.
+
+Changing any of them, or switching input device, restarts the underlying `MediaStreamTrack` and
+replaces it on the existing sender: the publication and every subscription survive, and no
+renegotiation happens. While the microphone is muted the change is held instead — restarting a
+muted track would re-open the device and light the browser's recording indicator — and applied on
+unmute; `state().microphone.pendingWhileMuted` says so.
+
+Device names are only revealed by the browser after the microphone has been granted once. Before
+that the list is real but unnamed, and the module labels the entries `Microphone 1`, `Microphone 2`
+with `named: false` and a note saying why. A `devicechange` that removes the chosen microphone falls
+back to the system default and says so, rather than leaving a dead track.
+
+The screen share is published as `screen_share`, never as a camera: the server keys its stream
+tracker and its bandwidth policy off the source, and a screen holding still must not be read as a
+layer that stopped arriving. It is published single-layer VP8, capped at 1080p15. Screen audio comes
+only when the browser offers it — Chrome and Edge share tab or system sound only when the box in the
+picker is ticked, Firefox and Safari not at all — and the module says the share is silent instead of
+pretending otherwise. A picker closed without a choice and a blocked permission are the same
+`NotAllowedError` in every browser, so the module reports the pair rather than guessing between
+them, and a share stopped from the browser's own bar unpublishes and reports itself the same as one
+stopped from our button.
+
+## The interface
+
+The room is the shape a voice chat has settled into, and nothing more: a persistent list of who is
+present down the left, the people or the shared screen in the middle, and one bar of controls along
+the bottom holding mute, the microphone chooser, the noise-suppression switch, screen share, camera,
+the bench and leave. When somebody is sharing a screen it takes the main area and the participants
+shrink to a strip beneath it; when nobody is, the participants fill it. Two people with the same
+name keep the last four characters of their identity beside it, as they always have.
+
+What the page will not do is look calm about something it cannot see:
+
+- **Speaking is measured, not announced.** This SFU does not send `SpeakersChanged`, so an
+  indicator driven by the server's opinion would stay dark for ever. Every ring on this page comes
+  from an `AnalyserNode` on the track's own audio; the section below says how.
+- **A participant nobody can measure reads as unknown**, with a dashed outline and a sentence on
+  hover: a track that is published but not subscribed, one the server paused for bandwidth, a
+  microphone that was never opened, or a browser that gave the page no audio context at all. None of
+  those are shown as `listening`.
+- **A muted microphone reads as muted on every page**, because the mute travels as a track event and
+  each page paints it from the publication rather than from a guess.
+- **Every control says what it will do and reports what happened.** A refused microphone says which
+  setting to change; a screen picker closed without a choice says so, and says that no browser
+  distinguishes that from a blocked permission; a failed publish names the source the token would
+  have needed. The noise-suppression button carries what the browser *reports* it applied, which is
+  not always what was asked for, and says `asked for on` where the browser reports nothing.
+
+Every control is a real `button`, `input` or `select`, reachable and operable from the keyboard, with
+a visible focus ring, an accessible name that changes with its state, and `aria-pressed` /
+`aria-checked` wherever it toggles. Escape closes the audio menu and returns focus to the button that
+opened it. `prefers-reduced-motion` turns the speaking pulse off.
+
+The bench is one press away rather than always on, and while it is open **it owns the video**: the
+bench tiles attach the tracks and the stage does not. A track attached in two places is a track
+either renderer can detach from under the other, so only one of them ever holds it.
 
 ## What the page shows
 
-**The link panel**, five numbers straight from `RTCPeerConnection.getStats()` on the client's own
-transports, sampled once a second:
+**The link panel**, in the bench view, five numbers straight from `RTCPeerConnection.getStats()` on
+the client's own transports, sampled once a second:
 
 | Cell | Source |
 |---|---|
@@ -282,6 +373,12 @@ one `AnalyserNode` per participant, fed from the track's own `MediaStreamTrack`,
 150 ms, RMS over the threshold marks that participant as speaking and holds it for half a second so
 the dot does not flicker between syllables. Local and remote are measured the same way, which also
 means the indicator keeps working unchanged once the server does start reporting speakers.
+
+Changing a processing setting or switching input device replaces the local `MediaStreamTrack` behind
+the publication, and a meter left on the old one would report silence for ever. The capture module
+announces the swap as `microphonetrack`, and the page re-attaches the analyser to the new track on
+that event. Where no analyser could be built at all — no `AudioContext`, or a track that is not
+subscribed — the participant is painted as unknown rather than as quiet.
 
 ## Two decisions worth stating
 

@@ -11,16 +11,50 @@ import {
   formatMillis,
   write,
 } from "/readout.js";
+import { createMedia } from "/media.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 const SPEAKING_RMS = 0.02;
 const SPEAKING_HOLD_MS = 500;
 const METER_INTERVAL_MS = 150;
 const BENCH_INTERVAL_MS = 1000;
+const NOTICE_MS = 12000;
 const PRESETS = { 180: "h180", 360: "h360", 720: "h720" };
+const SYSTEM_DEFAULT = "";
+
+const PROCESSING_ROWS = [
+  {
+    key: "echoCancellation",
+    label: "Echo cancellation",
+    note: "Subtracts what the speakers are playing from what the microphone hears.",
+  },
+  {
+    key: "noiseSuppression",
+    label: "Noise suppression",
+    note: "Attenuates steady background noise: fans, traffic, hiss.",
+  },
+  {
+    key: "autoGainControl",
+    label: "Automatic gain",
+    note: "Rides the level towards a target loudness between phrases.",
+  },
+  {
+    key: "voiceIsolation",
+    label: "Voice isolation",
+    note:
+      "A stronger separation of a voice from everything else. Chrome offers it and the client " +
+      "asks for it by default; other browsers do not report it either way.",
+  },
+];
+
+const NO_AUDIO_CONTEXT =
+  "this browser gave the page no audio context, so nothing here can tell whether they are speaking";
+const NOT_SUBSCRIBED =
+  "the server has not sent this track to this browser, so nothing here can tell whether they are speaking";
+const NOT_PUBLISHED =
+  "the microphone is open in this browser but the server has not accepted a publication for it";
 
 const el = {
-  main: document.querySelector("main"),
   lobby: document.getElementById("lobby"),
   lobbyRoom: document.getElementById("lobby-room"),
   lobbyStatus: document.getElementById("lobby-status"),
@@ -28,22 +62,43 @@ const el = {
   form: document.getElementById("join-form"),
   name: document.getElementById("name"),
   join: document.getElementById("join"),
-  video: document.getElementById("with-video"),
+  withVideo: document.getElementById("with-video"),
   room: document.getElementById("room"),
   roomName: document.getElementById("room-name"),
   roomCount: document.getElementById("room-count"),
   roomState: document.getElementById("room-state"),
   roomError: document.getElementById("room-error"),
   participants: document.getElementById("participants"),
+  cards: document.getElementById("cards"),
+  share: document.getElementById("share"),
+  shareFrame: document.getElementById("share-frame"),
+  shareWho: document.getElementById("share-who"),
+  shareTabs: document.getElementById("share-tabs"),
+  bench: document.getElementById("bench"),
   tiles: document.getElementById("tiles"),
   estimate: document.getElementById("link-estimate"),
-  arriving: document.getElementById("link-arriving"),
-  video: document.getElementById("link-video"),
+  arrivingRate: document.getElementById("link-arriving"),
+  videoRate: document.getElementById("link-video"),
   rtt: document.getElementById("link-rtt"),
   sending: document.getElementById("link-sending"),
+  notice: document.getElementById("notice"),
+  noticeText: document.getElementById("notice-text"),
+  noticeDismiss: document.getElementById("notice-dismiss"),
   enableAudio: document.getElementById("enable-audio"),
-  camera: document.getElementById("camera"),
+  audioMenu: document.getElementById("audio-menu"),
+  audioSettings: document.getElementById("audio-settings"),
+  micSelect: document.getElementById("mic-select"),
+  micNote: document.getElementById("mic-note"),
+  processing: document.getElementById("processing"),
   mute: document.getElementById("mute"),
+  muteLabel: document.getElementById("mute-label"),
+  noise: document.getElementById("noise"),
+  noiseSub: document.getElementById("noise-sub"),
+  shareScreen: document.getElementById("share-screen"),
+  shareLabel: document.getElementById("share-label"),
+  camera: document.getElementById("camera"),
+  cameraLabel: document.getElementById("camera-label"),
+  benchToggle: document.getElementById("bench-toggle"),
   leave: document.getElementById("leave"),
   audio: document.getElementById("audio"),
   footUrl: document.getElementById("foot-url"),
@@ -54,6 +109,7 @@ const requestedRoom = query.get("room");
 const wantsSimulcast = query.get("simulcast") !== "0";
 
 let lk = null;
+let media = null;
 let settings = {
   room: "demo",
   wsUrl: "",
@@ -61,32 +117,54 @@ let settings = {
   roomNamespaceSeparator: ".",
 };
 let room = null;
-let micTrack = null;
 let cameraTrack = null;
 let speaking = new Set();
 const meters = new Map();
 const arriving = new Map();
+const cards = new Map();
+const switches = new Map();
+const pending = { mute: false, share: false, camera: false };
 let meterTimer = null;
 let audioContext = null;
 let bench = null;
 let benchTimer = null;
 let lastReading = null;
 let tiles = null;
+let showBench = false;
+let selectedShare = null;
+let shareSignature = "";
+let deviceSignature = "";
+let sharedElement = null;
+let sharedTrack = null;
+let noticeTimer = null;
 
 start();
 
 async function start() {
   tiles = createTiles(el.tiles);
-  el.video.checked = query.get("video") === "1";
+  el.withVideo.checked = query.get("video") === "1";
+  showBench = query.get("bench") === "1";
 
   el.form.addEventListener("submit", onJoin);
-  el.camera.addEventListener("click", onCamera);
   el.mute.addEventListener("click", onMute);
+  el.noise.addEventListener("click", () => applyProcessing("noiseSuppression"));
+  el.audioSettings.addEventListener("click", () => toggleMenu());
+  el.micSelect.addEventListener("change", onSelectMicrophone);
+  el.shareScreen.addEventListener("click", onShareScreen);
+  el.camera.addEventListener("click", onCamera);
+  el.benchToggle.addEventListener("click", onBenchToggle);
   el.leave.addEventListener("click", () => leave("You left the room."));
   el.enableAudio.addEventListener("click", onEnableAudio);
+  el.noticeDismiss.addEventListener("click", () => clearNotice());
+  document.addEventListener("keydown", onKeydown);
+  document.addEventListener("pointerdown", onPointerDown);
   window.addEventListener("pagehide", () => {
     if (room) room.disconnect();
   });
+
+  buildSwitches();
+  paintBenchToggle();
+  paintControls();
 
   settings = await loadSettings();
   el.lobbyRoom.textContent = roomLabel();
@@ -112,13 +190,20 @@ async function start() {
     return;
   }
 
+  media = createMedia(lk);
+  media.on("change", onMediaChange);
+  media.on("microphonetrack", onMicrophoneTrack);
+  media.on("screensharestopped", onScreenShareStopped);
+  media.on("notice", (entry) => showNotice(entry.text));
+
+  paintControls();
   ready();
 }
 
 function ready() {
   el.join.disabled = false;
   el.name.disabled = false;
-  el.video.disabled = false;
+  el.withVideo.disabled = false;
   el.lobbyStatus.textContent = "";
   el.name.focus();
 }
@@ -151,28 +236,23 @@ async function onJoin(event) {
     return;
   }
 
-  const withVideo = el.video.checked;
-  busy(true, "Asking for the microphone…");
+  const withVideo = el.withVideo.checked;
+  busy(true, "Asking for the microphone...");
 
-  try {
-    micTrack = await lk.createLocalAudioTrack({
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    });
-  } catch (error) {
+  const opened = await media.openMicrophone();
+  if (!opened.opened) {
     busy(false, "");
-    fail(el.lobbyError, microphoneMessage(error));
+    fail(el.lobbyError, opened.reason);
     return;
   }
 
-  busy(true, "Connecting…");
+  busy(true, "Connecting...");
 
   let credentials;
   try {
     credentials = await mintToken(name);
   } catch (error) {
-    await releaseMicrophone();
+    await media.release();
     busy(false, "");
     fail(el.lobbyError, error.message);
     return;
@@ -181,8 +261,8 @@ async function onJoin(event) {
   try {
     await connect(credentials);
   } catch (error) {
-    await releaseMicrophone();
     await discardRoom();
+    await media.release();
     busy(false, "");
     fail(el.lobbyError, connectionMessage(error, credentials.url));
     return;
@@ -228,6 +308,8 @@ async function connect(credentials) {
     .on(lk.RoomEvent.ParticipantDisconnected, onParticipantDisconnected)
     .on(lk.RoomEvent.TrackSubscribed, onTrackSubscribed)
     .on(lk.RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
+    .on(lk.RoomEvent.TrackPublished, render)
+    .on(lk.RoomEvent.TrackUnpublished, render)
     .on(lk.RoomEvent.TrackMuted, render)
     .on(lk.RoomEvent.TrackUnmuted, render)
     .on(lk.RoomEvent.TrackStreamStateChanged, render)
@@ -238,20 +320,24 @@ async function connect(credentials) {
     .on(lk.RoomEvent.Disconnected, onDisconnected);
 
   await room.connect(credentials.url, credentials.token);
-  await room.localParticipant.publishTrack(micTrack);
-  watchLevel(room.localParticipant.identity, micTrack);
+  media.attach(room);
+
+  const published = await media.publishMicrophone();
+  if (!published.published) throw new Error(published.reason);
+
+  watchLevel(room.localParticipant.identity, media.microphoneTrack);
   startBench();
 }
 
 function enterRoom(credentials) {
   el.roomName.textContent = credentials.room;
-  el.footUrl.textContent = `${credentials.url} · ${credentials.identity}`;
+  el.footUrl.textContent = `${credentials.url} - ${credentials.identity}`;
   hide(el.roomError);
   el.lobby.hidden = true;
   el.room.hidden = false;
-  updateMuteButton();
-  updateCameraButton();
   onPlaybackStatus();
+  paintControls();
+  paintDevices();
   render();
   el.mute.focus();
 }
@@ -259,13 +345,21 @@ function enterRoom(credentials) {
 async function leave(reason) {
   await discardRoom();
   await releaseCamera();
-  await releaseMicrophone();
+  if (media) {
+    await media.detach();
+    await media.release();
+  }
   stopBench();
   dropAllLevels();
   tiles.clear();
-  el.main.dataset.wide = "false";
+  clearCards();
+  paintShare(null);
+  paintShareTabs([]);
   el.audio.replaceChildren();
   speaking = new Set();
+  selectedShare = null;
+  toggleMenu(false);
+  clearNotice();
   el.room.hidden = true;
   el.lobby.hidden = false;
   busy(false, reason || "");
@@ -278,13 +372,6 @@ async function discardRoom() {
   room = null;
   leaving.removeAllListeners();
   await leaving.disconnect();
-}
-
-async function releaseMicrophone() {
-  if (!micTrack) return;
-  const track = micTrack;
-  micTrack = null;
-  await track.stop();
 }
 
 async function releaseCamera() {
@@ -302,8 +389,8 @@ function capturePreset() {
 async function startCamera() {
   if (!room || cameraTrack) return;
 
-  el.camera.disabled = true;
-  el.camera.textContent = "Starting camera…";
+  pending.camera = true;
+  paintControls();
 
   const preset = capturePreset();
   try {
@@ -319,23 +406,24 @@ async function startCamera() {
     fail(el.roomError, cameraMessage(error));
   }
 
-  el.camera.disabled = false;
-  updateCameraButton();
+  pending.camera = false;
+  paintControls();
   render();
 }
 
 async function stopCamera() {
   if (!room || !cameraTrack) return;
 
-  el.camera.disabled = true;
+  pending.camera = true;
+  paintControls();
   try {
     await room.localParticipant.unpublishTrack(cameraTrack, true);
   } catch (error) {
     console.warn("the camera track could not be unpublished cleanly", error);
   }
   await releaseCamera();
-  el.camera.disabled = false;
-  updateCameraButton();
+  pending.camera = false;
+  paintControls();
   render();
 }
 
@@ -348,8 +436,146 @@ async function onCamera() {
   }
 }
 
-function updateCameraButton() {
-  el.camera.textContent = cameraTrack ? "Stop camera" : "Start camera";
+async function onShareScreen() {
+  if (!media || !room) return;
+  hide(el.roomError);
+
+  pending.share = true;
+  paintControls();
+
+  if (media.state().screenShare.active) {
+    await media.stopScreenShare();
+    showNotice("You stopped sharing your screen.");
+  } else {
+    const result = await media.startScreenShare();
+    if (result.outcome === "started") {
+      showNotice(
+        result.audioNote ||
+          (result.audio
+            ? "Sharing your screen, with the sound the browser handed over with it."
+            : "Sharing your screen."),
+      );
+    } else if (result.outcome === "cancelled" || result.outcome === "unsupported") {
+      showNotice(result.reason);
+    } else {
+      fail(el.roomError, result.reason);
+    }
+  }
+
+  pending.share = false;
+  paintControls();
+  render();
+}
+
+function onScreenShareStopped() {
+  paintControls();
+  render();
+}
+
+async function onMute() {
+  if (!media) return;
+  pending.mute = true;
+  paintControls();
+  const result = await media.toggleMuted();
+  pending.mute = false;
+  if (result.reason) fail(el.roomError, result.reason);
+  paintControls();
+  render();
+}
+
+async function applyProcessing(key) {
+  if (!media) return;
+  hide(el.roomError);
+
+  const wanted = !media.state().processing[key];
+  const result = await media.setProcessing({ [key]: wanted });
+  const label = PROCESSING_ROWS.find((row) => row.key === key).label;
+
+  if (result.applied) {
+    showNotice(`${label} is now ${wanted ? "on" : "off"}.`);
+  } else if (result.deferred) {
+    showNotice(
+      `${label} will change when you unmute. Restarting the capture while you are muted would ` +
+        "re-open the device and light the browser's recording indicator.",
+    );
+  } else if (result.reason) {
+    fail(el.roomError, result.reason);
+  }
+
+  paintControls();
+}
+
+async function onSelectMicrophone() {
+  if (!media) return;
+  hide(el.roomError);
+
+  const chosen = el.micSelect.value;
+  const result = await media.selectMicrophone(chosen === SYSTEM_DEFAULT ? null : chosen);
+
+  if (result.applied) {
+    showNotice(
+      "Switched microphone. Nobody was unsubscribed: only the capture behind the publication changed.",
+    );
+  } else if (result.deferred) {
+    showNotice("The microphone will switch when you unmute.");
+  } else if (result.reason) {
+    fail(el.roomError, result.reason);
+  }
+
+  paintControls();
+}
+
+function onBenchToggle() {
+  showBench = !showBench;
+  paintBenchToggle();
+  render();
+  if (lastReading) paint(lastReading);
+}
+
+function paintBenchToggle() {
+  el.benchToggle.setAttribute("aria-pressed", String(showBench));
+  el.benchToggle.setAttribute(
+    "aria-label",
+    showBench ? "Hide the bandwidth bench" : "Show the bandwidth bench",
+  );
+  el.benchToggle.dataset.on = String(showBench);
+  el.bench.hidden = !showBench;
+}
+
+function toggleMenu(open) {
+  const next = open === undefined ? el.audioMenu.hidden : open;
+  el.audioMenu.hidden = !next;
+  el.audioSettings.setAttribute("aria-expanded", String(next));
+  el.audioSettings.dataset.on = String(next);
+  if (!next) return;
+
+  paintDevices();
+  el.micSelect.focus();
+  if (media) media.listMicrophones().then(paintDevices);
+}
+
+function onKeydown(event) {
+  if (event.key !== "Escape" || el.audioMenu.hidden) return;
+  toggleMenu(false);
+  el.audioSettings.focus();
+}
+
+function onPointerDown(event) {
+  if (el.audioMenu.hidden) return;
+  if (el.audioMenu.contains(event.target) || el.audioSettings.contains(event.target)) return;
+  toggleMenu(false);
+}
+
+function onMediaChange() {
+  paintControls();
+  paintDevices();
+  render();
+}
+
+function onMicrophoneTrack(entry) {
+  if (!room || !entry.track) return;
+  watchLevel(room.localParticipant.identity, entry.track);
+  render();
 }
 
 function startBench() {
@@ -394,7 +620,7 @@ async function pump() {
 
 function paint(reading) {
   paintLink(reading.link);
-  tiles.paint(reading);
+  if (showBench) tiles.paint(reading);
   paintArriving(reading);
 }
 
@@ -404,8 +630,8 @@ function paintLink(link) {
     formatBitrate(link.estimate),
     link.note || link.pairNote || link.estimateNote || NOT_REPORTED,
   );
-  write(el.arriving, formatBitrate(link.arriving), link.note || FIRST_SAMPLE);
-  write(el.video, formatBitrate(link.video), link.note || link.videoNote || FIRST_SAMPLE);
+  write(el.arrivingRate, formatBitrate(link.arriving), link.note || FIRST_SAMPLE);
+  write(el.videoRate, formatBitrate(link.video), link.note || link.videoNote || FIRST_SAMPLE);
   write(el.rtt, formatMillis(link.rtt), link.note || link.pairNote || NOT_REPORTED);
   write(el.sending, formatBitrate(link.sending), link.sendingNote || NOT_REPORTED);
 }
@@ -422,7 +648,7 @@ function onTrackSubscribed(track, _publication, participant) {
     const element = track.attach();
     element.dataset.identity = participant.identity;
     el.audio.appendChild(element);
-    watchLevel(participant.identity, track);
+    if (track.source === lk.Track.Source.Microphone) watchLevel(participant.identity, track);
   }
   render();
 }
@@ -430,7 +656,7 @@ function onTrackSubscribed(track, _publication, participant) {
 function onTrackUnsubscribed(track, publication, participant) {
   if (track.kind === lk.Track.Kind.Audio) {
     track.detach().forEach((element) => element.remove());
-    dropLevel(participant.identity);
+    if (track.source === lk.Track.Source.Microphone) dropLevel(participant.identity);
   }
   if (bench && publication) bench.forget(publication.trackSid);
   render();
@@ -442,7 +668,7 @@ function onParticipantDisconnected(participant) {
 }
 
 function watchLevel(identity, track) {
-  const source = track.mediaStreamTrack;
+  const source = track && track.mediaStreamTrack;
   if (!source) return;
 
   dropLevel(identity);
@@ -473,7 +699,7 @@ function ensureAudioContext() {
     try {
       audioContext = new Ctor();
     } catch (error) {
-      console.warn("no audio context, the speaking indicator stays dark", error);
+      console.warn("no audio context, so this page cannot say who is speaking", error);
       return null;
     }
   }
@@ -542,7 +768,7 @@ function onConnectionState(state) {
     );
   } else if (state === lk.ConnectionState.Reconnecting) {
     setState("lost", "reconnecting");
-    fail(el.roomError, "The connection dropped. Trying to get it back…");
+    fail(el.roomError, "The connection dropped. Trying to get it back.");
   } else if (state === lk.ConnectionState.Connecting) {
     setState("", "connecting");
   }
@@ -559,10 +785,7 @@ async function onEnableAudio() {
     await room.startAudio();
     onPlaybackStatus();
   } catch (error) {
-    fail(
-      el.roomError,
-      `The browser would not start audio playback: ${error.message || error}`,
-    );
+    fail(el.roomError, `The browser would not start audio playback: ${error.message || error}`);
   }
 }
 
@@ -579,27 +802,6 @@ function disconnectDetail(reason) {
   const names = lk.DisconnectReason;
   const name = names && typeof names === "object" ? names[reason] : undefined;
   return typeof name === "string" ? ` (${name.toLowerCase().replace(/_/g, " ")})` : "";
-}
-
-async function onMute() {
-  if (!micTrack) return;
-  el.mute.disabled = true;
-  try {
-    if (micTrack.isMuted) {
-      await micTrack.unmute();
-    } else {
-      await micTrack.mute();
-    }
-  } finally {
-    el.mute.disabled = false;
-  }
-  updateMuteButton();
-  render();
-}
-
-function updateMuteButton() {
-  const muted = Boolean(micTrack && micTrack.isMuted);
-  el.mute.textContent = muted ? "Unmute" : "Mute";
 }
 
 function render() {
@@ -621,21 +823,169 @@ function render() {
   el.roomCount.textContent =
     people.length === 1 ? "Just you so far." : `${people.length} people in the room.`;
 
-  const wanted = videoTiles(people, labels);
-  tiles.sync(wanted);
-  el.main.dataset.wide = String(wanted.length > 0);
+  const shares = screenShares(people, labels);
+  const chosen = chooseShare(shares);
+  paintShareTabs(shares);
+
+  // A track attached in two places at once is a track either renderer can rip
+  // out from under the other, so the bench owns the video or the stage does.
+  if (showBench) {
+    clearCards();
+    paintShare(null);
+    tiles.sync(videoTiles(people, labels));
+  } else {
+    tiles.clear();
+    paintShare(chosen);
+    syncCards(cardEntries(people, labels));
+  }
+
+  el.bench.hidden = !showBench;
+  el.cards.dataset.compact = String(Boolean(chosen));
+  paintControls();
 
   if (lastReading) paint(lastReading);
 }
 
+function screenShares(people, labels) {
+  const found = [];
+  const local = media ? media.screenShareTracks.video : null;
+
+  if (local) {
+    found.push({
+      key: "local-share",
+      label: labels.get(room.localParticipant.identity),
+      track: local,
+      local: true,
+    });
+  }
+
+  for (const participant of people) {
+    if (participant === room.localParticipant) continue;
+    for (const publication of participant.videoTrackPublications.values()) {
+      if (publication.source !== lk.Track.Source.ScreenShare) continue;
+      if (!publication.track) continue;
+      found.push({
+        key: publication.trackSid,
+        label: labels.get(participant.identity),
+        track: publication.track,
+        local: false,
+      });
+    }
+  }
+
+  return found;
+}
+
+function chooseShare(shares) {
+  if (shares.length === 0) {
+    selectedShare = null;
+    return null;
+  }
+  const kept = shares.find((entry) => entry.key === selectedShare);
+  const chosen = kept || shares[0];
+  selectedShare = chosen.key;
+  return chosen;
+}
+
+function paintShare(entry) {
+  if (!entry) {
+    if (sharedTrack && sharedElement) sharedTrack.detach(sharedElement);
+    if (sharedElement) sharedElement.remove();
+    sharedTrack = null;
+    sharedElement = null;
+    el.share.hidden = true;
+    el.shareFrame.replaceChildren();
+    return;
+  }
+
+  el.share.hidden = false;
+
+  if (sharedTrack !== entry.track) {
+    if (sharedTrack && sharedElement) sharedTrack.detach(sharedElement);
+    if (sharedElement) sharedElement.remove();
+    sharedElement = entry.track.attach();
+    sharedElement.autoplay = true;
+    sharedElement.playsInline = true;
+    sharedElement.muted = true;
+    sharedTrack = entry.track;
+    el.shareFrame.replaceChildren(sharedElement);
+  }
+
+  el.shareWho.textContent = entry.local
+    ? "You are sharing your screen. Everyone in the room sees this."
+    : `${entry.label} is sharing a screen.`;
+}
+
+function paintShareTabs(shares) {
+  const signature = shares.map((entry) => `${entry.key} ${entry.label}`).join("");
+  const same = signature === shareSignature;
+  shareSignature = signature;
+
+  el.shareTabs.hidden = shares.length < 2;
+  if (shares.length < 2) {
+    if (!same) el.shareTabs.replaceChildren();
+    return;
+  }
+
+  if (!same) {
+    el.shareTabs.replaceChildren(
+      ...shares.map((entry) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "share-tab";
+        button.dataset.key = entry.key;
+        button.textContent = entry.local ? `${entry.label} (you)` : entry.label;
+        button.addEventListener("click", () => {
+          selectedShare = entry.key;
+          render();
+        });
+        return button;
+      }),
+    );
+  }
+
+  for (const button of el.shareTabs.children) {
+    button.setAttribute("aria-pressed", String(button.dataset.key === selectedShare));
+  }
+}
+
+function cardEntries(people, labels) {
+  return people.map((participant) => {
+    const isLocal = participant === room.localParticipant;
+    const described = describeParticipant(participant, isLocal);
+    return {
+      key: participant.identity,
+      label: labels.get(participant.identity) || displayName(participant),
+      local: isLocal,
+      track: cameraFor(participant, isLocal),
+      ...described,
+    };
+  });
+}
+
+function cameraFor(participant, isLocal) {
+  if (isLocal) return cameraTrack;
+  for (const publication of participant.videoTrackPublications.values()) {
+    if (publication.source === lk.Track.Source.ScreenShare) continue;
+    if (publication.track) return publication.track;
+  }
+  return null;
+}
+
 function videoTiles(people, labels) {
   const wanted = [];
+  const localShare = media ? media.screenShareTracks.video : null;
 
-  if (cameraTrack) {
+  // One local tile, whatever is going out. bench.js reads the rungs off every
+  // outbound video encoding at once, so a second tile would repeat the first
+  // one's numbers under a label claiming they belonged to one of the two.
+  if (cameraTrack || localShare) {
+    const sending =
+      cameraTrack && localShare ? "camera and screen" : cameraTrack ? "camera" : "screen";
     wanted.push({
       key: "local",
-      label: `${labels.get(room.localParticipant.identity)} · you`,
-      track: cameraTrack,
+      label: `${labels.get(room.localParticipant.identity)} - you, ${sending}`,
+      track: cameraTrack || localShare,
       local: true,
     });
   }
@@ -644,9 +994,11 @@ function videoTiles(people, labels) {
     if (participant === room.localParticipant) continue;
     for (const publication of participant.videoTrackPublications.values()) {
       if (!publication.track) continue;
+      const label = labels.get(participant.identity);
       wanted.push({
         key: publication.trackSid,
-        label: labels.get(participant.identity),
+        label:
+          publication.source === lk.Track.Source.ScreenShare ? `${label} - screen` : label,
         track: publication.track,
         local: false,
       });
@@ -660,7 +1012,8 @@ function labelsFor(people) {
   const seen = new Map();
   for (const participant of people) {
     const name = displayName(participant);
-    seen.set(name, (seen.get(name) || 0) + 1);
+    const counted = seen.get(name);
+    seen.set(name, counted === undefined ? 1 : counted + 1);
   }
 
   const labels = new Map();
@@ -683,20 +1036,82 @@ function shortIdentity(identity) {
   return tail || String(identity);
 }
 
-function renderParticipant(participant, isLocal, label) {
+function microphoneOf(participant) {
   const publications = [...participant.audioTrackPublications.values()];
-  const publication = publications[0];
-  const muted = isLocal
-    ? Boolean(micTrack && micTrack.isMuted)
-    : Boolean(publication && publication.isMuted);
-  const talking = speaking.has(participant.identity) && !muted;
+  return (
+    publications.find((publication) => publication.source === lk.Track.Source.Microphone) ||
+    publications.find(
+      (publication) => publication.source !== lk.Track.Source.ScreenShareAudio,
+    ) ||
+    null
+  );
+}
+
+/**
+ * The one place that decides what a participant's audio is doing. Anything the
+ * page cannot measure comes back as "unknown" carrying the reason, because the
+ * alternative -- printing "listening" for a track nobody is receiving -- is the
+ * page telling a comfortable lie.
+ */
+function describeParticipant(participant, isLocal) {
+  const identity = participant.identity;
+  const status = media ? media.state().microphone : null;
+
+  if (isLocal) {
+    if (!status || !status.open) {
+      return unknownState("no microphone", "this page has not opened a microphone");
+    }
+    if (status.muted) return mutedState();
+    if (!status.published) return unknownState("not published", NOT_PUBLISHED);
+    return level(identity);
+  }
+
+  const publication = microphoneOf(participant);
+  if (!publication) {
+    return unknownState("no microphone", "this participant is not publishing a microphone");
+  }
+  if (publication.isMuted) return mutedState();
+  if (!publication.track) return unknownState("not subscribed", NOT_SUBSCRIBED);
+  if (publication.track.streamState === "paused") {
+    return unknownState(
+      "paused",
+      "the server stopped forwarding this track, so there is nothing arriving to measure",
+    );
+  }
+
+  return level(identity);
+}
+
+function mutedState() {
+  return { state: "muted", text: "muted", reason: null, muted: true, speaking: false };
+}
+
+function level(identity) {
+  if (!meters.has(identity)) return unknownState("level unknown", NO_AUDIO_CONTEXT);
+  const talking = speaking.has(identity);
+  return {
+    state: talking ? "speaking" : "listening",
+    text: talking ? "speaking" : "listening",
+    reason: null,
+    muted: false,
+    speaking: talking,
+  };
+}
+
+function unknownState(text, reason) {
+  return { state: "unknown", text, reason, muted: false, speaking: false };
+}
+
+function renderParticipant(participant, isLocal, label) {
+  const described = describeParticipant(participant, isLocal);
 
   const row = document.createElement("li");
-  row.dataset.speaking = String(talking);
-  row.dataset.muted = String(muted);
+  row.dataset.speaking = String(described.speaking);
+  row.dataset.muted = String(described.muted);
+  row.dataset.state = described.state;
 
-  const level = document.createElement("span");
-  level.className = "level";
+  const dot = document.createElement("span");
+  dot.className = "level";
 
   const who = document.createElement("span");
   who.className = "who";
@@ -710,22 +1125,16 @@ function renderParticipant(participant, isLocal, label) {
 
   const state = document.createElement("span");
   state.className = "state";
-  if (!publication) {
-    state.textContent = "no microphone";
-  } else if (muted) {
-    state.textContent = "muted";
-  } else if (talking) {
-    state.textContent = "speaking";
-  } else {
-    state.textContent = "listening";
-  }
+  state.textContent = described.text;
+  if (described.reason) state.title = described.reason;
 
-  row.append(level, who, state);
+  row.append(dot, who, state);
 
-  if (!isLocal && publication) {
+  const publication = isLocal ? null : microphoneOf(participant);
+  if (publication) {
     const heard = document.createElement("span");
     heard.className = "heard";
-    heard.textContent = "…";
+    heard.textContent = "...";
     row.appendChild(heard);
     arriving.set(participant.identity, { node: heard, sid: publication.trackSid });
   }
@@ -733,29 +1142,349 @@ function renderParticipant(participant, isLocal, label) {
   return row;
 }
 
-function microphoneMessage(error) {
-  switch (error && error.name) {
-    case "NotAllowedError":
-    case "PermissionDeniedError":
-      return (
-        "The microphone was blocked. Open the padlock in the address bar, set Microphone " +
-        "to Allow for this site, then press Join again."
-      );
-    case "NotFoundError":
-    case "DevicesNotFoundError":
-      return (
-        "No microphone was found. Connect one, or choose an input device in the system " +
-        "sound settings, then press Join again."
-      );
-    case "NotReadableError":
-    case "TrackStartError":
-      return (
-        "The microphone is already in use by another application. Close it and press " +
-        "Join again."
-      );
-    default:
-      return `The microphone could not be opened: ${(error && error.message) || error}.`;
+function syncCards(entries) {
+  const keys = new Set(entries.map((entry) => entry.key));
+
+  for (const [key, card] of [...cards]) {
+    if (keys.has(key)) continue;
+    detachCard(card);
+    card.node.remove();
+    cards.delete(key);
   }
+
+  for (const entry of entries) {
+    let card = cards.get(entry.key);
+    if (!card) {
+      card = buildCard();
+      cards.set(entry.key, card);
+      el.cards.appendChild(card.node);
+    }
+    paintCard(card, entry);
+  }
+
+  const ordered = entries.map((entry) => cards.get(entry.key).node);
+  const settled =
+    ordered.length === el.cards.children.length &&
+    ordered.every((node, index) => el.cards.children[index] === node);
+  if (!settled) el.cards.replaceChildren(...ordered);
+
+  el.cards.hidden = entries.length === 0;
+}
+
+function buildCard() {
+  const node = document.createElement("li");
+  node.className = "card-tile";
+  node.dataset.video = "false";
+
+  const frame = document.createElement("div");
+  frame.className = "card-frame";
+
+  const avatar = document.createElement("span");
+  avatar.className = "avatar";
+  frame.appendChild(avatar);
+
+  const foot = document.createElement("div");
+  foot.className = "card-foot";
+
+  const who = document.createElement("span");
+  who.className = "who";
+
+  const state = document.createElement("span");
+  state.className = "state";
+
+  foot.append(who, state);
+  node.append(frame, foot);
+
+  return { node, frame, avatar, who, state, track: null, video: null };
+}
+
+function paintCard(card, entry) {
+  card.node.dataset.speaking = String(entry.speaking);
+  card.node.dataset.muted = String(entry.muted);
+  card.node.dataset.state = entry.state;
+
+  card.who.textContent = entry.local ? `${entry.label} - you` : entry.label;
+  card.state.textContent = entry.text;
+  if (entry.reason) {
+    card.state.title = entry.reason;
+  } else {
+    card.state.removeAttribute("title");
+  }
+
+  card.avatar.textContent = initials(entry.label);
+
+  if (card.track === entry.track) return;
+
+  detachCard(card);
+  card.track = entry.track || null;
+  if (!card.track) return;
+
+  card.video = card.track.attach();
+  card.video.autoplay = true;
+  card.video.playsInline = true;
+  card.video.muted = true;
+  card.frame.appendChild(card.video);
+  card.node.dataset.video = "true";
+}
+
+function detachCard(card) {
+  if (card.track && card.video) card.track.detach(card.video);
+  if (card.video) card.video.remove();
+  card.track = null;
+  card.video = null;
+  card.node.dataset.video = "false";
+}
+
+function clearCards() {
+  for (const [key, card] of [...cards]) {
+    detachCard(card);
+    card.node.remove();
+    cards.delete(key);
+  }
+  el.cards.hidden = true;
+}
+
+function initials(label) {
+  const words = String(label || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) return "?";
+  const first = [...words[0]][0] || "";
+  const second = words.length > 1 ? [...words[words.length - 1]][0] || "" : "";
+  return (first + second).toUpperCase();
+}
+
+function paintControls() {
+  const state = media ? media.state() : null;
+  const open = Boolean(state && state.microphone.open);
+  const muted = Boolean(state && state.microphone.muted);
+
+  el.mute.disabled = !open || pending.mute;
+  el.mute.setAttribute("aria-pressed", String(muted));
+  el.mute.dataset.on = String(open && !muted);
+  el.mute.dataset.alert = String(muted);
+  el.muteLabel.textContent = muted ? "Unmute" : "Mute";
+  el.mute.setAttribute("aria-label", muted ? "Unmute your microphone" : "Mute your microphone");
+  icon(el.mute, muted ? "#icon-mic-off" : "#icon-mic");
+  el.mute.title = open
+    ? "Muting stops the packets leaving; every page in the room shows it at once."
+    : "No microphone is open.";
+
+  paintNoise(state);
+
+  const sharing = Boolean(state && state.screenShare.active);
+  const canShare = Boolean(state && state.support.screenShare);
+  el.shareScreen.disabled = !room || !canShare || pending.share;
+  el.shareScreen.setAttribute("aria-pressed", String(sharing));
+  el.shareScreen.dataset.on = String(sharing);
+  el.shareLabel.textContent = sharing ? "Stop sharing" : "Share screen";
+  el.shareScreen.setAttribute(
+    "aria-label",
+    sharing ? "Stop sharing your screen" : "Share your screen",
+  );
+  icon(el.shareScreen, sharing ? "#icon-screen-off" : "#icon-screen");
+  el.shareScreen.title = canShare
+    ? "The browser asks which window or screen; this page never sees the choice, only the result."
+    : "This browser does not offer screen capture to a web page.";
+
+  el.camera.disabled = !room || pending.camera;
+  el.camera.setAttribute("aria-pressed", String(Boolean(cameraTrack)));
+  el.camera.dataset.on = String(Boolean(cameraTrack));
+  el.cameraLabel.textContent = pending.camera
+    ? "Working"
+    : cameraTrack
+      ? "Stop camera"
+      : "Start camera";
+  el.camera.setAttribute("aria-label", cameraTrack ? "Stop your camera" : "Start your camera");
+  icon(el.camera, cameraTrack ? "#icon-camera-off" : "#icon-camera");
+
+  el.audioSettings.disabled = !media;
+  el.micSelect.disabled = !state || !state.support.deviceList || state.devices.list.length === 0;
+
+  paintSwitches(state);
+}
+
+function paintNoise(state) {
+  const wanted = state ? Boolean(state.processing.noiseSuppression) : false;
+  const effective = state && state.effective ? state.effective.noiseSuppression : null;
+  const held = Boolean(state && state.microphone.pendingWhileMuted);
+
+  el.noise.disabled = !state || !state.microphone.open;
+  el.noise.setAttribute("aria-pressed", String(wanted));
+  el.noise.dataset.on = String(wanted);
+
+  if (!state || !state.microphone.open) {
+    sub("no microphone", true, "Open a microphone first.");
+    return;
+  }
+  if (held) {
+    sub(
+      "applies on unmute",
+      true,
+      "Restarting the capture while you are muted would re-open the device and light the " +
+        "browser's recording indicator, so the change is held.",
+    );
+    return;
+  }
+  if (effective === null) {
+    sub(
+      wanted ? "asked for on" : "asked for off",
+      true,
+      "This browser does not report whether it applied noise suppression.",
+    );
+    return;
+  }
+  if (effective !== wanted) {
+    sub(
+      effective ? "browser: on" : "browser: off",
+      true,
+      "The browser reports something other than what was asked for, and what it reports is what " +
+        "the room hears.",
+    );
+    return;
+  }
+
+  sub(
+    effective ? "on" : "off",
+    false,
+    "The browser confirms this is what it applied, before the audio was encoded.",
+  );
+}
+
+function sub(text, missing, title) {
+  el.noiseSub.textContent = text;
+  el.noiseSub.dataset.missing = String(missing);
+  el.noise.title = title;
+  el.noise.setAttribute("aria-label", `Noise suppression, ${text}`);
+}
+
+function buildSwitches() {
+  el.processing.replaceChildren(
+    ...PROCESSING_ROWS.map((row) => {
+      const item = document.createElement("li");
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "switch";
+      button.dataset.key = row.key;
+      button.setAttribute("role", "switch");
+      button.setAttribute("aria-checked", "false");
+
+      const track = document.createElement("span");
+      track.className = "switch-track";
+      track.setAttribute("aria-hidden", "true");
+
+      const name = document.createElement("span");
+      name.className = "switch-name";
+      name.textContent = row.label;
+
+      button.append(track, name);
+      button.addEventListener("click", () => applyProcessing(row.key));
+
+      const effective = document.createElement("p");
+      effective.className = "switch-effective";
+
+      const note = document.createElement("p");
+      note.className = "switch-note";
+      note.textContent = row.note;
+
+      item.append(button, effective, note);
+      switches.set(row.key, { button, effective });
+      return item;
+    }),
+  );
+}
+
+function paintSwitches(state) {
+  for (const row of PROCESSING_ROWS) {
+    const entry = switches.get(row.key);
+    const wanted = state ? Boolean(state.processing[row.key]) : false;
+    entry.button.setAttribute("aria-checked", String(wanted));
+    entry.button.disabled = !state || !state.microphone.open;
+
+    const reported = state && state.effective ? state.effective[row.key] : null;
+
+    if (!state || !state.microphone.open) {
+      say(entry.effective, "no microphone is open, so the browser reports nothing", true);
+    } else if (state.microphone.pendingWhileMuted) {
+      say(entry.effective, "held until you unmute", true);
+    } else if (reported === null) {
+      say(entry.effective, "this browser does not report whether it applied this", true);
+    } else {
+      say(entry.effective, `the browser reports it is ${reported ? "on" : "off"}`, false);
+    }
+  }
+}
+
+function say(node, text, missing) {
+  node.textContent = text;
+  node.dataset.missing = String(missing);
+}
+
+function paintDevices() {
+  if (!media) return;
+  const { devices, microphone, support } = media.state();
+
+  const options = [
+    { value: SYSTEM_DEFAULT, text: "System default" },
+    ...devices.list.map((device) => ({ value: device.deviceId, text: device.label })),
+  ];
+  const signature = options.map((option) => `${option.value} ${option.text}`).join("");
+
+  if (signature !== deviceSignature) {
+    deviceSignature = signature;
+    el.micSelect.replaceChildren(
+      ...options.map((option) => {
+        const node = document.createElement("option");
+        node.value = option.value;
+        node.textContent = option.text;
+        return node;
+      }),
+    );
+  }
+
+  el.micSelect.value = microphone.deviceId || SYSTEM_DEFAULT;
+
+  const lines = [];
+  if (devices.note) lines.push(devices.note);
+  if (!support.deviceList) {
+    lines.push(
+      "This browser offers no device list, so the input can only be chosen in the system sound " +
+        "settings.",
+    );
+  } else if (microphone.open) {
+    const active = devices.list.find((device) => device.deviceId === microphone.activeDeviceId);
+    lines.push(
+      active && active.named
+        ? `The browser reports it opened "${active.label}".`
+        : "The browser does not report which device it opened.",
+    );
+  }
+
+  const note = lines.join(" ");
+  el.micNote.textContent = note;
+  el.micNote.hidden = note === "";
+}
+
+function icon(button, href) {
+  const use = button.querySelector("use");
+  if (use) use.setAttribute("href", href);
+}
+
+function showNotice(text) {
+  if (!text) return;
+  el.noticeText.textContent = text;
+  el.notice.hidden = false;
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(clearNotice, NOTICE_MS);
+}
+
+function clearNotice() {
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = null;
+  el.notice.hidden = true;
+  el.noticeText.textContent = "";
 }
 
 function cameraMessage(error) {
@@ -796,8 +1525,8 @@ function setState(kind, label) {
 function busy(active, message) {
   el.join.disabled = active;
   el.name.disabled = active;
-  el.video.disabled = active;
-  el.join.textContent = active ? "Joining…" : "Join";
+  el.withVideo.disabled = active;
+  el.join.textContent = active ? "Joining..." : "Join";
   el.lobbyStatus.textContent = message;
 }
 
@@ -805,7 +1534,7 @@ function block(message) {
   fail(el.lobbyError, message);
   el.join.disabled = true;
   el.name.disabled = true;
-  el.video.disabled = true;
+  el.withVideo.disabled = true;
 }
 
 function fail(node, message) {
