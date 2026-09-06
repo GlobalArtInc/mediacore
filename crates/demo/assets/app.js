@@ -16,6 +16,15 @@ import {
 } from "/readout.js";
 import { createMedia } from "/media.js";
 import { createDenoiser } from "/denoise.js";
+import {
+  afterRefusal,
+  afterRequest,
+  frameArea,
+  fullscreenPlan,
+  nextShare,
+  shareBadge,
+  sizeChange,
+} from "/stage.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 
@@ -31,6 +40,7 @@ const SPEAKING_HOLD_MS = 500;
 const METER_INTERVAL_MS = 150;
 const BENCH_INTERVAL_MS = 1000;
 const NOTICE_MS = 12000;
+const TOGGLE_GUARD_MS = 350;
 const PRESETS = { 180: "h180", 360: "h360", 720: "h720" };
 const SYSTEM_DEFAULT = "";
 
@@ -121,7 +131,13 @@ const el = {
   cards: document.getElementById("cards"),
   share: document.getElementById("share"),
   shareFrame: document.getElementById("share-frame"),
+  shareStats: document.getElementById("share-stats"),
+  shareFullscreen: document.getElementById("share-fullscreen"),
+  shareFullscreenLabel: document.getElementById("share-fullscreen-label"),
   shareWho: document.getElementById("share-who"),
+  shareLive: document.getElementById("share-live"),
+  shareState: document.getElementById("share-state"),
+  shareSpeaking: document.getElementById("share-speaking"),
   shareTabs: document.getElementById("share-tabs"),
   bench: document.getElementById("bench"),
   tiles: document.getElementById("tiles"),
@@ -136,6 +152,7 @@ const el = {
   enableAudio: document.getElementById("enable-audio"),
   audioMenu: document.getElementById("audio-menu"),
   audioSettings: document.getElementById("audio-settings"),
+  audioClose: document.getElementById("audio-close"),
   micSelect: document.getElementById("mic-select"),
   micNote: document.getElementById("mic-note"),
   processing: document.getElementById("processing"),
@@ -186,12 +203,18 @@ let benchTimer = null;
 let lastReading = null;
 let tiles = null;
 let showBench = false;
-let selectedShare = null;
+let pinnedShare = null;
+let stageShare = null;
 let shareSignature = "";
 let deviceSignature = "";
 let sharedElement = null;
 let sharedTrack = null;
 let noticeTimer = null;
+let fullscreen = "off";
+let shareSize = { key: null, resolution: null, area: null };
+let shareSeen = null;
+let shareTimer = null;
+let fullscreenToggledAt = 0;
 
 start();
 
@@ -204,8 +227,15 @@ async function start() {
   el.mute.addEventListener("click", onMute);
   el.noise.addEventListener("click", onCycleNoise);
   el.audioSettings.addEventListener("click", () => toggleMenu());
+  el.audioClose.addEventListener("click", () => {
+    toggleMenu(false);
+    el.audioSettings.focus();
+  });
   el.micSelect.addEventListener("change", onSelectMicrophone);
   el.shareScreen.addEventListener("click", onShareScreen);
+  el.shareFullscreen.addEventListener("click", onToggleFullscreen);
+  el.shareFrame.addEventListener("dblclick", onToggleFullscreen);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
   el.camera.addEventListener("click", onCamera);
   el.benchToggle.addEventListener("click", onBenchToggle);
   el.leave.addEventListener("click", () => leave("You left the room."));
@@ -219,6 +249,7 @@ async function start() {
 
   buildSwitches();
   buildNoiseChoices();
+  paintFullscreenControl();
   buildDenoiseReadout();
   paintBenchToggle();
   paintControls();
@@ -428,11 +459,13 @@ async function leave(reason) {
   dropAllLevels();
   tiles.clear();
   clearCards();
-  paintShare(null);
+  leaveFullscreen();
+  scheduleShareRecheck(null);
+  paintShare(null, false);
   paintShareTabs([]);
   el.audio.replaceChildren();
   speaking = new Set();
-  selectedShare = null;
+  pinnedShare = null;
   toggleMenu(false);
   clearNotice();
   el.room.hidden = true;
@@ -648,6 +681,10 @@ async function onSelectMicrophone() {
 
 function onBenchToggle() {
   showBench = !showBench;
+  if (showBench && fullscreen !== "off") {
+    leaveFullscreen();
+    showNotice("The bench holds the video while it is open, so the fullscreen view closed.");
+  }
   paintBenchToggle();
   render();
   if (lastReading) paint(lastReading);
@@ -676,9 +713,20 @@ function toggleMenu(open) {
 }
 
 function onKeydown(event) {
-  if (event.key !== "Escape" || el.audioMenu.hidden) return;
-  toggleMenu(false);
-  el.audioSettings.focus();
+  if (event.key !== "Escape") return;
+
+  if (!el.audioMenu.hidden) {
+    toggleMenu(false);
+    el.audioSettings.focus();
+    return;
+  }
+
+  // A fullscreen the browser granted is the browser's to leave, and it does.
+  // One the page had to draw itself is the page's, and nothing else would.
+  if (fullscreen === "fallback") {
+    leaveFullscreen();
+    el.shareFullscreen.focus();
+  }
 }
 
 function onPointerDown(event) {
@@ -743,6 +791,7 @@ function paint(reading) {
   paintLink(reading.link);
   if (showBench) tiles.paint(reading);
   paintArriving(reading);
+  paintShareStats();
 }
 
 function paintLink(link) {
@@ -945,26 +994,55 @@ function render() {
     people.length === 1 ? "Just you so far." : `${people.length} people in the room.`;
 
   const shares = screenShares(people, labels);
-  const chosen = chooseShare(shares);
+  const step = nextShare(pinnedShare, shares, { link: linkState(), now: performance.now() });
+  pinnedShare = step.pinned;
+  scheduleShareRecheck(step.waitFor);
   paintShareTabs(shares);
 
   // A track attached in two places at once is a track either renderer can rip
   // out from under the other, so the bench owns the video or the stage does.
   if (showBench) {
     clearCards();
-    paintShare(null);
+    paintShare(null, false);
     tiles.sync(videoTiles(people, labels));
   } else {
     tiles.clear();
-    paintShare(chosen);
-    syncCards(cardEntries(people, labels));
+    paintShare(step.entry, step.outcome === "waiting");
+    // A tile behind a fullscreen share is a video this machine keeps decoding
+    // into something `display: none`, which buys the share nothing at all.
+    if (fullscreen === "off") syncCards(cardEntries(people, labels));
+    else clearCards();
   }
 
   el.bench.hidden = !showBench;
-  el.cards.dataset.compact = String(Boolean(chosen));
+  el.cards.dataset.compact = String(Boolean(step.entry) || step.outcome === "waiting");
+  paintStageSpeaking(people, labels);
+  announceShareChange(step);
   paintControls();
 
   if (lastReading) paint(lastReading);
+}
+
+/**
+ * Whether the room is in a position to say anything about a share at all. A
+ * reconnecting room has dropped every remote participant, so its empty share
+ * list is the absence of news rather than news of an absence.
+ */
+function linkState() {
+  if (!room) return "gone";
+  if (room.state === lk.ConnectionState.Connected) return "connected";
+  if (room.state === lk.ConnectionState.Disconnected) return "gone";
+  return "waiting";
+}
+
+function scheduleShareRecheck(waitFor) {
+  if (shareTimer) clearTimeout(shareTimer);
+  shareTimer = null;
+  if (typeof waitFor !== "number") return;
+  shareTimer = setTimeout(() => {
+    shareTimer = null;
+    render();
+  }, waitFor);
 }
 
 function screenShares(people, labels) {
@@ -974,7 +1052,9 @@ function screenShares(people, labels) {
   if (local) {
     found.push({
       key: "local-share",
+      identity: room.localParticipant.identity,
       label: labels.get(room.localParticipant.identity),
+      owner: "You",
       track: local,
       local: true,
     });
@@ -987,7 +1067,9 @@ function screenShares(people, labels) {
       if (!publication.track) continue;
       found.push({
         key: publication.trackSid,
+        identity: participant.identity,
         label: labels.get(participant.identity),
+        owner: labels.get(participant.identity),
         track: publication.track,
         local: false,
       });
@@ -997,25 +1079,75 @@ function screenShares(people, labels) {
   return found;
 }
 
-function chooseShare(shares) {
-  if (shares.length === 0) {
-    selectedShare = null;
-    return null;
+/**
+ * A share that ends under a viewer who is watching it fullscreen leaves them
+ * looking at a dead rectangle, so the fullscreen view is closed and the reason
+ * is said. When somebody else is still sharing there is somewhere to go instead
+ * of out, and going there is named too.
+ */
+function announceShareChange(step) {
+  if (showBench) return;
+
+  if (step.outcome === "switched") {
+    showNotice(`${step.gone} stopped sharing, so you are now watching ${shareName(step.entry)}.`);
+    return;
   }
-  const kept = shares.find((entry) => entry.key === selectedShare);
-  const chosen = kept || shares[0];
-  selectedShare = chosen.key;
-  return chosen;
+  if (step.outcome === "none" && step.gone && fullscreen !== "off") {
+    leaveFullscreen();
+    showNotice(`${step.gone} stopped sharing, so the fullscreen view closed.`);
+    return;
+  }
+  // A room that ended took the picture with it, and `#room-error` is already
+  // saying so. Naming the person whose screen it was would be blaming them for
+  // the one thing here that was nobody's doing.
+  if (step.outcome === "ended" && fullscreen !== "off") leaveFullscreen();
 }
 
-function paintShare(entry) {
+/**
+ * Fullscreen hides the roster and the tiles, which were the only two places the
+ * page ever showed who was talking, so the stage carries its own line.
+ */
+function paintStageSpeaking(people, labels) {
+  const talking = people
+    .filter((participant) => speaking.has(participant.identity))
+    .map((participant) =>
+      participant === room.localParticipant
+        ? "you"
+        : labels.get(participant.identity) || displayName(participant),
+    );
+
+  el.shareSpeaking.textContent =
+    talking.length === 0 ? "Nobody is speaking." : `Speaking: ${talking.join(", ")}.`;
+}
+
+function shareOwner(entry) {
+  return entry.local ? "You" : entry.label;
+}
+
+function shareName(entry) {
+  return entry.local ? "your own screen" : entry.label;
+}
+
+function paintShare(entry, waiting) {
+  stageShare = entry || null;
+
   if (!entry) {
+    hideShareStats();
     if (sharedTrack && sharedElement) sharedTrack.detach(sharedElement);
     if (sharedElement) sharedElement.remove();
     sharedTrack = null;
     sharedElement = null;
-    el.share.hidden = true;
     el.shareFrame.replaceChildren();
+
+    if (waiting) {
+      el.share.hidden = false;
+      el.shareWho.textContent = "Waiting for the shared screen.";
+      return;
+    }
+
+    rescueFocus(el.share);
+    el.share.hidden = true;
+    el.shareWho.textContent = "";
     return;
   }
 
@@ -1035,6 +1167,23 @@ function paintShare(entry) {
   el.shareWho.textContent = entry.local
     ? "You are sharing your screen. Everyone in the room sees this."
     : `${entry.label} is sharing a screen.`;
+
+  paintShareStats();
+}
+
+/**
+ * `[hidden]` is `display: none`, and the focused element going away hands focus
+ * back to the body, so the next Tab restarts at the top of the page -- from
+ * exactly the button a keyboard user pressed to get here.
+ */
+function rescueFocus(container) {
+  if (!container.contains(document.activeElement)) return;
+  for (const control of [el.mute, el.shareScreen, el.leave]) {
+    if (control && !control.disabled) {
+      control.focus();
+      return;
+    }
+  }
 }
 
 function paintShareTabs(shares) {
@@ -1049,6 +1198,11 @@ function paintShareTabs(shares) {
   }
 
   if (!same) {
+    const standing =
+      document.activeElement && el.shareTabs.contains(document.activeElement)
+        ? document.activeElement.dataset.key
+        : null;
+
     el.shareTabs.replaceChildren(
       ...shares.map((entry) => {
         const button = document.createElement("button");
@@ -1057,17 +1211,212 @@ function paintShareTabs(shares) {
         button.dataset.key = entry.key;
         button.textContent = entry.local ? `${entry.label} (you)` : entry.label;
         button.addEventListener("click", () => {
-          selectedShare = entry.key;
+          pinnedShare = {
+            key: entry.key,
+            identity: entry.identity || null,
+            label: shareOwner(entry),
+            since: null,
+          };
           render();
         });
         return button;
       }),
     );
+
+    if (standing) {
+      const back = [...el.shareTabs.children].find((button) => button.dataset.key === standing);
+      if (back) back.focus();
+    }
   }
 
+  const held = pinnedShare ? pinnedShare.key : null;
   for (const button of el.shareTabs.children) {
-    button.setAttribute("aria-pressed", String(button.dataset.key === selectedShare));
+    button.setAttribute("aria-pressed", String(button.dataset.key === held));
   }
+}
+
+/**
+ * Fullscreen is asked for on the whole room, not on the video: everything a
+ * person reaches for once the picture fills the screen -- mute, the microphone
+ * chooser, the tab of the other person's share, leave -- is inside `#room`, and
+ * a video element taken fullscreen on its own takes none of it along.
+ */
+function fullscreenSupport() {
+  return {
+    request: typeof el.room.requestFullscreen === "function",
+    enabled:
+      typeof document.fullscreenEnabled === "boolean" ? document.fullscreenEnabled : undefined,
+  };
+}
+
+function onToggleFullscreen() {
+  // The picture answers a double click, so people double-click the button as
+  // well. Bound to `click`, that would be in and straight back out again.
+  const now = performance.now();
+  if (now - fullscreenToggledAt < TOGGLE_GUARD_MS) return;
+  fullscreenToggledAt = now;
+
+  if (fullscreen !== "off") {
+    leaveFullscreen();
+    el.shareFullscreen.focus();
+    return;
+  }
+  if (!stageShare) return;
+  enterFullscreen();
+}
+
+async function enterFullscreen() {
+  const plan = fullscreenPlan(fullscreenSupport());
+
+  if (plan.mode === "native") {
+    let taken;
+    try {
+      await el.room.requestFullscreen();
+      taken = afterRequest(document.fullscreenElement === el.room);
+    } catch (error) {
+      console.warn("the browser refused fullscreen", error);
+      taken = afterRefusal(error);
+    }
+
+    if (taken.mode === "native") {
+      applyFullscreen("native");
+      return;
+    }
+    fillTheWindow(taken.reason);
+    return;
+  }
+
+  fillTheWindow(plan.reason);
+}
+
+function fillTheWindow(reason) {
+  applyFullscreen("fallback");
+  showNotice(
+    `The shared screen now fills the window, because ${reason}. Press Escape, or the same ` +
+      "button, to go back to the room.",
+  );
+}
+
+function leaveFullscreen() {
+  const wasNative = fullscreen === "native";
+  applyFullscreen("off");
+
+  if (wasNative && document.fullscreenElement === el.room && document.exitFullscreen) {
+    document.exitFullscreen().catch((error) => {
+      console.warn("the browser would not leave fullscreen", error);
+    });
+  }
+}
+
+function applyFullscreen(mode) {
+  const was = fullscreen;
+  fullscreen = mode;
+  el.room.dataset.fullscreen = mode;
+  paintFullscreenControl();
+
+  // The tiles behind the share are attached and detached by `render`, which is
+  // not on this stack: leaving fullscreen is one of the things `render` does.
+  if ((was === "off") !== (mode === "off")) queueMicrotask(() => render());
+}
+
+// The browser owns Escape while it owns the screen, so this is how the page
+// hears about a fullscreen it did not leave itself.
+function onFullscreenChange() {
+  if (document.fullscreenElement === el.room) {
+    applyFullscreen("native");
+    return;
+  }
+  if (fullscreen === "native") applyFullscreen("off");
+}
+
+function paintFullscreenControl() {
+  const active = fullscreen !== "off";
+  // A window with the browser's own chrome still around it is not fullscreen,
+  // and a control that says it is would be the last thing on screen still
+  // claiming it once the notice has cleared.
+  const drawn = fullscreen === "fallback";
+
+  el.shareFullscreenLabel.textContent = active
+    ? drawn
+      ? "Exit full window"
+      : "Exit fullscreen"
+    : "Fullscreen";
+  el.shareFullscreen.setAttribute("aria-pressed", String(active));
+  el.shareFullscreen.setAttribute(
+    "aria-label",
+    active
+      ? drawn
+        ? "Leave the full-window view and go back to the room"
+        : "Leave fullscreen and go back to the room"
+      : "Show the shared screen fullscreen",
+  );
+  el.shareFullscreen.title = active
+    ? fullscreen === "fallback"
+      ? "This browser would not hand the page fullscreen, so the shared screen fills the " +
+        "window instead. Escape leaves it, and the controls below stay where they are."
+      : "Escape leaves fullscreen. The controls below stay where they are."
+    : "The shared screen fills the screen, controls and all. Double-clicking it does the same.";
+  icon(el.shareFullscreen, active ? "#icon-collapse" : "#icon-expand");
+  el.shareLive.hidden = !active;
+}
+
+/**
+ * What actually arrived, in the corner: the frame size and the bitrate this
+ * browser reports for the track on the stage, and nothing at all when it
+ * reports neither. Nothing here is inferred from what was published.
+ */
+function paintShareStats() {
+  if (!stageShare) {
+    hideShareStats();
+    return;
+  }
+
+  const reading = shareReading(stageShare);
+  const badge = shareBadge(reading, formatBitrate);
+
+  const measured = { key: stageShare.key, resolution: badge.resolution, area: frameArea(reading) };
+  // Two readings a second apart have to agree before a size is called a change,
+  // so an encoder drawing breath is not reported as somebody changing window.
+  if (shareSeen && shareSeen.key === measured.key && shareSeen.resolution === measured.resolution) {
+    const change = sizeChange(shareSize, measured);
+    if (change) showNotice(change.text);
+    shareSize = measured;
+  }
+  shareSeen = measured;
+
+  if (badge.text === null) {
+    hideShareStats();
+    return;
+  }
+
+  const measures = stageShare.local
+    ? "What this browser reports it is sending for the shared screen."
+    : "What this browser reports arriving for the shared screen.";
+
+  el.shareStats.hidden = false;
+  el.shareStats.textContent = badge.text;
+  el.shareStats.title = badge.note ? `${measures} ${capitalise(badge.note)}.` : measures;
+}
+
+function hideShareStats() {
+  shareSize = { key: null, resolution: null, area: null };
+  shareSeen = null;
+  el.shareStats.hidden = true;
+  el.shareStats.textContent = "";
+  el.shareStats.removeAttribute("title");
+}
+
+function shareReading(entry) {
+  if (!lastReading || !entry) return null;
+  if (!entry.local) return lastReading.tracks.get(entry.key) || null;
+
+  const source = entry.track ? entry.track.mediaStreamTrack : null;
+  if (!source || !lastReading.localTracks) return null;
+  return lastReading.localTracks.get(source.id) || null;
+}
+
+function capitalise(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function cardEntries(people, labels) {
@@ -1905,6 +2254,8 @@ function connectionMessage(error, url) {
 function setState(kind, label) {
   el.roomState.dataset.state = kind;
   el.roomState.textContent = label;
+  el.shareState.dataset.state = kind;
+  el.shareState.textContent = label;
 }
 
 function busy(active, message) {

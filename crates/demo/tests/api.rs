@@ -1116,3 +1116,374 @@ async fn every_icon_the_script_swaps_in_exists_in_the_page() {
         );
     }
 }
+
+fn body_of<'a>(js: &'a str, signature: &str) -> &'a str {
+    js.split_once(signature)
+        .unwrap_or_else(|| panic!("{signature} is defined"))
+        .1
+        .split_once("\n}\n")
+        .unwrap_or_else(|| panic!("{signature} is closed"))
+        .0
+}
+
+fn rule_of<'a>(css: &'a str, selector: &str) -> &'a str {
+    css.split_once(&format!("{selector} {{"))
+        .unwrap_or_else(|| panic!("the stylesheet has no rule for {selector}"))
+        .1
+        .split_once('}')
+        .expect("the rule is closed")
+        .0
+}
+
+#[tokio::test]
+async fn the_shared_screen_can_be_taken_fullscreen_by_button_by_double_click_and_left_by_escape() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let button = page
+        .split_once(r#"id="share-fullscreen""#)
+        .expect("the shared screen carries no fullscreen control")
+        .1
+        .split_once('>')
+        .expect("the control is closed")
+        .0;
+    assert!(
+        button.contains(r#"type="button""#) && button.contains(r#"aria-pressed="false""#),
+        "the fullscreen control is not a real toggle a keyboard and a screen reader can work: \
+         {button}"
+    );
+
+    let share = page
+        .split_once(r#"<section id="share""#)
+        .expect("the stage has a share section")
+        .1
+        .split_once("</section>")
+        .expect("the share section is closed")
+        .0;
+    assert!(
+        share.contains(r#"id="share-fullscreen""#),
+        "the fullscreen control is somewhere other than on the tile it acts on"
+    );
+
+    assert!(
+        js.contains(r#"el.shareFullscreen.addEventListener("click", onToggleFullscreen)"#),
+        "the fullscreen button does nothing"
+    );
+    assert!(
+        js.contains(r#"el.shareFrame.addEventListener("dblclick", onToggleFullscreen)"#),
+        "double-clicking the video does not take it fullscreen"
+    );
+
+    let control = body_of(&js, "\nfunction paintFullscreenControl(");
+    for state in ["Exit fullscreen", "Fullscreen"] {
+        assert!(
+            control.contains(state),
+            "the control never says `{state}`, so it does not say which state it will put you in"
+        );
+    }
+    assert!(
+        control.contains(r#"el.shareFullscreen.setAttribute("aria-pressed", String(active))"#)
+            && control.contains(r#""aria-label","#),
+        "the control's state never reaches a screen reader: {control}"
+    );
+
+    let escape = body_of(&js, "\nfunction onKeydown(");
+    assert!(
+        escape.contains(r#"event.key !== "Escape""#) && escape.contains("leaveFullscreen()"),
+        "Escape does not leave the fullscreen this page drew itself, which no browser will \
+         leave for it"
+    );
+}
+
+#[tokio::test]
+async fn the_call_controls_stay_reachable_while_fullscreen() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    assert!(
+        js.contains("await el.room.requestFullscreen()"),
+        "fullscreen is asked for on something smaller than the room, so muting and leaving go \
+         off the screen with everything else"
+    );
+
+    let inside = page
+        .split_once(r#"id="room""#)
+        .expect("the room element is in the page")
+        .1;
+    let bar = inside
+        .find(r#"<div class="bar""#)
+        .expect("the control bar is in the page");
+    let sink = inside
+        .find(r#"id="audio""#)
+        .expect("the audio sink follows the room");
+    assert!(
+        bar < sink,
+        "the control bar is outside the element that goes fullscreen"
+    );
+
+    for line in css.lines().filter(|line| line.contains("data-fullscreen")) {
+        for gone in [".bar", ".dock", "#notice"] {
+            assert!(
+                !line.contains(gone),
+                "fullscreen hides `{gone}`, and leaving the call from inside it is exactly what \
+                 somebody will try: {line}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_browser_that_will_not_go_fullscreen_still_fills_the_window() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+    let (status, stage) = get(addr, "/stage.js").await;
+
+    assert_eq!(status, 200, "the stage module is not served");
+    assert!(
+        stage.contains("fullscreenPlan") && stage.contains("mode: \"fallback\""),
+        "nothing decides what to do with a browser that refuses fullscreen"
+    );
+
+    let enter = body_of(&js, "\nasync function enterFullscreen(");
+    assert!(
+        enter.contains("fullscreenPlan(fullscreenSupport())")
+            && enter.contains("fillTheWindow(plan.reason)")
+            && enter.contains("afterRefusal(error)")
+            && enter.contains("afterRequest(document.fullscreenElement === el.room)"),
+        "a browser with no Fullscreen API, one that refuses the request, and one that takes the \
+         request and stays where it is do not all land on the path that fills the window: {enter}"
+    );
+
+    let filled = rule_of(&css, r#"#room[data-fullscreen="fallback"]"#);
+    assert!(
+        filled.contains("position: fixed") && filled.contains("inset: 0"),
+        "the fallback does not actually fill the window: {filled}"
+    );
+}
+
+#[tokio::test]
+async fn what_arrived_is_shown_in_the_corner_of_the_shared_screen() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+    let (_, bench) = get(addr, "/bench.js").await;
+
+    assert!(
+        page.contains(r#"<p id="share-stats" class="share-stats" hidden></p>"#),
+        "the shared screen carries no readout, or ships one with something already in it"
+    );
+
+    let corner = rule_of(&css, ".share-stats");
+    assert!(
+        corner.contains("position: absolute"),
+        "the readout is not in a corner of the picture: {corner}"
+    );
+
+    let paint = body_of(&js, "\nfunction paintShareStats(");
+    assert!(
+        paint.contains("shareBadge(reading, formatBitrate)"),
+        "the corner does not read the browser's own numbers"
+    );
+    assert!(
+        paint.contains("badge.text === null") && paint.contains("hideShareStats()"),
+        "a browser that reported nothing still gets a badge drawn over the picture: {paint}"
+    );
+
+    assert!(
+        bench.contains("trackIdentifier") && bench.contains("mediaSourceId"),
+        "the bench cannot tell one local track's outbound stream from another's, so a screen \
+         share's bitrate would move when a camera beside it did"
+    );
+}
+
+#[tokio::test]
+async fn a_share_that_ends_under_a_viewer_does_not_leave_a_dead_rectangle() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let announce = body_of(&js, "\nfunction announceShareChange(");
+    assert!(
+        announce.contains("leaveFullscreen()") && announce.contains("showNotice("),
+        "a share that ends while somebody is watching it fullscreen leaves them in fullscreen, \
+         or leaves without a word: {announce}"
+    );
+    assert!(
+        announce.contains(r#"step.outcome === "switched""#),
+        "the viewer is moved to the other share in silence"
+    );
+
+    let render = body_of(&js, "\nfunction render(");
+    assert!(
+        render.contains("announceShareChange(step)"),
+        "nothing notices a share appearing or ending"
+    );
+
+    let bench = body_of(&js, "\nfunction onBenchToggle(");
+    assert!(
+        bench.contains("leaveFullscreen()"),
+        "opening the bench takes the video off the stage without leaving the fullscreen that \
+         was showing it"
+    );
+}
+
+#[tokio::test]
+async fn the_shared_screen_is_never_displaced_by_whoever_is_speaking() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, stage) = get(addr, "/stage.js").await;
+
+    for name in ["screenShares(", "nextShare("] {
+        let body = if name == "nextShare(" {
+            body_of(&stage, "\nexport function nextShare(")
+        } else {
+            body_of(&js, "\nfunction screenShares(")
+        };
+        assert!(
+            !body.contains("speaking"),
+            "what the stage shows depends on who is talking, which is the one thing sharing a \
+             screen exists to override: {name}"
+        );
+    }
+
+    let sample = body_of(&js, "\nfunction sample(");
+    assert!(
+        !sample.contains("Share"),
+        "the speaking meter reaches into the stage: {sample}"
+    );
+
+    let render = body_of(&js, "\nfunction render(");
+    assert!(
+        render.contains("nextShare(pinnedShare, shares,"),
+        "the stage no longer keeps the share it was holding"
+    );
+}
+
+#[tokio::test]
+async fn a_link_that_dropped_is_not_reported_as_somebody_ending_their_share() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, stage) = get(addr, "/stage.js").await;
+    let (_, css) = get(addr, "/app.css").await;
+
+    let render = body_of(&js, "\nfunction render(");
+    assert!(
+        render.contains("link: linkState()"),
+        "the stage decides a share has ended without knowing whether the room is still there, \
+         so a reconnect empties the participant list and the page blames whoever was sharing"
+    );
+
+    let link = body_of(&js, "\nfunction linkState(");
+    for state in ["Connected", "Disconnected"] {
+        assert!(
+            link.contains(state),
+            "a reconnecting room is not told apart from one that ended: {link}"
+        );
+    }
+
+    let next = body_of(&stage, "\nexport function nextShare(");
+    assert!(
+        next.contains("SHARE_GRACE_MS") && next.contains(r#"outcome: "waiting""#)
+            || next.contains(r#"return waitingOn("#),
+        "an empty share list is concluded from at once, so a publisher swapping a window for a \
+         screen throws every viewer out of fullscreen: {next}"
+    );
+    assert!(
+        next.contains("entry.identity") && next.contains("held.identity"),
+        "shares are told apart only by track, so the same person starting a second capture \
+         reads as one person stopping and another beginning"
+    );
+
+    let announce = body_of(&js, "\nfunction announceShareChange(");
+    let ended = announce
+        .split_once(r#"step.outcome === "ended""#)
+        .expect("nothing handles a room that ended")
+        .1;
+    assert!(
+        !ended.contains("showNotice("),
+        "the room ending is announced as a person stopping their share: {ended}"
+    );
+
+    for rule in css
+        .split('}')
+        .filter(|rule| rule.contains("data-fullscreen") && rule.contains("display: none"))
+    {
+        assert!(
+            !rule.contains(".share-live"),
+            "fullscreen hides the one line that survives it, which is where who is speaking and \
+             whether the link is up are said: {rule}"
+        );
+    }
+    let live = rule_of(&css, ".share-live");
+    assert!(
+        live.contains("display: flex"),
+        "the stage carries no line for who is speaking: {live}"
+    );
+}
+
+#[tokio::test]
+async fn two_screens_shared_at_once_are_a_choice_and_not_a_race() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let share = page
+        .split_once(r#"<section id="share""#)
+        .expect("the stage has a share section")
+        .1
+        .split_once("</section>")
+        .expect("the share section is closed")
+        .0;
+    assert!(
+        share.contains(r#"id="share-tabs""#) && share.contains(r#"role="group""#),
+        "two people sharing at once are not offered as a choice"
+    );
+
+    let tabs = body_of(&js, "\nfunction paintShareTabs(");
+    assert!(
+        tabs.contains("el.shareTabs.hidden = shares.length < 2"),
+        "the chooser is shown for a single share, or hidden for two"
+    );
+    assert!(
+        tabs.contains(r#"button.type = "button""#)
+            && tabs.contains(r#"setAttribute("aria-pressed""#),
+        "the chooser is not a keyboard-reachable control that says which screen is on the stage"
+    );
+    assert!(
+        tabs.contains("key: entry.key,") && tabs.contains("label: shareOwner(entry),"),
+        "choosing a screen does not pin it, so the next render can move the stage under the \
+         person who chose"
+    );
+}
+
+#[tokio::test]
+async fn nothing_of_the_fullscreen_view_reaches_a_room_with_no_share() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        page.contains(r#"<section id="share" class="share" aria-label="Shared screen" hidden>"#),
+        "the share section no longer starts hidden, so an audio-only room shows an empty stage"
+    );
+    assert!(
+        page.contains(r#"<div id="room" class="shell" data-fullscreen="off" hidden>"#),
+        "the room does not start out of fullscreen"
+    );
+
+    let toggle = body_of(&js, "\nfunction onToggleFullscreen(");
+    assert!(
+        toggle.contains("if (!stageShare) return;"),
+        "fullscreen can be entered with nothing on the stage: {toggle}"
+    );
+
+    let leave = body_of(&js, "\nasync function leave(");
+    assert!(
+        leave.contains("leaveFullscreen()"),
+        "leaving the room leaves the browser in fullscreen"
+    );
+}

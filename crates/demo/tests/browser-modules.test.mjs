@@ -30,6 +30,21 @@ const { createDenoiser, createOverloadWatch, keepingUp, measureAgainst, readingF
   await import(`file://${assetPath("denoise.js")}`);
 const { monoDestination } = await import(`file://${assetPath("denoise.js")}`);
 const { READY, STALLED, install } = await import(`file://${assetPath("denoise-gate.js")}`);
+const {
+  FULLSCREEN_IGNORED,
+  FULLSCREEN_NOT_ALLOWED,
+  NO_BITRATE,
+  NO_FRAME_SIZE,
+  NO_FULLSCREEN_API,
+  afterRefusal,
+  afterRequest,
+  SHARE_GRACE_MS,
+  fullscreenPlan,
+  nextShare,
+  shareBadge,
+  sizeChange,
+} = await import(`file://${assetPath("stage.js")}`);
+const { createBench } = await import(`file://${assetPath("bench.js")}`);
 
 const QUANTUM = 128;
 const SAMPLE_RATE = 48000;
@@ -1312,7 +1327,404 @@ describe("the delay the node adds is measured, not quoted", () => {
   });
 });
 
+describe("the shared screen stays the main view, and says whose it is when it goes", () => {
+  const alice = { key: "sid-alice", identity: "alice", label: "Alice", owner: "Alice", local: false };
+  const bob = { key: "sid-bob", identity: "bob", label: "Bob", owner: "Bob", local: false };
+  const after = (ms) => ({ link: "connected", now: ms });
+
+  it("keeps the share it is holding however the room is reordered", () => {
+    const pinned = { key: bob.key, label: bob.label };
+
+    for (const shares of [
+      [alice, bob],
+      [bob, alice],
+    ]) {
+      const step = nextShare(pinned, shares);
+      assert.equal(step.outcome, "kept");
+      assert.equal(
+        step.key,
+        bob.key,
+        "the stage moved to another share because the list came back in a different order, " +
+          "which is what an active-speaker view would do to somebody trying to read a screen",
+      );
+      assert.equal(step.gone, null);
+    }
+  });
+
+  it("takes the first share when it is holding none", () => {
+    const step = nextShare(null, [alice, bob]);
+    assert.equal(step.outcome, "first");
+    assert.equal(step.key, alice.key);
+    assert.equal(step.gone, null);
+  });
+
+  it("moves to the share that is left, and names the one that ended", () => {
+    const step = nextShare({ key: alice.key, label: "Alice" }, [bob]);
+    assert.equal(step.outcome, "switched");
+    assert.equal(step.key, bob.key);
+    assert.equal(step.entry, bob);
+    assert.equal(
+      step.gone,
+      "Alice",
+      "the viewer is moved to another screen without being told whose ended",
+    );
+  });
+
+  it("reports an empty stage as empty once the wait is out, carrying who it was", () => {
+    const held = { key: bob.key, identity: "bob", label: "Bob", since: 0 };
+    const step = nextShare(held, [], after(SHARE_GRACE_MS + 1));
+    assert.equal(step.outcome, "none");
+    assert.equal(step.key, null);
+    assert.equal(step.entry, null);
+    assert.equal(
+      step.gone,
+      "Bob",
+      "a viewer left in fullscreen is given no reason for the picture stopping",
+    );
+  });
+
+  it("holds the share it had while the wait runs, and says nothing yet", () => {
+    const held = { key: bob.key, identity: "bob", label: "Bob", since: 0 };
+    const step = nextShare(held, [], after(SHARE_GRACE_MS - 1));
+    assert.equal(step.outcome, "waiting");
+    assert.equal(step.pinned.key, bob.key, "the stage let go of the share it was holding");
+    assert.equal(step.gone, null, "a share was announced as ended before it was known to be");
+    assert.ok(step.waitFor > 0, "nothing brings the stage back to look again");
+  });
+
+  it("waits without end while the room is not there to say anything", () => {
+    const held = { key: bob.key, identity: "bob", label: "Bob", since: 0 };
+    const step = nextShare(held, [], { link: "waiting", now: SHARE_GRACE_MS * 100 });
+    assert.equal(
+      step.outcome,
+      "waiting",
+      "a reconnecting room drops every remote participant, and reading that as the share " +
+        "ending blames the sharer for the viewer's own connection",
+    );
+    assert.equal(step.gone, null);
+    assert.equal(step.pinned.since, null, "the wait is timed from before the link went");
+  });
+
+  it("says a room that ended ended, and names nobody for it", () => {
+    const held = { key: bob.key, identity: "bob", label: "Bob", since: 0 };
+    const step = nextShare(held, [], { link: "gone", now: 1 });
+    assert.equal(step.outcome, "ended");
+    assert.equal(step.gone, null, "the room ending is put on the person who was sharing");
+    assert.equal(step.pinned, null);
+  });
+
+  it("reads the same publisher on a new track as one share continuing", () => {
+    const held = { key: bob.key, identity: "bob", label: "Bob", since: null };
+    const swapped = { key: "sid-bob-2", identity: "bob", label: "Bob", owner: "Bob", local: false };
+
+    const step = nextShare(held, [swapped], after(1));
+    assert.equal(
+      step.outcome,
+      "resumed",
+      "swapping a window for a whole screen mints a new track, and reading it as a stranger " +
+        "would tear the viewer out of fullscreen for the most ordinary thing a sharer does",
+    );
+    assert.equal(step.key, swapped.key);
+    assert.equal(step.gone, null);
+  });
+
+  it("says nothing about a share ending when there was never one", () => {
+    const step = nextShare(null, [], after(1));
+    assert.equal(step.outcome, "none");
+    assert.equal(step.gone, null, "an audio-only room announced a share that never existed");
+  });
+});
+
+describe("a browser that will not go fullscreen still fills the window", () => {
+  it("takes the browser's own fullscreen when it is offered", () => {
+    assert.deepEqual(fullscreenPlan({ request: true, enabled: true }), {
+      mode: "native",
+      reason: null,
+    });
+  });
+
+  it("does not require an answer from a browser that reports none", () => {
+    assert.equal(fullscreenPlan({ request: true, enabled: undefined }).mode, "native");
+  });
+
+  it("fills the window where a page cannot be made fullscreen at all", () => {
+    const plan = fullscreenPlan({ request: false, enabled: undefined });
+    assert.equal(
+      plan.mode,
+      "fallback",
+      "iOS Safari offers fullscreen to a video and to nothing else, and this is the path that " +
+        "leaves the call controls on the screen with the picture",
+    );
+    assert.equal(plan.reason, NO_FULLSCREEN_API);
+  });
+
+  it("fills the window where the document is forbidden fullscreen", () => {
+    const plan = fullscreenPlan({ request: true, enabled: false });
+    assert.equal(plan.mode, "fallback");
+    assert.equal(plan.reason, FULLSCREEN_NOT_ALLOWED);
+  });
+
+  it("does not believe a request that resolved without taking the screen", () => {
+    assert.deepEqual(afterRequest(true), { mode: "native", reason: null });
+
+    const ignored = afterRequest(false);
+    assert.equal(
+      ignored.mode,
+      "fallback",
+      "an embedded web view resolves the request and stays exactly where it was, and the page " +
+        "would sit in a fullscreen only the browser can leave, on a browser that never entered one",
+    );
+    assert.equal(ignored.reason, FULLSCREEN_IGNORED);
+  });
+
+  it("carries the browser's own words when the request is refused", () => {
+    const refused = afterRefusal(new Error("Permissions check failed"));
+    assert.equal(refused.mode, "fallback");
+    assert.equal(refused.reason, "Permissions check failed");
+    assert.match(afterRefusal(undefined).reason, /without saying why/);
+  });
+});
+
+describe("the corner of the shared screen shows what arrived, or nothing", () => {
+  const rate = (bps) => (bps >= 1_000_000 ? `${(bps / 1_000_000).toFixed(2)} Mb/s` : `${Math.round(bps / 1000)} kb/s`);
+
+  it("prints the frame size and the bitrate the browser reported", () => {
+    const badge = shareBadge({ width: 1920, height: 1080, bitrate: 2_100_000 }, rate);
+    assert.equal(badge.text, "1920×1080 · 2.10 Mb/s");
+    assert.equal(badge.note, null);
+  });
+
+  it("prints nothing at all when the browser reported neither", () => {
+    const badge = shareBadge({ width: null, height: null, bitrate: null }, rate);
+    assert.equal(
+      badge.text,
+      null,
+      "an empty badge is shown, which answers `I cannot see it` no better than a dash",
+    );
+    assert.equal(shareBadge(null, rate).text, null);
+  });
+
+  it("prints the half it has, and says which half is missing", () => {
+    const noRate = shareBadge({ width: 2560, height: 1440, bitrate: null }, rate);
+    assert.equal(noRate.text, "2560×1440");
+    assert.equal(noRate.note, NO_BITRATE);
+
+    const noSize = shareBadge({ width: null, height: null, bitrate: 400_000 }, rate);
+    assert.equal(noSize.text, "400 kb/s");
+    assert.equal(noSize.note, NO_FRAME_SIZE);
+  });
+
+  it("keeps a reported zero, and refuses a frame size of nothing", () => {
+    assert.equal(shareBadge({ width: 1280, height: 720, bitrate: 0 }, rate).text, "1280×720 · 0 kb/s");
+    assert.equal(
+      shareBadge({ width: 0, height: 0, bitrate: 500_000 }, rate).resolution,
+      null,
+      "`0×0` was printed as a resolution",
+    );
+  });
+});
+
+describe("a size the browser reports changing is said, and not explained", () => {
+  const hd = { key: "sid", resolution: "1920×1080", area: 1920 * 1080 };
+
+  it("says nothing the first time a size is seen", () => {
+    assert.equal(sizeChange({ key: null, resolution: null, area: null }, hd), null);
+  });
+
+  it("says nothing while the size holds", () => {
+    assert.equal(sizeChange(hd, hd), null);
+  });
+
+  it("names both sizes when the picture changes under the viewer", () => {
+    const change = sizeChange(hd, { key: "sid", resolution: "2560×1440", area: 2560 * 1440 });
+    assert.equal(change.from, "1920×1080");
+    assert.equal(change.to, "2560×1440");
+    assert.match(change.text, /now 2560×1440 \(it was 1920×1080\)/);
+    assert.doesNotMatch(
+      change.text,
+      /switch|window|screen changed/i,
+      "the line claims to know why the size moved, and an encoder scaling itself down under " +
+        "congestion moves it without anybody touching anything",
+    );
+  });
+
+  it("lets a small step past without a word", () => {
+    assert.equal(
+      sizeChange(hd, { key: "sid", resolution: "1856×1044", area: 1856 * 1044 }),
+      null,
+      "a flapping encoder writes a line a second into the one notice slot the page has, " +
+        "which is also where mute and the denoiser say what they did",
+    );
+  });
+
+  it("does not read a different share as the same one resizing", () => {
+    assert.equal(
+      sizeChange({ key: "sid-alice", resolution: "1920×1080" }, { key: "sid-bob", resolution: "1280×720" }),
+      null,
+    );
+  });
+});
+
+describe("the bench tells one local track's numbers from another's", () => {
+  it("joins an outbound stream to its track through the media source", async () => {
+    const bench = createBench(benchRoom());
+
+    await bench.read();
+    const reading = await bench.read();
+
+    const screen = reading.localTracks.get("screen-track");
+    assert.ok(screen, "the screen share's own outbound stream was never found");
+    assert.equal(screen.width, 1920);
+    assert.equal(screen.height, 1080);
+    assert.equal(
+      screen.bitrate,
+      1_600_000,
+      "the screen share is credited with bytes the camera sent, so the number in the corner " +
+        "would move when the camera did",
+    );
+
+    const camera = reading.localTracks.get("camera-track");
+    assert.equal(camera.height, 720, "the camera's rungs were not read off the tallest one");
+    assert.equal(camera.bitrate, 800_000);
+  });
+
+  it("measures nothing from a single sample", async () => {
+    const bench = createBench(benchRoom());
+    const first = await bench.read();
+    assert.equal(
+      first.localTracks.get("screen-track").bitrate,
+      null,
+      "a rate was reported from one reading, with no interval behind it",
+    );
+    assert.equal(first.localTracks.get("screen-track").width, 1920);
+  });
+
+  it("leaves out a stream the browser did not join to a track", async () => {
+    const bench = createBench(benchRoom({ join: false }));
+    await bench.read();
+    const reading = await bench.read();
+
+    assert.equal(reading.localTracks.size, 0, "an outbound stream was credited to a guess");
+    assert.equal(reading.local.length, 3, "the rungs themselves went missing with it");
+  });
+
+  it("reads the arriving screen off the inbound stream for that track", async () => {
+    const bench = createBench(benchRoom());
+    await bench.read();
+    const reading = await bench.read();
+
+    const arriving = reading.tracks.get("sid-remote-screen");
+    assert.ok(arriving, "nothing was read for the remote screen share");
+    assert.equal(arriving.width, 2560);
+    assert.equal(arriving.height, 1440);
+    assert.equal(arriving.bitrate, 2_400_000);
+  });
+});
+
 // -------------------------------------------------------------------- rigs
+
+/**
+ * A room whose two peer connections report the statistics a screen share
+ * produces: one outbound stream for the shared screen, two simulcast rungs for
+ * a camera going out beside it, and one inbound stream for somebody else's
+ * screen. Each read advances the clock by a second and the byte counters by the
+ * bitrates written here, so a rate the bench prints can be checked against a
+ * rate that was actually put in.
+ */
+function benchRoom({ join = true } = {}) {
+  let reads = 0;
+
+  const outgoing = [
+    { id: "out-screen", source: "src-screen", bps: 1_600_000, width: 1920, height: 1080, rid: null },
+    { id: "out-cam-f", source: "src-camera", bps: 600_000, width: 1280, height: 720, rid: "f" },
+    { id: "out-cam-h", source: "src-camera", bps: 200_000, width: 640, height: 360, rid: "h" },
+  ];
+
+  const publisherReport = () => {
+    const at = 1000 + reads * 1000;
+    const entries = [
+      { id: "src-screen", type: "media-source", trackIdentifier: "screen-track" },
+      { id: "src-camera", type: "media-source", trackIdentifier: "camera-track" },
+    ];
+    for (const stream of outgoing) {
+      entries.push({
+        id: stream.id,
+        type: "outbound-rtp",
+        kind: "video",
+        rid: stream.rid,
+        mediaSourceId: join ? stream.source : undefined,
+        bytesSent: (stream.bps / 8) * reads,
+        frameWidth: stream.width,
+        frameHeight: stream.height,
+        framesPerSecond: 15,
+        timestamp: at,
+      });
+    }
+    return new Map(entries.map((entry) => [entry.id, entry]));
+  };
+
+  const subscriberReport = () => {
+    const at = 1000 + reads * 1000;
+    const entries = [
+      {
+        id: "in-screen",
+        type: "inbound-rtp",
+        kind: "video",
+        trackIdentifier: "remote-screen-track",
+        bytesReceived: (2_400_000 / 8) * reads,
+        packetsReceived: 100 * reads,
+        packetsLost: 0,
+        frameWidth: 2560,
+        frameHeight: 1440,
+        framesPerSecond: 15,
+        timestamp: at,
+      },
+    ];
+    return new Map(entries.map((entry) => [entry.id, entry]));
+  };
+
+  const connection = (report) => ({
+    connectionState: "connected",
+    getStats: async () => report(),
+  });
+
+  const publication = {
+    trackSid: "sid-remote-screen",
+    kind: "video",
+    isMuted: false,
+    track: {
+      streamState: "active",
+      mediaStreamTrack: { id: "remote-screen-track" },
+    },
+  };
+
+  return {
+    engine: {
+      pcManager: {
+        publisher: { _pc: connection(publisherReport) },
+        subscriber: {
+          _pc: {
+            connectionState: "connected",
+            async getStats() {
+              const report = subscriberReport();
+              reads += 1;
+              return report;
+            },
+          },
+        },
+      },
+    },
+    remoteParticipants: new Map([
+      [
+        "remote",
+        {
+          identity: "remote",
+          trackPublications: new Map([[publication.trackSid, publication]]),
+        },
+      ],
+    ]),
+  };
+}
 
 /**
  * Runs `denoise-probe.js` in a context carrying the globals an

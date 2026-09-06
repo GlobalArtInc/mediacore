@@ -58,6 +58,18 @@
       <symbol id="icon-chevron" viewBox="0 0 24 24">
         <path d="M6 15l6-6 6 6" />
       </symbol>
+      <symbol id="icon-expand" viewBox="0 0 24 24">
+        <path d="M9 4H4v5" />
+        <path d="M15 4h5v5" />
+        <path d="M15 20h5v-5" />
+        <path d="M9 20H4v-5" />
+      </symbol>
+      <symbol id="icon-collapse" viewBox="0 0 24 24">
+        <path d="M4 9h5V4" />
+        <path d="M20 9h-5V4" />
+        <path d="M20 15h-5v5" />
+        <path d="M4 15h5v5" />
+      </symbol>
     </svg>
 
     <main class="page">
@@ -101,7 +113,7 @@
         </div>
       </section>
 
-      <div id="room" class="shell" hidden>
+      <div id="room" class="shell" data-fullscreen="off" hidden>
         <aside class="roster" aria-label="People in the room">
           <header class="roster-head">
             <div class="roster-title">
@@ -124,9 +136,26 @@
         <div class="main">
           <div class="stage">
             <section id="share" class="share" aria-label="Shared screen" hidden>
-              <div id="share-frame" class="share-frame"></div>
+              <div class="share-view">
+                <div id="share-frame" class="share-frame"></div>
+                <p id="share-stats" class="share-stats" hidden></p>
+                <button
+                  id="share-fullscreen"
+                  class="share-full"
+                  type="button"
+                  aria-pressed="false"
+                  aria-label="Show the shared screen fullscreen"
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#icon-expand" /></svg>
+                  <span id="share-fullscreen-label">Fullscreen</span>
+                </button>
+              </div>
               <div class="share-foot">
                 <p id="share-who" class="share-who"></p>
+                <div id="share-live" class="share-live" hidden>
+                  <span id="share-state" class="pill">connecting</span>
+                  <p id="share-speaking" class="share-speaking"></p>
+                </div>
                 <div
                   id="share-tabs"
                   class="share-tabs"
@@ -233,6 +262,10 @@
                   forwards encoded packets and never decodes them, so nothing here can be undone or
                   improved later.
                 </p>
+              </div>
+
+              <div class="menu-foot">
+                <button id="audio-close" class="link-button" type="button">Close</button>
               </div>
             </div>
 

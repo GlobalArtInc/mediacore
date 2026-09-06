@@ -59,6 +59,7 @@ export function createBench(room) {
       },
       tracks: new Map(),
       local: [],
+      localTracks: new Map(),
       localNote: null,
     };
 
@@ -328,6 +329,7 @@ function readLocal(reading, report, history) {
 
     rungs.push({
       rid: typeof entry.rid === "string" ? entry.rid : null,
+      source: typeof entry.mediaSourceId === "string" ? entry.mediaSourceId : null,
       label: labelForRid(entry.rid),
       width: finite(entry.frameWidth),
       height: finite(entry.frameHeight),
@@ -346,7 +348,55 @@ function readLocal(reading, report, history) {
 
   rungs.sort((left, right) => order(left.rid) - order(right.rid));
   reading.local = rungs;
+  reading.localTracks = groupLocalTracks(report, rungs);
   reading.localNote = rungs.length === 0 ? NOT_PUBLISHING : null;
+}
+
+/**
+ * Which outbound stream belongs to which local track. `outbound-rtp` never says
+ * so itself; it names a `media-source`, and that is the entry carrying the
+ * `trackIdentifier`. Without both there is no honest way to tell a screen share
+ * apart from a camera going out beside it, so a rung the browser did not join
+ * up is left out rather than added to whichever track was asked about.
+ */
+function groupLocalTracks(report, rungs) {
+  const identifiers = new Map();
+  report.forEach((entry) => {
+    if (entry.type !== "media-source") return;
+    if (typeof entry.trackIdentifier !== "string") return;
+    identifiers.set(entry.id, entry.trackIdentifier);
+  });
+
+  const tracks = new Map();
+  for (const rung of rungs) {
+    const identifier = rung.source === null ? undefined : identifiers.get(rung.source);
+    if (identifier === undefined) continue;
+
+    const found = tracks.get(identifier) || {
+      width: null,
+      height: null,
+      fps: null,
+      bitrate: null,
+    };
+
+    // The tallest rung is the one a viewer can be asked about, and its width,
+    // height and frame rate are read off that same rung so the three cannot
+    // come from three different encodings.
+    if (rung.height !== null && rung.width !== null) {
+      if (found.height === null || rung.height > found.height) {
+        found.width = rung.width;
+        found.height = rung.height;
+        found.fps = rung.fps;
+      }
+    }
+    if (rung.bitrate !== null) {
+      found.bitrate = found.bitrate === null ? rung.bitrate : found.bitrate + rung.bitrate;
+    }
+
+    tracks.set(identifier, found);
+  }
+
+  return tracks;
 }
 
 function order(rid) {

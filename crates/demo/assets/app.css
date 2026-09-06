@@ -424,6 +424,57 @@ li[data-speaking="true"] .state {
   gap: 0.5rem;
 }
 
+.share-view {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.share-stats {
+  position: absolute;
+  top: 0.55rem;
+  left: 0.55rem;
+  margin: 0;
+  padding: 0.22rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgb(4 7 10 / 0.74);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.share-full {
+  position: absolute;
+  top: 0.55rem;
+  right: 0.55rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgb(4 7 10 / 0.74);
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+.share-full:hover {
+  border-color: #38424e;
+}
+
+.share-full .icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .share-frame {
   aspect-ratio: 16 / 9;
   max-height: 58dvh;
@@ -449,6 +500,25 @@ li[data-speaking="true"] .state {
 }
 
 .share-who {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/*
+ * Fullscreen takes the roster and the tiles away, and with them the only two
+ * places the page showed who was talking and whether the link was up. This line
+ * is inside the stage, which fullscreen keeps.
+ */
+.share-live {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  order: 1;
+  flex-basis: 100%;
+}
+
+.share-speaking {
   margin: 0;
   font-size: 0.82rem;
   color: var(--muted);
@@ -886,10 +956,87 @@ li[data-speaking="true"] .state {
   margin-left: auto;
 }
 
+/* ------------------------------------------------------------- fullscreen */
+
+/*
+ * Two ways in, one layout. `native` is the browser's fullscreen on the room
+ * element; `fallback` is the same room pinned over the window for the browsers
+ * -- iOS Safari among them -- that will not hand fullscreen to anything but a
+ * video. The control bar is inside the room either way, so muting and leaving
+ * are where they were.
+ */
+#room[data-fullscreen]:not([data-fullscreen="off"]) {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+#room[data-fullscreen="fallback"] {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  height: 100dvh;
+  background: var(--ink);
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .roster,
+#room[data-fullscreen]:not([data-fullscreen="off"]) .cards,
+#room[data-fullscreen]:not([data-fullscreen="off"]) .bench {
+  display: none;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .stage {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share {
+  flex: 1;
+  min-height: 0;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-view {
+  flex: 1;
+  min-height: 0;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-frame {
+  aspect-ratio: auto;
+  max-height: none;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-foot {
+  padding: 0.5rem 1.2rem 0;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-live {
+  order: 0;
+  flex-basis: auto;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-stats {
+  top: 0.9rem;
+  left: 0.9rem;
+}
+
+#room[data-fullscreen]:not([data-fullscreen="off"]) .share-full {
+  top: 0.9rem;
+  right: 0.9rem;
+}
+
 /* ------------------------------------------------------------ audio menu */
 
 .dock {
   position: relative;
+}
+
+.menu-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 0.2rem;
 }
 
 .menu {

@@ -466,6 +466,83 @@ same setting as a radio group with a sentence about each. When somebody is shari
 shrink to a strip beneath it; when nobody is, the participants fill it. Two people with the same
 name keep the last four characters of their identity beside it, as they always have.
 
+### The shared screen
+
+A shared screen is the main view for as long as it is being shared, and nothing displaces it. It is
+not moved aside by whoever is speaking and not re-picked on every render: the stage pins the share
+it is holding by track, and only lets go when that share ends. Somebody sharing a screen is asking
+the room to look at one thing, and a view that swaps to the loudest person is the failure this is
+written against.
+
+The room allows two screens at once. Both appear as a row of buttons under the picture naming who
+is sharing, the stage shows the one you picked, and it stays picked until you pick another or it
+ends. If the one you were watching ends while somebody else is still sharing, the stage moves to
+what is left and says whose ended and whose you are now watching.
+
+A share that stops arriving is not the same thing as a share that ended, and the stage will not
+confuse them. A room that is reconnecting has dropped every remote participant and told us nothing
+about any of them, so while the link is down the stage holds what it had, says nothing, and leaves
+the fullscreen view standing — the red alert underneath is already saying what happened, and a line
+blaming the person whose picture stopped would be blaming them for the viewer's own connection. A
+room that has ended closes the fullscreen view and still names nobody. While the link is up the
+stage waits four seconds before concluding a share is over, because a publisher swapping a window
+for a whole screen stops one capture and starts another, and the gap in between is theirs. That
+swap arrives as a **new track from the same publisher**, which the stage reads as one share
+continuing rather than one ending and a stranger beginning: the picture carries on and the
+fullscreen view is not torn down for the most ordinary thing a sharer does.
+
+**Fullscreen hides the roster and the tiles**, which were the only two places the page showed who
+was talking and whether the link was up, so the stage carries its own line for both: the connection
+pill and a list of who is speaking, under the picture, visible only in fullscreen because the room
+already says both elsewhere. The tiles behind the picture are detached while it is up — a video
+decoded into something `display: none` buys the share nothing.
+
+**Fullscreen** is one button on the tile — `Fullscreen` / `Exit fullscreen`, in the tab order, with
+`aria-pressed` and an accessible name that says which state pressing it leaves you in — a double
+click on the picture, and Escape to come back. It is asked for on the **room**, not on the video:
+the control bar is inside that element, so muting, switching microphone, choosing the other screen
+and leaving the call all stay on the screen with the picture. A video element taken fullscreen on
+its own would take none of them along.
+
+Three answers are possible to that request and all three are handled:
+
+| What the browser does | What the page does |
+|---|---|
+| grants it | the browser's own fullscreen, and its own Escape |
+| has no `requestFullscreen` on an element, or forbids it to this document | the same layout, pinned over the window, and Escape handled by the page |
+| resolves the request and stays where it was | the same, because what the document says afterwards is what counts |
+
+The second row is iOS Safari, where nothing but a video element goes fullscreen and taking the
+video would hand the screen to the system player and the controls with it. The window-filling path
+is not a lesser fallback: it is the same markup and the same controls, laid out the same way, and
+the only difference is who owns the Escape key. Whichever path was taken is said in the notice
+line, with the browser's own reason in it.
+
+The states that end a fullscreen say why, rather than leaving somebody looking at a dead rectangle:
+the share ending closes it and names who stopped, another share still running moves the view there
+instead, and opening the bench — which takes the video onto its own tiles — closes it too. Leaving
+the room closes it.
+
+**In the corner of the picture** is what actually arrived: the frame size and the bitrate this
+browser reports for that track, sampled once a second from the same `getStats()` the bench reads,
+with a tooltip saying whether that is what is arriving or, for your own share, what is going out.
+If the browser reports only one of the two, only that one is shown and the tooltip says the other is
+missing; if it reports neither there is no badge at all. Nothing there is inferred from what was
+published: a 1080p15 layer that is arriving as 1280×720 says 1280×720.
+
+When that size changes the change is said out loud, as what it is and what it was, and with no
+claim about why. The page cannot tell a publisher swapping a window for a whole screen from their
+encoder scaling itself down under congestion — both arrive as a different `frameWidth` — so it does
+not pretend to: the line reads *the shared screen is now 1280×720 (it was 1920×1080)*. Two readings
+a second apart have to agree before the change counts, and a step smaller than a fifth of the area
+is not worth a line at all, because the page has one notice slot and mute, the denoiser and the
+microphone chooser all speak through it too.
+
+Telling one local track's outbound stream from another's needs the `media-source` entry that
+carries the `trackIdentifier`; a stream the browser does not join to a track is left out of the
+reckoning rather than added to whichever track was asked about, which is what keeps a camera going
+out beside a share from moving the share's number.
+
 What the page will not do is look calm about something it cannot see:
 
 - **Speaking is measured, not announced.** This SFU does not send `SpeakersChanged`, so an
@@ -540,6 +617,11 @@ quiet, which matters because one congested subscriber must never do that to the 
 
 **A line per remote participant** in the list, with the arriving bitrate and loss of their audio.
 
+**The corner of a shared screen**, outside the bench and always on while a screen is on the stage:
+`frameWidth×frameHeight` and the bitrate differenced over the sample, from the `inbound-rtp` entry
+for that track, or from the `outbound-rtp` entries joined to that track through `media-source` when
+the share is your own.
+
 **The microphone denoiser panel**, when ours is in the path — described in the denoiser section
 above.
 
@@ -572,6 +654,14 @@ bundler and no browser, and it drives the real modules:
   is published beside it when the browser offers it and said to be missing when it does not, that a
   closed picker and a blocked permission are reported as the pair the browser makes of them, and
   that a share stopped from the browser's own bar unpublishes and reports itself.
+- `stage.js`, which is where the stage's decisions live precisely so they can be argued with here:
+  that a pinned share survives the room being reordered under it, that a share ending names whose it
+  was, that a browser with no fullscreen and one that refuses and one that silently ignores the
+  request all land on the path that fills the window, and that the corner badge prints a half it has,
+  nothing at all when it has neither, and never `0×0`.
+- `bench.js` against a fake `RTCStatsReport`, on the join that attributes an outbound stream to a
+  local track: a screen share and a camera going out together keep their own numbers, a stream the
+  browser did not join to a track is left out, and one sample yields no rate.
 - `denoise-probe.js` in a `vm` context carrying the globals an `AudioWorkletGlobalScope` carries,
   driven a quantum at a time: the cost it reports is the time it was actually given, a block that
   overran is counted as one, a window with no audio reports no level rather than a very quiet one,
