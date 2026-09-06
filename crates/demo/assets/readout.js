@@ -32,7 +32,18 @@ export function formatPercent(fraction) {
 
 export function formatMillis(millis) {
   if (millis === null || millis === undefined) return null;
+  if (millis < 1) return `${millis.toFixed(2)} ms`;
   return millis < 10 ? `${millis.toFixed(1)} ms` : `${Math.round(millis)} ms`;
+}
+
+export function formatDecibels(db) {
+  if (db === null || db === undefined) return null;
+  return `${db.toFixed(1)} dBFS`;
+}
+
+export function formatChange(db) {
+  if (db === null || db === undefined) return null;
+  return `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
 }
 
 export function formatCount(value) {

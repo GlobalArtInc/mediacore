@@ -8,12 +8,24 @@ import {
   createTiles,
   describeAudio,
   formatBitrate,
+  formatChange,
+  formatDecibels,
   formatMillis,
+  formatPercent,
   write,
 } from "/readout.js";
 import { createMedia } from "/media.js";
+import { createDenoiser } from "/denoise.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
+
+// Served from this binary, with the build's version in the path, so upgrading
+// it can never hand a browser a stale cached copy of the old one.
+const RNNOISE_WASM_URL = "/vendor/rnnoise-0.4.0.wasm";
+const RNNOISE_SIMD_WASM_URL = "/vendor/rnnoise-simd-0.4.0.wasm";
+const RNNOISE_WORKLET_URL = "/vendor/rnnoise-worklet-0.4.0.js";
+const DENOISE_GATE_URL = "/denoise-gate.js";
+const DENOISE_PROBE_URL = "/denoise-probe.js";
 const SPEAKING_RMS = 0.02;
 const SPEAKING_HOLD_MS = 500;
 const METER_INTERVAL_MS = 150;
@@ -26,26 +38,63 @@ const PROCESSING_ROWS = [
   {
     key: "echoCancellation",
     label: "Echo cancellation",
-    note: "Subtracts what the speakers are playing from what the microphone hears.",
-  },
-  {
-    key: "noiseSuppression",
-    label: "Noise suppression",
-    note: "Attenuates steady background noise: fans, traffic, hiss.",
+    note:
+      "Subtracts what the speakers are playing from what the microphone hears. It needs the " +
+      "browser's own reference of the output in the capture clock, which nothing on this page " +
+      "can supply, so it stays the browser's job whichever suppressor is running.",
   },
   {
     key: "autoGainControl",
     label: "Automatic gain",
     note: "Rides the level towards a target loudness between phrases.",
   },
+];
+
+// One control, three values. Two suppressors in series sound worse than either
+// alone, so the browser's noiseSuppression and voiceIsolation are not offered
+// beside ours: they are what "the browser's own" means, and they are both off
+// whenever ours is running.
+const NOISE_ROWS = [
   {
-    key: "voiceIsolation",
-    label: "Voice isolation",
+    engine: "off",
+    label: "Off",
+    short: "off",
+    note: "Nothing attenuates the room. Worth a listen before judging either of the other two.",
+  },
+  {
+    engine: "browser",
+    label: "The browser's own",
+    short: "browser",
     note:
-      "A stronger separation of a voice from everything else. Chrome offers it and the client " +
-      "asks for it by default; other browsers do not report it either way.",
+      "getUserMedia's noiseSuppression, plus voiceIsolation where Chrome offers it. A light " +
+      "attenuator for steady noise, and what this demo has always used.",
+  },
+  {
+    engine: "mediacore",
+    label: "mediacore (RNNoise)",
+    short: "mediacore",
+    note:
+      "RNNoise, running in this page as WebAssembly between the microphone and the encoder. " +
+      "Steady noise -- fans, hiss, traffic -- comes out further down than the browser manages. " +
+      "It does not remove other people's voices, and it treats music as noise.",
   },
 ];
+
+const DENOISE_ROWS = [
+  { key: "engine", label: "engine" },
+  { key: "levelIn", label: "level in" },
+  { key: "levelOut", label: "level out" },
+  { key: "change", label: "change" },
+  { key: "delay", label: "added delay" },
+  { key: "frame", label: "cost per 10 ms" },
+  { key: "load", label: "real time used" },
+  { key: "realtime", label: "keeping up" },
+  { key: "worst", label: "worst block" },
+  { key: "fallback", label: "fallback" },
+];
+
+const DENOISE_OFF =
+  "our denoiser is not in the capture path, so there is nothing here to measure";
 
 const NO_AUDIO_CONTEXT =
   "this browser gave the page no audio context, so nothing here can tell whether they are speaking";
@@ -90,6 +139,10 @@ const el = {
   micSelect: document.getElementById("mic-select"),
   micNote: document.getElementById("mic-note"),
   processing: document.getElementById("processing"),
+  noiseChoices: document.getElementById("noise-choices"),
+  noiseNote: document.getElementById("noise-note"),
+  noiseEffective: document.getElementById("noise-effective"),
+  denoise: document.getElementById("denoise"),
   mute: document.getElementById("mute"),
   muteLabel: document.getElementById("mute-label"),
   noise: document.getElementById("noise"),
@@ -123,7 +176,9 @@ const meters = new Map();
 const arriving = new Map();
 const cards = new Map();
 const switches = new Map();
-const pending = { mute: false, share: false, camera: false };
+const noiseChoices = new Map();
+const denoiseCells = new Map();
+const pending = { mute: false, share: false, camera: false, noise: false };
 let meterTimer = null;
 let audioContext = null;
 let bench = null;
@@ -147,7 +202,7 @@ async function start() {
 
   el.form.addEventListener("submit", onJoin);
   el.mute.addEventListener("click", onMute);
-  el.noise.addEventListener("click", () => applyProcessing("noiseSuppression"));
+  el.noise.addEventListener("click", onCycleNoise);
   el.audioSettings.addEventListener("click", () => toggleMenu());
   el.micSelect.addEventListener("change", onSelectMicrophone);
   el.shareScreen.addEventListener("click", onShareScreen);
@@ -163,6 +218,8 @@ async function start() {
   });
 
   buildSwitches();
+  buildNoiseChoices();
+  buildDenoiseReadout();
   paintBenchToggle();
   paintControls();
 
@@ -190,14 +247,32 @@ async function start() {
     return;
   }
 
-  media = createMedia(lk);
+  media = createMedia(lk, {
+    // livekit-client will not take a processor on a track with no audio
+    // context, and a track opened before the room exists has none. The page
+    // already keeps one for the level meters; lending it that one is what keeps
+    // the denoiser alive across a leave and a second join.
+    audioContext: ensureAudioContext,
+    denoiser: createDenoiser({
+      wasmUrl: RNNOISE_WASM_URL,
+      simdWasmUrl: RNNOISE_SIMD_WASM_URL,
+      workletUrl: RNNOISE_WORKLET_URL,
+      gateUrl: DENOISE_GATE_URL,
+      probeUrl: DENOISE_PROBE_URL,
+    }),
+  });
   media.on("change", onMediaChange);
   media.on("microphonetrack", onMicrophoneTrack);
   media.on("screensharestopped", onScreenShareStopped);
   media.on("notice", (entry) => showNotice(entry.text));
+  media.on("denoise", paintDenoise);
 
   paintControls();
   ready();
+
+  // Asked once, before anyone is offered the choice: a machine that cannot run
+  // the denoiser is never shown a switch that would silently do nothing.
+  media.prepareDenoiser().then(paintControls);
 }
 
 function ready() {
@@ -497,6 +572,52 @@ async function applyProcessing(key) {
     showNotice(
       `${label} will change when you unmute. Restarting the capture while you are muted would ` +
         "re-open the device and light the browser's recording indicator.",
+    );
+  } else if (result.reason) {
+    fail(el.roomError, result.reason);
+  }
+
+  paintControls();
+}
+
+function offeredEngines() {
+  const state = media ? media.state() : null;
+  const available = Boolean(state && state.noise.available);
+  return NOISE_ROWS.filter((row) => row.engine !== "mediacore" || available);
+}
+
+function onCycleNoise() {
+  const state = media ? media.state() : null;
+  if (!state) return;
+  const offered = offeredEngines();
+  const index = offered.findIndex((row) => row.engine === state.noise.engine);
+  const next = offered[(index + 1) % offered.length];
+  return applyNoiseEngine(next.engine);
+}
+
+async function applyNoiseEngine(engine) {
+  if (!media || pending.noise) return;
+  hide(el.roomError);
+
+  pending.noise = true;
+  paintControls();
+  const result = await media.setNoiseEngine(engine);
+  pending.noise = false;
+
+  const row = NOISE_ROWS.find((entry) => entry.engine === engine);
+  const label = row ? row.label.toLowerCase() : engine;
+
+  if (result.applied) {
+    showNotice(
+      engine === "mediacore"
+        ? "The mediacore denoiser is in the capture path, and the browser's own suppression is " +
+            "off. Nobody was unsubscribed: only the capture behind the publication changed."
+        : `Noise suppression is now ${label}.`,
+    );
+  } else if (result.deferred) {
+    showNotice(
+      "The suppressor will change when you unmute. Restarting the capture while you are muted " +
+        "would re-open the device and light the browser's recording indicator.",
     );
   } else if (result.reason) {
     fail(el.roomError, result.reason);
@@ -1303,41 +1424,73 @@ function paintControls() {
   el.micSelect.disabled = !state || !state.support.deviceList || state.devices.list.length === 0;
 
   paintSwitches(state);
+  paintNoiseChoices(state);
+  paintDenoise(state ? state.noise : null);
 }
 
+/**
+ * One button, one engine name. What the browser reports about its own two flags
+ * is a separate line in the menu, because it is a different claim: this button
+ * says what this page put in the path, not what the operating system did behind
+ * it.
+ */
 function paintNoise(state) {
-  const wanted = state ? Boolean(state.processing.noiseSuppression) : false;
-  const effective = state && state.effective ? state.effective.noiseSuppression : null;
+  const engine = state ? state.noise.engine : "browser";
+  const row = NOISE_ROWS.find((entry) => entry.engine === engine);
   const held = Boolean(state && state.microphone.pendingWhileMuted);
+  const pendingRow = state && state.noise.pending
+    ? NOISE_ROWS.find((entry) => entry.engine === state.noise.pending)
+    : null;
 
-  el.noise.disabled = !state || !state.microphone.open;
-  el.noise.setAttribute("aria-pressed", String(wanted));
-  el.noise.dataset.on = String(wanted);
+  el.noise.disabled = !state || !state.microphone.open || pending.noise;
+  el.noise.setAttribute("aria-pressed", String(engine !== "off"));
+  el.noise.dataset.on = String(engine !== "off");
 
   if (!state || !state.microphone.open) {
     sub("no microphone", true, "Open a microphone first.");
     return;
   }
-  if (held) {
+  if (pending.noise) {
+    sub("switching", true, "The capture is being restarted onto the chosen suppressor.");
+    return;
+  }
+  if (held && pendingRow) {
     sub(
-      "applies on unmute",
+      `${pendingRow.short} on unmute`,
       true,
       "Restarting the capture while you are muted would re-open the device and light the " +
-        "browser's recording indicator, so the change is held.",
+        "browser's recording indicator, so the change is held until you unmute.",
     );
     return;
   }
-  if (effective === null) {
+
+  if (engine === "mediacore") {
+    const claim = state.effective ? state.effective.noiseSuppression : null;
     sub(
-      wanted ? "asked for on" : "asked for off",
+      "mediacore",
+      false,
+      claim === true
+        ? "RNNoise is in the capture path. The browser was asked to stop suppressing and reports " +
+            "that it is still doing so, which is two suppressors in series -- see the menu."
+        : "RNNoise is in the capture path, running in this page before the audio is encoded. " +
+            "The browser's own suppression was turned off with it.",
+    );
+    return;
+  }
+
+  const claimed = state.effective ? state.effective.noiseSuppression : null;
+  if (claimed === null) {
+    sub(
+      row ? row.short : engine,
       true,
-      "This browser does not report whether it applied noise suppression.",
+      "This browser does not report whether it applied noise suppression, so this is what was " +
+        "asked for rather than what happened.",
     );
     return;
   }
-  if (effective !== wanted) {
+  if (claimed !== (engine === "browser")) {
     sub(
-      effective ? "browser: on" : "browser: off",
+      claimed ? "browser: on" : "browser: off",
       true,
       "The browser reports something other than what was asked for, and what it reports is what " +
         "the room hears.",
@@ -1346,7 +1499,7 @@ function paintNoise(state) {
   }
 
   sub(
-    effective ? "on" : "off",
+    row ? row.short : engine,
     false,
     "The browser confirms this is what it applied, before the audio was encoded.",
   );
@@ -1356,7 +1509,239 @@ function sub(text, missing, title) {
   el.noiseSub.textContent = text;
   el.noiseSub.dataset.missing = String(missing);
   el.noise.title = title;
-  el.noise.setAttribute("aria-label", `Noise suppression, ${text}`);
+  el.noise.setAttribute("aria-label", `Noise suppression: ${text}. Press to change`);
+}
+
+function buildNoiseChoices() {
+  el.noiseChoices.replaceChildren(
+    ...NOISE_ROWS.map((row) => {
+      const item = document.createElement("li");
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "choice";
+      button.dataset.engine = row.engine;
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", "false");
+      button.textContent = row.label;
+      button.addEventListener("click", () => applyNoiseEngine(row.engine));
+
+      const note = document.createElement("p");
+      note.className = "switch-note";
+      note.textContent = row.note;
+
+      item.append(button, note);
+      noiseChoices.set(row.engine, { button, note });
+      return item;
+    }),
+  );
+}
+
+function paintNoiseChoices(state) {
+  const engine = state ? state.noise.engine : "browser";
+  const open = Boolean(state && state.microphone.open);
+  const available = state ? state.noise.available : null;
+
+  for (const row of NOISE_ROWS) {
+    const entry = noiseChoices.get(row.engine);
+    const ours = row.engine === "mediacore";
+    const blocked = ours && available !== true;
+
+    entry.button.setAttribute("aria-checked", String(engine === row.engine));
+    entry.button.disabled = !open || pending.noise || blocked;
+    entry.button.dataset.blocked = String(blocked);
+
+    // The reason goes under the row, not into a tooltip: a disabled option
+    // whose explanation needs a mouse explains nothing on a touchscreen.
+    if (ours && available === null) {
+      entry.note.textContent = `${row.note} This page has not finished checking whether it can run here.`;
+    } else if (blocked && state && state.noise.reason) {
+      entry.note.textContent = `${row.note} Not on offer here: ${state.noise.reason}.`;
+    } else {
+      entry.note.textContent = row.note;
+    }
+    entry.button.removeAttribute("title");
+  }
+
+  const lines = [];
+  if (state && state.noise.fallback.reason) {
+    lines.push(
+      state.noise.fallback.engaged
+        ? `It was taken out of this call because ${state.noise.fallback.reason}.`
+        : `Earlier in this call it was taken out because ${state.noise.fallback.reason}.`,
+    );
+  }
+  const note = lines.join(" ");
+  el.noiseNote.textContent = note;
+  el.noiseNote.hidden = note === "";
+
+  paintNoiseEffective(state);
+}
+
+/**
+ * What the browser says about its own two flags, kept apart from the engine
+ * name above it. A browser can report `noiseSuppression: false` while the
+ * operating system carries on suppressing, so this line is labelled as a claim
+ * and not as a measurement.
+ */
+function paintNoiseEffective(state) {
+  if (!state || !state.microphone.open) {
+    say(el.noiseEffective, "no microphone is open, so the browser reports nothing", true);
+    return;
+  }
+  if (state.microphone.pendingWhileMuted) {
+    say(el.noiseEffective, "held until you unmute", true);
+    return;
+  }
+
+  const reported = state.effective || {};
+  const parts = [];
+  for (const key of ["noiseSuppression", "voiceIsolation"]) {
+    const value = reported[key];
+    parts.push(`${key} ${value === null || value === undefined ? "not reported" : value ? "on" : "off"}`);
+  }
+  const missing = ["noiseSuppression", "voiceIsolation"].every(
+    (key) => reported[key] === null || reported[key] === undefined,
+  );
+  say(el.noiseEffective, `the browser says: ${parts.join(", ")}`, missing);
+}
+
+function buildDenoiseReadout() {
+  el.denoise.replaceChildren(
+    ...DENOISE_ROWS.map((row) => {
+      const wrap = document.createElement("div");
+
+      const term = document.createElement("dt");
+      term.textContent = row.label;
+
+      const value = document.createElement("dd");
+      value.textContent = "—";
+
+      wrap.append(term, value);
+      denoiseCells.set(row.key, value);
+      return wrap;
+    }),
+  );
+}
+
+/**
+ * Everything here is measured on the render thread that runs the node, over the
+ * window the reading covers. Nothing is a nominal figure from a data sheet, and
+ * a value the browser would not give up stays an em dash carrying the reason.
+ */
+function paintDenoise(noise) {
+  const state = noise || (media ? media.state().noise : null);
+  const cell = (key) => denoiseCells.get(key);
+  if (!cell("engine")) return;
+
+  const engineRow = state ? NOISE_ROWS.find((row) => row.engine === state.engine) : null;
+  write(
+    cell("engine"),
+    engineRow ? engineRow.label : state ? state.engine : null,
+    "no capture module yet",
+  );
+
+  const fallback = state ? state.fallback : null;
+  write(
+    cell("fallback"),
+    fallback
+      ? fallback.engaged
+        ? "engaged"
+        : fallback.reason
+          ? "engaged earlier in this call"
+          : "never"
+      : null,
+    "no capture module yet",
+  );
+  if (fallback && fallback.reason) {
+    cell("fallback").title = fallback.reason;
+  }
+
+  const metrics = state ? state.metrics : null;
+  const measurable = Boolean(state && state.attached);
+  const idle = measurable ? "waiting for the first measurement from the render thread" : DENOISE_OFF;
+
+  if (!metrics) {
+    for (const key of [
+      "levelIn",
+      "levelOut",
+      "change",
+      "delay",
+      "frame",
+      "load",
+      "realtime",
+      "worst",
+    ]) {
+      write(cell(key), null, idle);
+    }
+    return;
+  }
+
+  write(cell("levelIn"), formatDecibels(metrics.input.rms), "no audio reached the node in this window");
+  write(cell("levelOut"), formatDecibels(metrics.output.rms), "no audio left the node in this window");
+  write(cell("change"), formatChange(metrics.reduction), "there was no level either side to compare");
+
+  // The one number that decides whether a call feels responsive, and the one
+  // figure here that cannot be read off the graph: the vendored worklet buffers
+  // internally and does not say by how much. It is found by lining the node's
+  // output up against its own input, so it needs signal on both sides.
+  write(
+    cell("delay"),
+    metrics.delay ? formatMillis(metrics.delay.ms) : null,
+    "there was not enough signal either side of the node to line its output up against its input",
+  );
+  if (metrics.delay) {
+    cell("delay").title =
+      `${metrics.delay.samples} samples at ${metrics.sampleRate} Hz, found by correlating the ` +
+      `node's output against its input (peak ${metrics.delay.correlation.toFixed(2)}). This is ` +
+      "the node's own buffering; what the browser adds between the capture track and the " +
+      "published one is not in it.";
+  }
+
+  const costNote = metrics.costNote || "the render thread reported no cost for this window";
+  const cost = metrics.cost;
+
+  const estimated = (text) => (text === null ? null : metrics.coarseClock ? `~${text}` : text);
+  write(cell("frame"), estimated(cost ? formatMillis(cost.frameMs) : null), costNote);
+
+  // Against the wall clock, not against the audio clock. The audio clock is the
+  // device's and runs at real time whatever the render thread is doing, so a
+  // share measured against it cannot rise when the thread starts losing.
+  write(
+    cell("load"),
+    estimated(cost && cost.load !== null ? formatPercent(cost.load) : null),
+    cost
+      ? "the first reading of a run has no wall-clock interval behind it to measure a share of"
+      : costNote,
+  );
+  if (cost && metrics.coarseClock) {
+    cell("frame").title = costNote;
+    cell("load").title = costNote;
+  }
+  write(
+    cell("worst"),
+    cost ? formatMillis(cost.worstQuantumMs) : null,
+    metrics.coarseClock
+      ? `this browser's audio render thread has only a whole-millisecond clock, which cannot say ` +
+          "what one 2.67 ms block cost"
+      : costNote,
+  );
+
+  // The cost above is what the node took; this is whether the machine got it
+  // done in time. It is measured on this thread, so it works in browsers whose
+  // render thread has no clock to lend the two above.
+  write(
+    cell("realtime"),
+    metrics.realtime ? formatPercent(metrics.realtime.behind) : null,
+    "the first reading of a run has nothing to measure a rate against",
+  );
+  if (metrics.realtime) {
+    cell("realtime").title =
+      `${Math.round(metrics.realtime.wallMs)} ms of wall clock for ` +
+      `${Math.round(metrics.realtime.audioMs)} ms of audio the node actually emitted. Above ` +
+      "100 % the render thread is falling behind, and past 125 % for three seconds the node is " +
+      "taken out.";
+  }
 }
 
 function buildSwitches() {

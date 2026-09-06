@@ -113,7 +113,12 @@
 
           <ul id="participants" class="participants"></ul>
 
-          <footer class="foot"><span id="foot-url"></span></footer>
+          <footer class="foot">
+            <span id="foot-url"></span>
+            <a class="foot-notice" href="/NOTICE.txt" target="_blank" rel="noopener"
+              >third-party notices</a
+            >
+          </footer>
         </aside>
 
         <div class="main">
@@ -159,6 +164,20 @@
                 </div>
               </dl>
 
+              <h3 class="bench-head">Microphone denoiser</h3>
+              <dl id="denoise" class="link"></dl>
+              <p class="bench-note">
+                Levels are the signal either side of our node, measured on the render thread that
+                runs it. The cost is the wall clock between the node before it returning and the
+                node after it being entered, so it is the denoiser's own time and not a figure from
+                a data sheet; the audio budget is that cost against the 2.67 ms the browser allows
+                per block. A tilde marks a cost estimated from a whole-millisecond clock, which is
+                all Chrome's render thread offers. Keeping up needs no such clock: it is the audio
+                this machine produced against the wall time it took, and past 125 % for three
+                seconds the node comes out. A dash means the browser would not give the number up;
+                hover it to read why.
+              </p>
+
               <ul id="tiles" class="tiles" hidden></ul>
 
               <p class="bench-note">
@@ -186,6 +205,24 @@
                 <label for="mic-select">Microphone</label>
                 <select id="mic-select"></select>
                 <p id="mic-note" class="menu-note"></p>
+              </div>
+
+              <div class="menu-block">
+                <h2 class="menu-head" id="noise-head">Noise suppression</h2>
+                <ul
+                  id="noise-choices"
+                  class="choices"
+                  role="radiogroup"
+                  aria-labelledby="noise-head"
+                ></ul>
+                <p id="noise-effective" class="switch-effective"></p>
+                <p id="noise-note" class="menu-note" hidden></p>
+                <p class="menu-note">
+                  One suppressor at a time. Two in series sound worse than either alone, so the
+                  browser's own noise suppression and voice isolation are turned off whenever ours
+                  is running, and they are not offered separately. Echo cancellation is not part of
+                  this choice and stays on.
+                </p>
               </div>
 
               <div class="menu-block">

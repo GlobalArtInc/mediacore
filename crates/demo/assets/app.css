@@ -376,12 +376,26 @@ li[data-speaking="true"] .state {
 }
 
 .foot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
   padding: 0.7rem 1rem;
   border-top: 1px solid var(--line-soft);
   font-family: var(--mono);
   font-size: 0.68rem;
   color: var(--faint);
   word-break: break-all;
+}
+
+.foot-notice {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.foot-notice:hover,
+.foot-notice:focus-visible {
+  color: var(--text);
 }
 
 /* ------------------------------------------------------------------ stage */
@@ -963,6 +977,45 @@ li[data-speaking="true"] .state {
 .switch[aria-checked="true"] .switch-track::after {
   transform: translateX(0.92rem);
   background: var(--accent);
+}
+
+.choices {
+  list-style: none;
+  margin: 0.7rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.choice {
+  display: block;
+  width: 100%;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  text-align: left;
+  font-size: 0.88rem;
+}
+
+.choice[aria-checked="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+.choice:disabled {
+  opacity: 0.5;
+}
+
+.choice[data-blocked="true"] {
+  cursor: help;
+}
+
+.choices .switch-note,
+#noise-effective {
+  margin-left: 0;
 }
 
 .switch-effective,

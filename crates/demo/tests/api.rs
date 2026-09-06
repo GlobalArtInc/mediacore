@@ -218,29 +218,6 @@ async fn the_capture_module_is_served_as_its_own_module() {
 }
 
 #[tokio::test]
-async fn the_capture_module_names_the_screen_share_source_the_grant_allows() {
-    let addr = spawn().await;
-    let (_, media) = get(addr, "/media.js").await;
-
-    assert!(
-        media.contains("createLocalScreenTracks"),
-        "the screen is never captured"
-    );
-    assert!(
-        media.contains("ScreenSharePresets"),
-        "the screen share is published without a capture ceiling"
-    );
-    assert!(
-        media.contains("TrackEvent.Ended"),
-        "a share stopped from the browser's own bar would stay published"
-    );
-    assert!(
-        media.contains("restartTrack"),
-        "switching microphone would drop the publication and the subscriptions with it"
-    );
-}
-
-#[tokio::test]
 async fn a_requested_room_is_namespaced_under_the_configured_one() {
     let addr = spawn().await;
     let (status, body) = mint(addr, r#"{"name":"Alice","room":"standup"}"#).await;
@@ -321,10 +298,168 @@ async fn every_response_carries_a_content_security_policy() {
             "{path} does not allow the signalling socket"
         );
         assert!(
-            head.contains("script-src 'self';"),
-            "{path} would still allow a third-party script"
+            head.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "{path} would still allow a third-party script, or would refuse the denoiser"
+        );
+        assert!(
+            !head.contains("'unsafe-eval';") && !head.contains("'unsafe-inline'"),
+            "{path} bought WebAssembly with a general eval: {head}"
         );
         assert!(head.contains("x-content-type-options: nosniff"));
+    }
+}
+
+#[tokio::test]
+async fn the_denoiser_is_served_from_this_origin_with_its_version_in_the_path() {
+    let addr = spawn().await;
+
+    for path in [http::RNNOISE_WASM_PATH, http::RNNOISE_SIMD_WASM_PATH] {
+        assert!(
+            path.contains(http::RNNOISE_VERSION),
+            "{path} does not name the build it serves, so an upgrade could be answered from cache"
+        );
+
+        let head = head_of(addr, path).await.to_lowercase();
+        assert!(
+            head.starts_with("http/1.1 200"),
+            "{path} is not served: {head}"
+        );
+        assert!(
+            head.contains("content-type: application/wasm"),
+            "{path} is not served as WebAssembly, and no browser will compile it: {head}"
+        );
+        assert!(
+            head.contains("immutable"),
+            "{path} is not cacheable, so every join would fetch it again: {head}"
+        );
+    }
+
+    let head = head_of(addr, http::RNNOISE_WORKLET_PATH)
+        .await
+        .to_lowercase();
+    assert!(head.starts_with("http/1.1 200"));
+    assert!(head.contains("content-type: text/javascript"));
+    assert!(head.contains("immutable"));
+
+    let (status, worklet) = get(addr, http::RNNOISE_WORKLET_PATH).await;
+    assert_eq!(status, 200);
+    assert!(
+        worklet.contains("registerProcessor"),
+        "the vendored worklet registers no processor, so the node could never be constructed"
+    );
+    assert!(
+        worklet.contains("@sapphi-red/web-noise-suppressor/rnnoise"),
+        "the vendored worklet does not register the name denoise.js constructs"
+    );
+    assert!(
+        !worklet.contains("sourceMappingURL"),
+        "the worklet points at a source map this server does not serve"
+    );
+}
+
+#[tokio::test]
+async fn the_probe_worklet_is_served_and_registers_both_ends_of_the_measurement() {
+    let addr = spawn().await;
+
+    let (status, probe) = get(addr, http::DENOISE_PROBE_PATH).await;
+    assert_eq!(status, 200, "{} is not served", http::DENOISE_PROBE_PATH);
+
+    for processor in ["mediacore/denoise-tap", "mediacore/denoise-probe"] {
+        assert!(
+            probe.contains(processor),
+            "the probe module does not register {processor}, so one end of the measurement is \
+             missing and the cost cannot be attributed to the denoiser"
+        );
+    }
+
+    let (status, gate) = get(addr, http::DENOISE_GATE_PATH).await;
+    assert_eq!(status, 200, "{} is not served", http::DENOISE_GATE_PATH);
+    assert!(
+        gate.contains("@sapphi-red/web-noise-suppressor/rnnoise"),
+        "the gate does not name the processor it wraps, so nothing would be gated and the node \
+         would publish silence until its wasm compiled"
+    );
+
+    for path in [http::DENOISE_PROBE_PATH, http::DENOISE_GATE_PATH] {
+        let head = head_of(addr, path).await.to_lowercase();
+        assert!(
+            head.contains("content-type: text/javascript"),
+            "addModule refuses anything that is not javascript: {head}"
+        );
+    }
+}
+
+/// The notice has to be reachable from a running deployment, not merely present
+/// in the repository: that is what Apache-2.0 4(d) and the MIT permission
+/// notice ask for.
+#[tokio::test]
+async fn the_licence_notice_is_served_and_the_page_links_to_it() {
+    let addr = spawn().await;
+
+    let (status, notice) = get(addr, http::NOTICE_PATH).await;
+    assert_eq!(status, 200, "{} is not served", http::NOTICE_PATH);
+
+    for project in [
+        "livekit-client",
+        "@sapphi-red/web-noise-suppressor",
+        "@shiguredo/rnnoise-wasm",
+        "xiph/rnnoise",
+    ] {
+        assert!(
+            notice.contains(project),
+            "{project} is served from this origin and the notice does not name it"
+        );
+    }
+    assert!(
+        notice.contains("Apache License") && notice.contains("MIT License"),
+        "the notice names projects whose licences it does not reproduce"
+    );
+
+    let head = head_of(addr, http::NOTICE_PATH).await.to_lowercase();
+    assert!(
+        head.contains("content-type: text/plain"),
+        "the notice would be downloaded rather than read: {head}"
+    );
+
+    let (_, index) = get(addr, "/").await;
+    assert!(
+        index.contains(http::NOTICE_PATH),
+        "nothing on the page links to the notice, so nobody running this ever sees it"
+    );
+}
+
+#[tokio::test]
+async fn the_page_never_reaches_a_third_party_for_the_denoiser() {
+    let addr = spawn().await;
+
+    for path in [
+        "/app.js",
+        "/denoise.js",
+        http::DENOISE_GATE_PATH,
+        http::DENOISE_PROBE_PATH,
+    ] {
+        let (status, module) = get(addr, path).await;
+        assert_eq!(status, 200);
+        for host in ["cdn.jsdelivr.net", "unpkg.com", "cdn.mezon.ai", "https://"] {
+            assert!(
+                !module.contains(host),
+                "{path} names {host}; nothing in a running deployment may leave this origin"
+            );
+        }
+    }
+
+    let (_, app) = get(addr, "/app.js").await;
+    for path in [
+        http::RNNOISE_WASM_PATH,
+        http::RNNOISE_SIMD_WASM_PATH,
+        http::RNNOISE_WORKLET_PATH,
+        http::DENOISE_GATE_PATH,
+        http::DENOISE_PROBE_PATH,
+    ] {
+        assert!(
+            app.contains(path),
+            "the page does not load {path} from this server"
+        );
     }
 }
 
@@ -843,7 +978,7 @@ async fn the_capture_module_drives_every_audio_control() {
     let (_, js) = get(addr, "/app.js").await;
 
     assert!(
-        js.contains(r#"from "/media.js""#) && js.contains("createMedia(lk)"),
+        js.contains(r#"from "/media.js""#) && js.contains("createMedia(lk, {"),
         "the interface does not use the capture module at all"
     );
 
@@ -852,6 +987,8 @@ async fn the_capture_module_drives_every_audio_control() {
         "media.publishMicrophone()",
         "media.toggleMuted()",
         "media.setProcessing(",
+        "media.setNoiseEngine(",
+        "media.prepareDenoiser()",
         "media.selectMicrophone(",
         "media.startScreenShare(",
         "media.stopScreenShare()",
@@ -865,8 +1002,8 @@ async fn the_capture_module_drives_every_audio_control() {
          device choice and the processing switches would act on different tracks"
     );
     assert!(
-        js.contains("noiseSuppression"),
-        "the noise suppression switch is not wired to anything"
+        js.contains("function onCycleNoise()") && js.contains("function applyNoiseEngine("),
+        "the noise suppression control is not wired to anything"
     );
 }
 

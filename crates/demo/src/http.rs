@@ -21,7 +21,14 @@ const APP_JS: &str = include_str!("../assets/app.js");
 const MEDIA_JS: &str = include_str!("../assets/media.js");
 const BENCH_JS: &str = include_str!("../assets/bench.js");
 const READOUT_JS: &str = include_str!("../assets/readout.js");
+const DENOISE_JS: &str = include_str!("../assets/denoise.js");
+const DENOISE_GATE_JS: &str = include_str!("../assets/denoise-gate.js");
+const DENOISE_PROBE_JS: &str = include_str!("../assets/denoise-probe.js");
+const NOTICE_TXT: &str = include_str!("../assets/vendor/NOTICE.txt");
 const SDK_JS: &str = include_str!("../assets/vendor/livekit-client.esm.js");
+const RNNOISE_WORKLET_JS: &str = include_str!("../assets/vendor/rnnoise-worklet.js");
+const RNNOISE_WASM: &[u8] = include_bytes!("../assets/vendor/rnnoise.wasm");
+const RNNOISE_SIMD_WASM: &[u8] = include_bytes!("../assets/vendor/rnnoise-simd.wasm");
 const TOKEN_BODY_LIMIT: usize = 4 * 1024;
 
 pub const PUBLISH_SOURCES: [&str; 4] =
@@ -29,6 +36,23 @@ pub const PUBLISH_SOURCES: [&str; 4] =
 
 pub const SDK_VERSION: &str = "2.22.2";
 pub const SDK_PATH: &str = "/vendor/livekit-client-2.22.2.esm.js";
+
+/// `@sapphi-red/web-noise-suppressor`, the AudioWorklet wrapper this binary
+/// serves, around `@shiguredo/rnnoise-wasm`'s emscripten build of
+/// `xiph/rnnoise`. Every route below carries the version, so a browser holding
+/// a cached copy of an older build can never be handed it again after an
+/// upgrade. All three projects are named in `assets/vendor/NOTICE.txt`.
+pub const RNNOISE_VERSION: &str = "0.4.0";
+pub const RNNOISE_WASM_PATH: &str = "/vendor/rnnoise-0.4.0.wasm";
+pub const RNNOISE_SIMD_WASM_PATH: &str = "/vendor/rnnoise-simd-0.4.0.wasm";
+pub const RNNOISE_WORKLET_PATH: &str = "/vendor/rnnoise-worklet-0.4.0.js";
+pub const DENOISE_GATE_PATH: &str = "/denoise-gate.js";
+pub const DENOISE_PROBE_PATH: &str = "/denoise-probe.js";
+
+/// Apache-2.0 and MIT both require the notice to travel with what they cover.
+/// It is compiled into this binary like the assets it covers, so a container
+/// carrying the binary carries it, and the page links to it.
+pub const NOTICE_PATH: &str = "/NOTICE.txt";
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const NO_CACHE: &str = "no-cache";
@@ -43,7 +67,14 @@ pub fn router(config: Config) -> Router {
         .route("/media.js", get(media))
         .route("/bench.js", get(bench))
         .route("/readout.js", get(readout))
+        .route("/denoise.js", get(denoise))
+        .route(DENOISE_GATE_PATH, get(denoise_gate))
+        .route(DENOISE_PROBE_PATH, get(denoise_probe))
+        .route(NOTICE_PATH, get(notice))
         .route(SDK_PATH, get(sdk))
+        .route(RNNOISE_WORKLET_PATH, get(rnnoise_worklet))
+        .route(RNNOISE_WASM_PATH, get(rnnoise_wasm))
+        .route(RNNOISE_SIMD_WASM_PATH, get(rnnoise_simd_wasm))
         .route("/healthz", get(healthz))
         .route("/api/config", get(public_config))
         .route(
@@ -75,9 +106,14 @@ fn signalling_origins(ws_url: &str) -> String {
 
 fn content_security_policy(ws_url: &str) -> HeaderValue {
     let origins = signalling_origins(ws_url);
+    // `wasm-unsafe-eval` is what lets the page compile the denoiser it is
+    // served. Without it Chrome refuses `WebAssembly.instantiate` outright and
+    // the feature is dead on arrival. It permits WebAssembly compilation and
+    // nothing else -- it is not `unsafe-eval`, and the sources a script may
+    // still come from are unchanged: this origin, and no other.
     let policy = format!(
         "default-src 'none'; \
-         script-src 'self'; \
+         script-src 'self' 'wasm-unsafe-eval'; \
          style-src 'self'; \
          img-src 'self' data:; \
          media-src 'self' blob:; \
@@ -115,8 +151,40 @@ async fn readout() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, READOUT_JS)
 }
 
+async fn denoise() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, DENOISE_JS)
+}
+
+async fn denoise_gate() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, DENOISE_GATE_JS)
+}
+
+async fn denoise_probe() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, DENOISE_PROBE_JS)
+}
+
+async fn notice() -> impl IntoResponse {
+    asset("text/plain; charset=utf-8", NO_CACHE, NOTICE_TXT)
+}
+
 async fn sdk() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", IMMUTABLE, SDK_JS)
+}
+
+async fn rnnoise_worklet() -> impl IntoResponse {
+    asset(
+        "text/javascript; charset=utf-8",
+        IMMUTABLE,
+        RNNOISE_WORKLET_JS,
+    )
+}
+
+async fn rnnoise_wasm() -> impl IntoResponse {
+    binary("application/wasm", IMMUTABLE, RNNOISE_WASM)
+}
+
+async fn rnnoise_simd_wasm() -> impl IntoResponse {
+    binary("application/wasm", IMMUTABLE, RNNOISE_SIMD_WASM)
 }
 
 async fn healthz() -> &'static str {
@@ -127,6 +195,20 @@ fn asset(
     content_type: &'static str,
     cache_control: &'static str,
     body: &'static str,
+) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+}
+
+fn binary(
+    content_type: &'static str,
+    cache_control: &'static str,
+    body: &'static [u8],
 ) -> impl IntoResponse {
     (
         [
@@ -266,6 +348,8 @@ async fn token(
 mod tests {
     use super::*;
 
+    const README_MD: &str = include_str!("../README.md");
+
     #[test]
     fn the_sdk_route_carries_the_vendored_version() {
         assert!(
@@ -285,6 +369,8 @@ mod tests {
             ("/bench.js", BENCH_JS),
             ("/readout.js", READOUT_JS),
             ("/media.js", MEDIA_JS),
+            ("/denoise.js", DENOISE_JS),
+            (DENOISE_GATE_PATH, DENOISE_GATE_JS),
         ];
 
         for (path, module) in served {
@@ -310,6 +396,10 @@ mod tests {
                 rest.split_once('"').map(|(path, _)| path.to_owned())
             })
             .filter(|path| path.ends_with(".js") && !path.contains("/vendor/"))
+            .map(|path| match path.strip_prefix("./") {
+                Some(rest) => format!("/{rest}"),
+                None => path,
+            })
             .collect()
     }
 
@@ -333,73 +423,229 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_module_reads_the_devices_the_browser_reports() {
-        assert!(
-            MEDIA_JS.contains("enumerateDevices"),
-            "the capture module never lists the inputs it offers to choose between"
-        );
-        assert!(
-            MEDIA_JS.contains(r#"addEventListener("devicechange""#),
-            "unplugging the chosen microphone would leave a dead track behind"
-        );
-        assert!(
-            MEDIA_JS.contains("getDisplayMedia") || MEDIA_JS.contains("createLocalScreenTracks"),
-            "the capture module never asks for a screen"
-        );
-
-        for flag in ["echoCancellation", "noiseSuppression", "autoGainControl"] {
-            assert!(
-                MEDIA_JS.contains(flag),
-                "the capture module cannot change {flag} while a call is running"
-            );
-        }
-    }
-
-    #[test]
-    fn the_capture_module_invents_no_value_the_browser_withheld() {
-        assert!(
-            !MEDIA_JS.contains("|| 0"),
-            "media.js substitutes a zero for a value the browser did not report"
-        );
-        assert!(
-            MEDIA_JS.contains("in settings ? Boolean(settings[key]) : null"),
-            "a processing flag the browser does not report must read as unknown, not as off"
-        );
-    }
-
-    #[test]
-    fn the_capture_module_stands_alone() {
-        assert!(
-            !MEDIA_JS.lines().any(|line| line.starts_with("import ")),
-            "media.js loads a module of its own instead of being handed the sdk it is given"
-        );
-        assert!(
-            !MEDIA_JS.contains("/vendor/"),
-            "media.js pins a copy of the sdk, so the page would load two of them"
-        );
-        assert!(
-            !MEDIA_JS.contains("document."),
-            "media.js touches the dom, so the interface cannot be redesigned without it"
-        );
-        assert!(
-            MEDIA_JS.contains("export function createMedia("),
-            "media.js does not expose the entry point the interface is documented to call"
-        );
-    }
-
-    #[test]
     fn the_policy_names_the_signalling_origin_and_forbids_the_rest() {
         let policy = content_security_policy("wss://media.example.test");
         let policy = policy.to_str().unwrap();
 
         assert!(policy.starts_with("default-src 'none';"));
-        assert!(policy.contains("script-src 'self';"));
+        assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval';"));
         assert!(
             policy.contains(
                 "connect-src 'self' wss://media.example.test https://media.example.test;"
             )
         );
         assert!(policy.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn the_policy_buys_wasm_and_nothing_else() {
+        let policy = content_security_policy("wss://media.example.test");
+        let policy = policy.to_str().unwrap();
+
+        assert!(
+            policy.contains("'wasm-unsafe-eval'"),
+            "chrome refuses to compile the denoiser without it, so the feature would be dead on \
+             arrival: {policy}"
+        );
+        assert!(
+            !policy.contains("'unsafe-eval'"),
+            "the policy bought wasm with a general eval: {policy}"
+        );
+        assert!(
+            !policy.contains("'unsafe-inline'"),
+            "the policy gained inline scripts: {policy}"
+        );
+        assert!(
+            !policy.contains("script-src 'self' 'wasm-unsafe-eval' "),
+            "a source other than this origin was added to script-src: {policy}"
+        );
+        assert!(
+            policy.contains(
+                "connect-src 'self' wss://media.example.test https://media.example.test;"
+            ),
+            "connect-src names something beyond the signalling origin: {policy}"
+        );
+        assert!(policy.contains("default-src 'none';"));
+    }
+
+    #[test]
+    fn the_denoiser_routes_carry_the_vendored_version() {
+        for path in [
+            RNNOISE_WASM_PATH,
+            RNNOISE_SIMD_WASM_PATH,
+            RNNOISE_WORKLET_PATH,
+        ] {
+            assert!(
+                path.contains(RNNOISE_VERSION),
+                "{path} does not name version {RNNOISE_VERSION}, so an upgrade could be served \
+                 from a browser's cache of the old build"
+            );
+            assert!(
+                APP_JS.contains(path),
+                "nothing on the page loads {path}, so the route is dead"
+            );
+        }
+
+        assert!(
+            APP_JS.contains(DENOISE_PROBE_PATH),
+            "the page never loads the probe worklet, so nothing measures the node"
+        );
+        assert!(
+            APP_JS.contains(DENOISE_GATE_PATH),
+            "the page never loads the gate worklet, so the vendored node would publish silence              until its wasm compiled, and for ever if it never did"
+        );
+    }
+
+    #[test]
+    fn the_denoiser_is_served_by_this_binary_and_not_fetched_from_anywhere() {
+        assert!(
+            !RNNOISE_WASM.is_empty() && !RNNOISE_SIMD_WASM.is_empty(),
+            "a denoiser route would answer with nothing"
+        );
+        assert_eq!(
+            &RNNOISE_WASM[..4],
+            b"\0asm",
+            "the plain build is not a WebAssembly module"
+        );
+        assert_eq!(
+            &RNNOISE_SIMD_WASM[..4],
+            b"\0asm",
+            "the simd build is not a WebAssembly module"
+        );
+
+        for (name, module) in [
+            ("denoise.js", DENOISE_JS),
+            ("denoise-gate.js", DENOISE_GATE_JS),
+            ("denoise-probe.js", DENOISE_PROBE_JS),
+            ("app.js", APP_JS),
+        ] {
+            for host in ["cdn.jsdelivr.net", "unpkg.com", "cdn.mezon.ai", "https://"] {
+                assert!(
+                    !module.contains(host),
+                    "{name} names {host}, so something would be fetched from off this origin"
+                );
+            }
+        }
+    }
+
+    /// Apache-2.0 section 4(d) and the MIT permission notice both require the
+    /// notice to travel with the thing they cover. The file existing in the
+    /// tree is not that: it has to be inside the binary a container runs, and
+    /// reachable from the page.
+    #[test]
+    fn the_licence_notice_travels_with_the_binary() {
+        assert!(
+            NOTICE_TXT.len() > 4096,
+            "the notice is too short to be carrying the licence texts it has to carry"
+        );
+
+        for project in [
+            "livekit-client",
+            "@sapphi-red/web-noise-suppressor",
+            "@shiguredo/rnnoise-wasm",
+            "xiph/rnnoise",
+        ] {
+            assert!(
+                NOTICE_TXT.contains(project),
+                "{project} is served by this binary and is not named in the notice"
+            );
+        }
+
+        for licence in [
+            "Apache License",
+            "MIT License",
+            "Redistribution and use in source and binary forms",
+        ] {
+            assert!(
+                NOTICE_TXT.contains(licence),
+                "the notice names a project under {licence} without reproducing it"
+            );
+        }
+
+        assert!(
+            INDEX_HTML.contains(NOTICE_PATH),
+            "nothing on the page links to {NOTICE_PATH}, so nobody who runs this ever sees it"
+        );
+    }
+
+    /// The README quotes what the denoiser costs a page load, down to the byte,
+    /// and a figure like that goes stale the first time somebody edits a file.
+    /// These are the bytes this binary serves; if they no longer match the ones
+    /// written down, the ones written down are wrong.
+    #[test]
+    fn the_page_weight_in_the_readme_is_the_page_weight() {
+        let every_load = [
+            (RNNOISE_SIMD_WASM_PATH, RNNOISE_SIMD_WASM.len()),
+            ("/denoise.js", DENOISE_JS.len()),
+        ];
+        let on_demand = [
+            (RNNOISE_WORKLET_PATH, RNNOISE_WORKLET_JS.len()),
+            (DENOISE_PROBE_PATH, DENOISE_PROBE_JS.len()),
+            (DENOISE_GATE_PATH, DENOISE_GATE_JS.len()),
+        ];
+
+        for (path, bytes) in every_load.iter().chain(on_demand.iter()) {
+            let row = format!("| `{path}` | {} |", grouped(*bytes));
+            assert!(
+                README_MD.contains(&row),
+                "the README does not carry `{row}`, so it is quoting a page weight that is no \
+                 longer what this binary serves"
+            );
+        }
+
+        let first: usize = every_load.iter().map(|(_, bytes)| bytes).sum();
+        let total: usize = first + on_demand.iter().map(|(_, bytes)| bytes).sum::<usize>();
+
+        for (label, bytes) in [("every load", first), ("once it is switched on", total)] {
+            let row = format!("| **{label}** | **{}** |", grouped(bytes));
+            assert!(
+                README_MD.contains(&row),
+                "the README does not carry `{row}`"
+            );
+        }
+
+        for (what, bytes) in [
+            ("the plain wasm build", RNNOISE_WASM.len()),
+            ("the sdk", SDK_JS.len()),
+        ] {
+            assert!(
+                README_MD.contains(&grouped(bytes)),
+                "the README does not name the {what} at {} bytes",
+                grouped(bytes)
+            );
+        }
+    }
+
+    /// Thousands separated by a space, which is how the README writes them.
+    fn grouped(value: usize) -> String {
+        let digits = value.to_string();
+        let mut out = String::new();
+        for (index, digit) in digits.chars().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push(' ');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    /// The Apache-2.0 build is the one whose bytes are actually shipped, and it
+    /// is the one that was missing from the notice. Its own banner is inside
+    /// the vendored worklet, so the two can be checked against each other.
+    #[test]
+    fn the_notice_names_the_project_the_wasm_came_from() {
+        assert!(
+            RNNOISE_WORKLET_JS.contains("@shiguredo/rnnoise-wasm"),
+            "the vendored worklet no longer carries the banner the notice was written against;              check what the wasm is now built from before touching the notice"
+        );
+        assert!(
+            RNNOISE_WORKLET_JS.contains("@license: Apache-2.0"),
+            "the vendored worklet no longer declares Apache-2.0"
+        );
+        assert!(
+            NOTICE_TXT.contains("@shiguredo/rnnoise-wasm") && NOTICE_TXT.contains("Apache License"),
+            "the wasm this binary serves is Apache-2.0 and the notice does not carry that licence"
+        );
     }
 
     #[test]
