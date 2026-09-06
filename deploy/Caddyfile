@@ -69,9 +69,13 @@ https://{$MEDIACORE_PUBLIC_HOST} {
 		reverse_proxy sfu:7880
 	}
 
-	# Everything else is the front end: /, /app.css, /app.js, the vendored
-	# client SDK, /api/config, /api/token, /healthz. It sets its own
-	# content security policy; nothing here rewrites response headers.
+	# Everything else is the front end: /, /r/<room>, /app.css, /app.js, the
+	# vendored client SDK, /api/config, /api/token, /healthz, and -- where
+	# signing in is switched on -- /auth/callback and /auth/logout. Neither a
+	# room's own url nor the sign-in routes need a rule of their own: they are
+	# more paths this catch-all hands over, and the front end answers them. It
+	# sets its own content security policy; nothing here rewrites response
+	# headers, which matters for the Set-Cookie the sign-in relies on.
 	handle {
 		reverse_proxy front:8080
 	}

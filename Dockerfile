@@ -25,7 +25,10 @@ RUN cargo build --release -p mediacore-server -p mediacore-front \
 
 FROM debian:bookworm-slim AS runtime
 # gettext-base is envsubst, used by deploy/start-sfu.sh to render the config;
-# curl is what the compose healthcheck calls.
+# curl is what the compose healthcheck calls; ca-certificates is what the front
+# end validates the identity provider's certificate against when signing in is
+# switched on -- without it every sign-in fails as "the identity provider could
+# not be reached", which reads like a network problem and is not one.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gettext-base \
     && rm -rf /var/lib/apt/lists/*

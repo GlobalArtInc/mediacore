@@ -1,0 +1,95 @@
+name: Build
+
+# Builds the image the Helm chart installs. One image carries both binaries --
+# `mediacore` and `mediacore-front` -- because they share a build and differ
+# only in which one the pod starts, and two images from one Dockerfile would be
+# two chances for the pair to drift apart in a deployment.
+#
+# Tags are `<utc timestamp>-<short sha>` and nothing else: no `latest`. A
+# cluster pinned to a moving tag reinstalls whatever happens to be behind it on
+# the next pod restart, which is how a call ends in the middle for a reason
+# nobody can reconstruct afterwards.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Work out the tag
+        id: tag
+        run: |
+          set -eu
+          echo "value=$(date -u +%Y%m%d%H%M%S)-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "repo=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Build and push
+        env:
+          DOCKER_BUILDKIT: '1'
+          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
+        run: |
+          set -eu
+          tag="$HARBOR_HOST/prod/${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.value }}"
+          docker build -f Dockerfile -t "$tag" .
+          docker push "$tag"
+          echo "built: $tag"
+          echo "### \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up old images
+        env:
+          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          REPO: ${{ steps.tag.outputs.repo }}
+          KEEP: '15'
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os, urllib.request
+
+          host, repo = os.environ['HARBOR_HOST'], os.environ['REPO']
+          keep = int(os.environ['KEEP'])
+          auth = base64.b64encode(
+              f"{os.environ['HARBOR_USERNAME']}:{os.environ['HARBOR_PASSWORD']}".encode()
+          ).decode()
+          base = f'https://{host}/api/v2.0/projects/prod/repositories/{repo}/artifacts'
+
+          def call(url, method='GET'):
+              request = urllib.request.Request(url, method=method)
+              request.add_header('Authorization', f'Basic {auth}')
+              with urllib.request.urlopen(request, timeout=60) as answer:
+                  return json.loads(answer.read() or b'null')
+
+          artifacts, page = [], 1
+          while True:
+              chunk = call(f'{base}?page_size=100&page={page}&with_tag=true')
+              if not chunk:
+                  break
+              artifacts += chunk
+              if len(chunk) < 100:
+                  break
+              page += 1
+
+          artifacts.sort(key=lambda artifact: artifact.get('push_time', ''), reverse=True)
+
+          removed = 0
+          for artifact in artifacts[keep:]:
+              call(f"{base}/{artifact['digest']}", method='DELETE')
+              removed += 1
+
+          print(f'kept {min(len(artifacts), keep)}, removed {removed}')
+          PYEOF

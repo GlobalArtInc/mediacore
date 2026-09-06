@@ -4,16 +4,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use mediacore_auth::{AuthError, Claims, VideoGrant};
 use serde::{Deserialize, Serialize};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::auth;
 use crate::config::Config;
-use crate::name::{NameError, RoomError, clean_name, identity_for, namespaced_room};
+use crate::name::{NameError, RoomError, clean_name, identity_for, room_for};
+use crate::session::Session;
+use crate::state::{Front, Shared};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -22,6 +25,7 @@ const MEDIA_JS: &str = include_str!("../assets/media.js");
 const BENCH_JS: &str = include_str!("../assets/bench.js");
 const READOUT_JS: &str = include_str!("../assets/readout.js");
 const STAGE_JS: &str = include_str!("../assets/stage.js");
+const ROOM_JS: &str = include_str!("../assets/room.js");
 const PREFS_JS: &str = include_str!("../assets/prefs.js");
 const DENOISE_JS: &str = include_str!("../assets/denoise.js");
 const DENOISE_GATE_JS: &str = include_str!("../assets/denoise-gate.js");
@@ -32,6 +36,13 @@ const RNNOISE_WORKLET_JS: &str = include_str!("../assets/vendor/rnnoise-worklet.
 const RNNOISE_WASM: &[u8] = include_bytes!("../assets/vendor/rnnoise.wasm");
 const RNNOISE_SIMD_WASM: &[u8] = include_bytes!("../assets/vendor/rnnoise-simd.wasm");
 const TOKEN_BODY_LIMIT: usize = 4 * 1024;
+
+/// The room's own URL. `/r/standup` is the address of a room: it is what a
+/// person pastes to a colleague, what the browser reloads into, and what an
+/// identity provider will one day be told to come back to. It carries the room
+/// and nothing else -- no token, no ticket, no name -- so it is safe to paste
+/// anywhere a link goes.
+pub const ROOM_PATH_PREFIX: &str = "/r/";
 
 pub const PUBLISH_SOURCES: [&str; 4] =
     ["microphone", "camera", "screen_share", "screen_share_audio"];
@@ -59,17 +70,40 @@ pub const NOTICE_PATH: &str = "/NOTICE.txt";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const NO_CACHE: &str = "no-cache";
 
+/// Anything that says who is signed in. A `no-cache` response may still be
+/// written to disk and revalidated; `no-store` is the one that says do not keep
+/// a copy at all, which is what a display name and a join token both want.
+const NO_STORE: &str = "no-store";
+
 pub fn router(config: Config) -> Router {
     let csp = content_security_policy(&config.ws_url);
+    let front = Front::new(config);
+    // The two sign-in routes exist only when there is a sign-in. With the
+    // switch off they are not registered at all, so `/auth/callback` is a 404
+    // rather than an endpoint answering questions about a feature this
+    // deployment does not have.
+    let sign_in = match front.requires_sign_in() {
+        true => Router::new()
+            .route(auth::CALLBACK_PATH, get(auth::callback))
+            .route(auth::LOGOUT_PATH, get(auth::logout)),
+        false => Router::new(),
+    };
 
     Router::new()
         .route("/", get(index))
+        // Every room name serves the same page, including one that cannot be a
+        // room. The page reads the name out of its own URL and asks
+        // `/api/config` about it; a 404 here would answer a mistyped link with
+        // a dead end instead of a lobby with the reason in it and the name
+        // still there to be fixed.
+        .route(&format!("{ROOM_PATH_PREFIX}{{room}}"), get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(script))
         .route("/media.js", get(media))
         .route("/bench.js", get(bench))
         .route("/readout.js", get(readout))
         .route("/stage.js", get(stage))
+        .route("/room.js", get(room))
         .route("/prefs.js", get(prefs))
         .route("/denoise.js", get(denoise))
         .route(DENOISE_GATE_PATH, get(denoise_gate))
@@ -85,7 +119,8 @@ pub fn router(config: Config) -> Router {
             "/api/token",
             post(token).layer(DefaultBodyLimit::max(TOKEN_BODY_LIMIT)),
         )
-        .with_state(Arc::new(config))
+        .merge(sign_in)
+        .with_state(Arc::new(front))
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
             csp,
@@ -131,8 +166,25 @@ fn content_security_policy(ws_url: &str) -> HeaderValue {
         .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
 }
 
-async fn index() -> impl IntoResponse {
-    asset("text/html; charset=utf-8", NO_CACHE, INDEX_HTML)
+/// The page, or the way to the provider.
+///
+/// With the switch off this is what it always was. With it on, a load with no
+/// session is answered by sending the browser to sign in, and the room this
+/// load was addressed to is remembered on this side of the wire so that the
+/// callback can put the person back exactly where they were going.
+///
+/// Only the page is behind this. `/app.js`, `/app.css` and the vendored client
+/// stay open, because they carry nothing about anybody and a login page that
+/// cannot load a stylesheet is a login page nobody can read; and `/api/config`
+/// stays open because it is what the page asks before it can show anything at
+/// all. The two things worth protecting are who is signed in, which only a
+/// session says, and a join token, which only `/api/token` mints.
+async fn index(State(front): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+    if front.requires_sign_in() && auth::signed_in(&front, &headers).is_none() {
+        return auth::start_sign_in(&front, &uri).await;
+    }
+
+    asset("text/html; charset=utf-8", NO_CACHE, INDEX_HTML).into_response()
 }
 
 async fn stylesheet() -> impl IntoResponse {
@@ -157,6 +209,10 @@ async fn readout() -> impl IntoResponse {
 
 async fn stage() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, STAGE_JS)
+}
+
+async fn room() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, ROOM_JS)
 }
 
 async fn prefs() -> impl IntoResponse {
@@ -237,16 +293,66 @@ struct PublicConfig {
     room: String,
     ws_url: String,
     max_name_length: usize,
+    max_room_length: usize,
     room_namespace_separator: char,
+    room_error: Option<String>,
+    /// Whether this deployment signs people in. It is what the lobby reads to
+    /// decide whether to ask for a name at all: with sign-in on, the name is
+    /// not the browser's to give.
+    sign_in: bool,
+    /// Who the *server* says this browser is, or null. It is the display name
+    /// and nothing else -- not the subject, not the roles, not the token --
+    /// because the page has one use for it, which is to show the person which
+    /// account they are about to join as.
+    signed_in_as: Option<String>,
 }
 
-async fn public_config(State(config): State<Arc<Config>>) -> Json<PublicConfig> {
-    Json(PublicConfig {
+/// The room the page found in its own URL, handed back for judgement.
+///
+/// It is optional because `/` names no room at all. It is here rather than in
+/// a validation endpoint of its own because the page already fetches this one
+/// before it enables the form, so the answer costs no extra round trip and
+/// arrives in time to be shown in the lobby instead of after a join.
+#[derive(Debug, Deserialize)]
+struct ConfigQuery {
+    #[serde(default)]
+    room: Option<String>,
+}
+
+/// What the lobby needs before anybody presses anything: the room to offer,
+/// the socket the browser will open, the two lengths the fields bind
+/// themselves to, and -- when the URL named a room -- whether that name can be
+/// a room at all.
+///
+/// `roomError` is the reason in the same words the token endpoint would use,
+/// because it comes from the same `room_for`. The page owns no second notion
+/// of a valid room name: it asks, and prints the answer.
+async fn public_config(
+    State(front): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<ConfigQuery>,
+) -> impl IntoResponse {
+    let config = &front.config;
+    let room_error = query
+        .room
+        .as_deref()
+        .and_then(|requested| room_for(&config.room, requested).err())
+        .map(|error| error.to_string());
+
+    let body = Json(PublicConfig {
         room: config.room.clone(),
         ws_url: config.ws_url.clone(),
         max_name_length: crate::name::MAX_NAME_CHARS,
+        max_room_length: crate::name::MAX_ROOM_CHARS,
         room_namespace_separator: crate::name::ROOM_NAMESPACE_SEPARATOR,
-    })
+        room_error,
+        sign_in: front.requires_sign_in(),
+        signed_in_as: auth::signed_in(&front, &headers).map(|session| session.display_name),
+    });
+
+    // `no-store`, because this one now says who is at the keyboard. A shared
+    // cache holding it would hand the previous visitor's name to the next.
+    ([(header::CACHE_CONTROL, NO_STORE)], body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +377,8 @@ struct TokenResponse {
 enum ApiError {
     #[error("the request body must be json with a `name` field")]
     Body,
+    #[error("this sign-in has ended. Reload the page to sign in again.")]
+    NotSignedIn,
     #[error(transparent)]
     Name(#[from] NameError),
     #[error(transparent)]
@@ -285,6 +393,7 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::Body | Self::Name(_) | Self::Room(_) => StatusCode::BAD_REQUEST,
+            Self::NotSignedIn => StatusCode::UNAUTHORIZED,
             Self::Issue(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -309,18 +418,44 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Mints the join token, from whoever this browser has turned out to be.
+///
+/// With the switch off this is what it always was: an unauthenticated endpoint
+/// that takes a name on trust, because there are no accounts and the link to a
+/// room is the whole of the invitation.
+///
+/// With it on the body stops being able to say who anybody is. The name and the
+/// identity both come out of the session -- **the `name` field is read and
+/// discarded** -- because a browser that can still name itself here is a
+/// browser that can join as somebody else, and that is the entire point of
+/// having signed anybody in. The room is the one thing the body is still
+/// believed about, and it is namespaced exactly as before.
 async fn token(
-    State(config): State<Arc<Config>>,
+    State(front): State<Shared>,
+    headers: HeaderMap,
     body: Result<Json<TokenRequest>, JsonRejection>,
 ) -> Result<Json<TokenResponse>, ApiError> {
+    let config = &front.config;
+    let session = match front.requires_sign_in() {
+        true => Some(auth::signed_in(&front, &headers).ok_or(ApiError::NotSignedIn)?),
+        false => None,
+    };
+
     let Json(request) = body.map_err(|_| ApiError::Body)?;
 
-    let name = clean_name(&request.name)?;
+    let (name, identity) = match &session {
+        Some(session) => whoever_signed_in(session),
+        None => {
+            let name = clean_name(&request.name)?;
+            let identity = identity_for(&name);
+
+            (name, identity)
+        }
+    };
     let room = match request.room.as_deref() {
-        Some(requested) => namespaced_room(&config.room, requested)?,
+        Some(requested) => room_for(&config.room, requested)?,
         None => config.room.clone(),
     };
-    let identity = identity_for(&name);
 
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -356,6 +491,21 @@ async fn token(
     }))
 }
 
+/// The name and the identity of somebody signed in.
+///
+/// The identity is the provider's `sub` and nothing appended to it. That is a
+/// decision with a visible consequence: a LiveKit identity is unique within a
+/// room, so one person joining the same room twice replaces their own first
+/// participant rather than sitting beside it. That is what "one person, one
+/// seat" means, and it is the right answer for a call -- the alternative is
+/// somebody's abandoned tab in the roster with a live microphone in it.
+///
+/// The anonymous path keeps its per-visit suffix, because there `Alice` is a
+/// string two people can both type.
+fn whoever_signed_in(session: &Session) -> (String, String) {
+    (session.display_name.clone(), session.subject.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +531,7 @@ mod tests {
             ("/bench.js", BENCH_JS),
             ("/readout.js", READOUT_JS),
             ("/stage.js", STAGE_JS),
+            ("/room.js", ROOM_JS),
             ("/prefs.js", PREFS_JS),
             ("/media.js", MEDIA_JS),
             ("/denoise.js", DENOISE_JS),
@@ -399,6 +550,7 @@ mod tests {
         for (path, module) in [
             ("/bench.js", BENCH_JS),
             ("/stage.js", STAGE_JS),
+            ("/room.js", ROOM_JS),
             ("/prefs.js", PREFS_JS),
         ] {
             assert!(

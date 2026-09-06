@@ -63,6 +63,17 @@ const {
   sizeChange,
   stagePlan,
 } = await import(`file://${assetPath("stage.js")}`);
+const {
+  ROOM_PATH_PREFIX,
+  TITLE,
+  addressedRoom,
+  composedRoom,
+  offeredRoom,
+  plainRoom,
+  roomInPath,
+  roomPath,
+  roomTitle,
+} = await import(`file://${assetPath("room.js")}`);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 
 const QUANTUM = 128;
@@ -1322,6 +1333,139 @@ describe("the denoiser survives leaving the room and joining it again", () => {
 
 // ------------------------------------------------------------- preferences
 
+describe("a room is an address", () => {
+  it("reads the room out of the url the page was opened at", () => {
+    assert.deepEqual(addressedRoom("/r/standup", ""), { room: "standup", canonical: null });
+    assert.deepEqual(addressedRoom("/r/a.b-c_d", ""), { room: "a.b-c_d", canonical: null });
+    assert.deepEqual(addressedRoom("/", ""), { room: null, canonical: null });
+    assert.deepEqual(addressedRoom("/healthz", ""), { room: null, canonical: null });
+
+    assert.equal(
+      roomInPath("/r/standup/"),
+      "standup",
+      "a link that picked up a trailing slash on its way through a chat client is still a link " +
+        "to that room",
+    );
+    assert.equal(roomInPath("/r/"), null);
+    assert.equal(roomInPath("/r/a/b"), null, "a room name cannot contain a path of its own");
+  });
+
+  it("decodes what the url actually says, including what it should not say", () => {
+    assert.equal(
+      addressedRoom("/r/not%20a%20room", "").room,
+      "not a room",
+      "the lobby would show a percent sequence instead of the name somebody has to correct",
+    );
+    assert.equal(
+      addressedRoom("/r/%zz", "").room,
+      "%zz",
+      "a percent sequence that will not decode took the page down rather than being shown to " +
+        "the person whose link it is",
+    );
+  });
+
+  it("still follows a link written before rooms had one, and corrects the address", () => {
+    const legacy = addressedRoom("/", "?room=standup");
+
+    assert.equal(legacy.room, "standup", "a link in somebody's chat history stopped working");
+    assert.equal(
+      legacy.canonical,
+      "/r/standup",
+      "the address bar would keep naming a room in a way this page no longer writes",
+    );
+
+    assert.equal(
+      addressedRoom("/r/retro", "?room=standup").room,
+      "retro",
+      "the path is the address of this page and the query is a parameter left on it; the " +
+        "address wins",
+    );
+    assert.equal(addressedRoom("/", "?room=%20%20").room, null, "whitespace is not a room name");
+  });
+
+  it("keeps the rest of this visit's parameters when it writes an address", () => {
+    assert.equal(
+      roomPath("standup", "?room=standup&video=1&bench=1"),
+      "/r/standup?video=1&bench=1",
+      "`?video=1` is an instruction for this visit, and a reload of the corrected url has to " +
+        "carry it; `?room=` is the path's job now",
+    );
+    assert.equal(roomPath("standup", ""), "/r/standup");
+    assert.equal(
+      roomPath("not a room", ""),
+      "/r/not%20a%20room",
+      "a name that cannot be a room still has to survive being put in a url",
+    );
+    assert.ok(roomPath("standup", "").startsWith(ROOM_PATH_PREFIX));
+  });
+
+  it("offers the link's room first, then the remembered one, then the server's", () => {
+    assert.deepEqual(offeredRoom("standup", "retro", "demo"), {
+      room: "standup",
+      source: "link",
+    });
+    assert.deepEqual(offeredRoom(null, "retro", "demo"), { room: "retro", source: "remembered" });
+    assert.deepEqual(offeredRoom(null, null, "demo"), { room: "demo", source: "default" });
+
+    assert.equal(
+      offeredRoom("standup", "retro", "demo").room,
+      "standup",
+      "following a link to one room and being offered another is the failure the address exists " +
+        "to prevent",
+    );
+    assert.equal(offeredRoom("  standup  ", null, "demo").room, "standup");
+    assert.equal(offeredRoom("", "   ", "demo").source, "default");
+  });
+
+  it("names the tab after the room, and puts the room first", () => {
+    assert.equal(roomTitle("standup"), `standup · ${TITLE}`);
+    assert.equal(
+      roomTitle(null),
+      TITLE,
+      "a tab that is about no particular room claims one anyway",
+    );
+    assert.equal(roomTitle("   "), TITLE);
+    assert.ok(
+      roomTitle("standup").startsWith("standup"),
+      "four tabs squeezed into a strip show their first few characters, and those have to be " +
+        "the ones that differ",
+    );
+  });
+
+  it("composes the room the server will know, and reads the spoken name back out of it", () => {
+    assert.equal(composedRoom("demo", "standup", "."), "demo.standup");
+    assert.equal(
+      composedRoom("demo", "demo", "."),
+      "demo",
+      "the namespace is itself a room, and naming it has to reach it rather than `demo.demo`",
+    );
+    assert.equal(composedRoom("demo", "  ", "."), "demo");
+
+    assert.equal(plainRoom("demo.standup", "demo", "."), "standup");
+    assert.equal(plainRoom("demo", "demo", "."), "demo");
+    assert.equal(plainRoom("demo.a.b", "demo", "."), "a.b");
+
+    for (const room of ["standup", "demo", "a.b-c_d"]) {
+      assert.equal(
+        plainRoom(composedRoom("demo", room, "."), "demo", "."),
+        room,
+        `\`${room}\` does not survive the round trip to the server's name and back, so the url ` +
+          "the page writes is not the url it was opened at",
+      );
+    }
+  });
+
+  it("hands back a room it cannot explain rather than a truncation of it", () => {
+    assert.equal(
+      plainRoom("other.standup", "demo", "."),
+      "other.standup",
+      "a room outside the namespace was shown as if it were inside it",
+    );
+    assert.equal(plainRoom("", "demo", "."), "");
+    assert.equal(plainRoom(null, "demo", "."), "");
+  });
+});
+
 describe("what this browser remembers between visits", () => {
   const OFFER = { engines: NOISE_ENGINES, processing: DIRECT_PROCESSING_KEYS };
 
@@ -1330,6 +1474,7 @@ describe("what this browser remembers between visits", () => {
 
     writePrefs(store, {
       name: "Alice",
+      room: "standup",
       camera: true,
       noise: NOISE_BROWSER,
       microphone: "mic-2",
@@ -1340,6 +1485,7 @@ describe("what this browser remembers between visits", () => {
 
     assert.deepEqual(readPrefs(store, OFFER), {
       name: "Alice",
+      room: "standup",
       camera: true,
       noise: NOISE_BROWSER,
       microphone: "mic-2",
@@ -1354,6 +1500,41 @@ describe("what this browser remembers between visits", () => {
         "and every script this origin ever runs can read it",
     );
     assert.equal("identity" in written, false, "the identity the server issued was written down");
+  });
+
+  it("remembers the room, which is an address and not a credential", () => {
+    const store = fakeStore();
+    writePrefs(store, { ...NOTHING_REMEMBERED, name: "Alice", room: "standup" });
+
+    assert.equal(
+      readPrefs(store, OFFER).room,
+      "standup",
+      "somebody who joins the same room every morning has to type it every morning",
+    );
+
+    assert.equal(
+      readPrefs(fakeStore({ name: "Alice", camera: true }), OFFER).room,
+      null,
+      "a blob written before rooms were remembered has to read as `no room remembered` rather " +
+        "than costing the fields beside it",
+    );
+    assert.equal(
+      readPrefs(fakeStore({ room: "   " }), OFFER).room,
+      null,
+      "whitespace was remembered as a room and would be offered as one",
+    );
+    assert.equal(
+      readPrefs(fakeStore({ room: 7 }), OFFER).room,
+      null,
+      "a room that is not a string was handed to the page to put in a text field",
+    );
+
+    assert.equal(
+      readPrefs(fakeStore({ room: "not a room" }), OFFER).room,
+      "not a room",
+      "a stored room is checked for shape and not for validity: what may be a room name is the " +
+        "server's answer, and a second copy of that rule here would drift from it",
+    );
   });
 
   it("remembers nothing at all when there is nothing stored", () => {

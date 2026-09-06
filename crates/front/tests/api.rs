@@ -20,6 +20,7 @@ fn config() -> Config {
         room: ROOM.to_owned(),
         port: 0,
         token_ttl: TOKEN_TTL,
+        oidc: None,
     }
 }
 
@@ -149,7 +150,15 @@ async fn public_config_carries_the_room_and_socket_url() {
     assert_eq!(value["wsUrl"], WS_URL);
     assert_eq!(
         value["roomNamespaceSeparator"], ".",
-        "the lobby cannot name the room a `?room=` link actually reaches"
+        "the lobby cannot name the room a `/r/` link actually reaches"
+    );
+    assert_eq!(
+        value["maxRoomLength"], 64,
+        "the room field cannot bind itself to the length this server accepts"
+    );
+    assert!(
+        value["roomError"].is_null(),
+        "a page opened at `/` names no room, so there is nothing to refuse"
     );
 }
 
@@ -230,11 +239,14 @@ async fn a_requested_room_is_namespaced_under_the_configured_one() {
     assert_eq!(body["room"], "demo.standup");
 }
 
+/// The endpoint mints for anybody who asks, so what it can address is the
+/// whole of its blast radius. Two rooms are inside it: the configured one, and
+/// a name under it. Nothing a caller sends reaches a third.
 #[tokio::test]
 async fn a_caller_cannot_name_a_room_outside_the_configured_namespace() {
     let addr = spawn().await;
 
-    for requested in ["board", "demo", "..", "ops.private", "-", "_"] {
+    for requested in ["board", "demo", "..", "ops.private", "-", "_", "Demo"] {
         let (status, body) = mint(
             addr,
             &format!(r#"{{"name":"Mallory","room":"{requested}"}}"#),
@@ -243,13 +255,15 @@ async fn a_caller_cannot_name_a_room_outside_the_configured_namespace() {
         assert_eq!(status, 200, "`{requested}` was refused outright");
 
         let claims = mediacore_auth::verify_join(body["token"].as_str().unwrap(), &keys()).unwrap();
-        assert_eq!(
-            claims.video.room,
-            format!("{ROOM}.{requested}"),
-            "`{requested}` reached a room the front end does not own"
+        let room = &claims.video.room;
+        assert!(
+            room == ROOM || room.starts_with(&format!("{ROOM}.")),
+            "`{requested}` reached `{room}`, a room this front end does not own"
         );
-        assert!(claims.video.room.starts_with(&format!("{ROOM}.")));
-        assert_ne!(claims.video.room, requested);
+        assert_eq!(
+            body["room"], *room,
+            "the page is told a room it was not given"
+        );
     }
 }
 
@@ -261,6 +275,292 @@ async fn a_room_that_would_not_fit_the_namespace_is_refused() {
 
     assert_eq!(status, 400);
     assert!(body["error"].as_str().unwrap().contains("at most"));
+}
+
+/// The complaint this answers, in the owner's words: typed a room name,
+/// pressed F5, and ended up back on the front page. A room only survives a
+/// reload if it has a URL, and a URL only survives one if the server answers
+/// at it.
+#[tokio::test]
+async fn a_room_has_a_url_of_its_own() {
+    let addr = spawn().await;
+
+    for path in ["/r/standup", "/r/demo", "/r/a.b-c_d", "/r/not%20a%20room"] {
+        let (status, page) = get(addr, path).await;
+        assert_eq!(
+            status, 200,
+            "{path} is not served, so reloading a room lands on nothing"
+        );
+        assert!(
+            page.contains(r#"id="join-form""#),
+            "{path} answered with something that is not the lobby"
+        );
+        assert!(
+            page.contains(r#"src="/app.js""#) && page.contains(r#"href="/app.css""#),
+            "{path} serves a page whose assets are addressed relative to it, so one directory \
+             down they would 404"
+        );
+    }
+
+    let (_, js) = get(addr, "/app.js").await;
+    assert!(
+        js.contains("addressedRoom(location.pathname, location.search)"),
+        "nothing reads the room out of the url the page was opened at"
+    );
+
+    let (_, room) = get(addr, "/room.js").await;
+    assert!(
+        room.contains(&format!(
+            r#"export const ROOM_PATH_PREFIX = "{}";"#,
+            http::ROOM_PATH_PREFIX
+        )),
+        "the page writes room urls under a prefix this server does not answer at, so every link \
+         it hands out would 404"
+    );
+}
+
+/// A room's URL is the thing somebody pastes into a chat window, so what it
+/// carries is what they hand over. It carries the room. The token is minted
+/// per load, lives in memory for the length of the connection, and is written
+/// neither into the address bar nor into storage.
+#[tokio::test]
+async fn the_rooms_url_carries_the_room_and_nothing_else() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, room) = get(addr, "/room.js").await;
+
+    let path = body_of(&room, "export function roomPath(room, search) {");
+    for private in ["token", "identity", "name", "prefs"] {
+        assert!(
+            !path.contains(private),
+            "the url a room is addressed by is built out of `{private}`: {path}"
+        );
+    }
+
+    assert_eq!(
+        js.matches("history.replaceState(").count(),
+        2,
+        "the page writes the address bar somewhere other than the two places that know what a \
+         room's url is: the correction of a legacy link, and entering a room"
+    );
+    assert!(
+        js.contains(r#"history.replaceState(null, "", arrival.canonical);"#)
+            && js.contains(r#"history.replaceState(null, "", path);"#),
+        "a url is being assembled at the call site rather than by `roomPath`"
+    );
+    assert!(
+        js.contains("const path = roomPath(room, location.search);"),
+        "the address the page writes is not the room's own url"
+    );
+    assert!(
+        !js.contains("history.pushState("),
+        "the room is pushed onto the history stack, so Back leaves the url naming the lobby \
+         while the page is still in the room and nothing here listens for `popstate`"
+    );
+}
+
+/// The lobby asks two questions now. The room is one of them, it is bound to
+/// the same length the server enforces, and it is dead until the client has
+/// loaded for the same reason the name field is.
+#[tokio::test]
+async fn the_lobby_asks_which_room() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        page.contains(r#"<label for="join-room">Room</label>"#),
+        "the room field has no label, so nothing says what the box is for"
+    );
+
+    let field = page
+        .split_once(r#"id="join-room""#)
+        .expect("the lobby has a room field")
+        .1
+        .split_once("/>")
+        .expect("the room field is closed")
+        .0;
+    assert!(
+        field.contains("disabled"),
+        "the room field takes a room before the client that would join it has loaded"
+    );
+    assert!(
+        field.contains(r#"maxlength="64""#),
+        "the room field is not bound to the length this server accepts: {field}"
+    );
+
+    assert!(
+        js.contains("mintToken(name, el.joinRoom.value)"),
+        "joining ignores the room in the field"
+    );
+    assert!(
+        js.contains("offeredRoom(arrival.room, prefs.room, settings.room)"),
+        "the room the lobby offers is no longer the link first, then what this browser last \
+         joined, then the server's own"
+    );
+    assert!(
+        js.contains("el.joinRoom.maxLength = settings.maxRoomLength;"),
+        "a room out of storage or out of a url could sit in the field at a length the server \
+         would refuse"
+    );
+}
+
+/// A link that was mangled on the way -- a space, a slash, a name too long --
+/// is answered in the lobby with the reason, and the name it named is left in
+/// the field where it can be corrected. Not a 404: somebody who was sent a
+/// broken link cannot edit the link, and a dead end tells them nothing.
+#[tokio::test]
+async fn a_room_name_that_cannot_be_one_is_refused_in_the_lobby() {
+    let addr = spawn().await;
+
+    let (status, body) = get(addr, "/api/config?room=not%20a%20room").await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        value["roomError"], "a room name may only contain letters, digits, `-`, `_` and `.`",
+        "the lobby is not told why the room in the url cannot be one"
+    );
+
+    let long = "a".repeat(64);
+    let (_, body) = get(addr, &format!("/api/config?room={long}")).await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        value["roomError"]
+            .as_str()
+            .expect("a reason")
+            .contains("at most"),
+        "a name that only becomes too long once it is composed is accepted by the lobby and \
+         refused after the microphone has been opened"
+    );
+
+    for good in ["standup", "demo", "a.b-c_d"] {
+        let (_, body) = get(addr, &format!("/api/config?room={good}")).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["roomError"].is_null(),
+            "`{good}` is a room this server would mint for and the lobby refuses it"
+        );
+    }
+
+    let (_, body) = get(addr, "/api/config").await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        value["roomError"].is_null(),
+        "arriving at `/` with no room named is not a mistake"
+    );
+
+    let (_, js) = get(addr, "/app.js").await;
+    assert!(
+        js.contains("loadSettings(arrival.room)") && js.contains("if (settings.roomError) {"),
+        "the page never asks whether the room in its url can be one, or never says so"
+    );
+    assert!(
+        body_of(&js, "function onRoomTyped() {").contains("hide(el.lobbyError)"),
+        "a refusal of what the link named outlives the correction of it, so the lobby goes on \
+         arguing with a name nobody is asking for while somebody types the one they want"
+    );
+}
+
+/// The round trip, from both ends. `/` and `/r/demo` are the same room, or
+/// pressing F5 on the room everybody lands in would quietly move them into
+/// `demo.demo`; and the same address twice is the same room with a new token
+/// rather than a token that was kept.
+#[tokio::test]
+async fn reloading_a_rooms_url_comes_back_to_the_same_room() {
+    let addr = spawn().await;
+
+    let (_, bare) = mint(addr, r#"{"name":"Alice"}"#).await;
+    let (_, named) = mint(addr, &format!(r#"{{"name":"Alice","room":"{ROOM}"}}"#)).await;
+    assert_eq!(
+        bare["room"], named["room"],
+        "`/` and `/r/{ROOM}` are two different rooms, so reloading the page everybody lands on \
+         moves them out of it"
+    );
+
+    let (_, first) = mint(addr, r#"{"name":"Alice","room":"standup"}"#).await;
+    let (_, again) = mint(addr, r#"{"name":"Alice","room":"standup"}"#).await;
+    assert_eq!(first["room"], "demo.standup");
+    assert_eq!(
+        again["room"], first["room"],
+        "the same url reached a different room the second time"
+    );
+    assert_ne!(
+        first["token"], again["token"],
+        "a token was reused across loads instead of minted per load"
+    );
+
+    let (_, js) = get(addr, "/app.js").await;
+    let enter = body_of(&js, "function enterRoom(credentials) {");
+    assert!(
+        enter.contains("plainRoom(") && enter.contains("credentials.room,"),
+        "the room the page names is not the room the token came back for: {enter}"
+    );
+    assert!(
+        enter.contains("showAddress(address);"),
+        "the address bar is left naming whatever the tab was opened at"
+    );
+}
+
+/// Four tabs, four rooms, and a tab strip that squeezes each of them to two
+/// centimetres. The room goes first in the title, where that much is still
+/// readable, and the roster header carries the name a person says rather than
+/// the composed one the SFU knows -- the footer already carries that, beside
+/// the socket and the identity, for whoever is reading `ListRooms` at the same
+/// time.
+#[tokio::test]
+async fn a_tab_says_which_room_it_is() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, room) = get(addr, "/room.js").await;
+
+    assert!(
+        page.contains("<title>mediacore</title>"),
+        "the page ships with a title that is not the product's name"
+    );
+    assert!(
+        room.contains("`${room.trim()} · ${TITLE}`"),
+        "the room is not the first thing in the tab's name, so four of them are four identical \
+         tabs"
+    );
+    assert!(
+        js.contains("document.title = roomTitle(address);"),
+        "joining a room does not name the tab after it"
+    );
+    assert!(
+        js.contains("el.roomName.textContent = address;"),
+        "the roster header no longer carries the room this tab is in"
+    );
+    assert!(
+        js.contains(
+            "el.footUrl.textContent = `${credentials.url} - ${credentials.room} - ${credentials.identity}`;"
+        ),
+        "the composed room the sfu knows is nowhere on the page, so nothing connects what is on \
+         screen to what `ListRooms` returns"
+    );
+}
+
+#[tokio::test]
+async fn the_address_module_is_served_as_its_own_module() {
+    let addr = spawn().await;
+
+    let (status, room) = get(addr, "/room.js").await;
+    assert_eq!(status, 200, "/room.js is not served");
+    assert!(
+        room.contains("export function addressedRoom(")
+            && room.contains("export function roomPath("),
+        "the interface has nothing to import"
+    );
+
+    let head = head_of(addr, "/room.js").await.to_lowercase();
+    assert!(
+        head.contains("content-type: text/javascript"),
+        "/room.js is not served as a module: {head}"
+    );
+    assert!(
+        head.contains("content-security-policy: default-src 'none';"),
+        "/room.js was served without a policy"
+    );
 }
 
 #[tokio::test]
@@ -1752,8 +2052,9 @@ async fn nothing_the_server_minted_is_ever_written_to_this_browser() {
     let (_, js) = get(addr, "/app.js").await;
 
     assert!(
-        prefs
-            .contains(r#"const FIELDS = ["name", "camera", "noise", "microphone", "processing"];"#),
+        prefs.contains(
+            r#"const FIELDS = ["name", "room", "camera", "noise", "microphone", "processing"];"#
+        ),
         "the list of what may be stored has changed; every field on it is written to disk verbatim"
     );
 
@@ -1884,8 +2185,13 @@ async fn the_lobby_comes_back_the_way_it_was_left() {
     let (_, js) = get(addr, "/app.js").await;
 
     assert!(
-        js.contains("if (prefs.name) el.name.value = prefs.name.slice(0, settings.maxNameLength);"),
+        js.contains("el.name.value = prefs.name.slice(0, settings.maxNameLength);"),
         "the name is not put back, or is put back at a length this server would refuse"
+    );
+    assert!(
+        js.contains("if (prefs.name && !settings.signIn) {"),
+        "a remembered name is put back into a field that is not there, on a deployment where the \
+         name is the provider's to give"
     );
     assert!(
         js.contains(r#"query.has("video")"#) && js.contains("prefs.camera === true"),
@@ -1893,7 +2199,7 @@ async fn the_lobby_comes_back_the_way_it_was_left() {
     );
 
     for setting in [
-        "remember({ name, camera: withVideo });",
+        "remember(settings.signIn ? { camera: withVideo } : { name, camera: withVideo });",
         "remember({ noise: engine });",
         "remember({ microphone: chosen === SYSTEM_DEFAULT ? null : chosen });",
         "remember({ processing: media.state().processing });",
@@ -1934,5 +2240,85 @@ async fn our_denoiser_is_the_default_and_every_way_out_of_it_lands_on_the_browse
         "something in the capture module is on a timer, and the only thing a timer could be for \
          here is putting our denoiser back after a machine gave up on it -- a suppressor that \
          switches on and off mid-sentence is worse than either state"
+    );
+}
+
+/// With signing in switched on the lobby stops asking who you are, because the
+/// answer is no longer the browser's to give. This is that shape, asserted
+/// against the markup and the script this binary actually serves -- the
+/// behaviour over real sockets is in `tests/oidc.rs`.
+#[tokio::test]
+async fn the_lobby_asks_for_a_name_only_when_nobody_has_signed_it_in() {
+    let addr = spawn().await;
+    let (_, page) = get(addr, "/").await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    assert!(
+        page.contains(r#"<div class="field" id="name-field">"#),
+        "the name field cannot be taken out of the lobby in one piece, so a deployment that \
+         signs people in would show a label with no box under it"
+    );
+    assert!(
+        js.contains("el.nameField.hidden = true;") && js.contains("el.name.value = \"\";"),
+        "the name field stays in the lobby with a session open, and whatever is typed in it is \
+         thrown away by the server"
+    );
+
+    assert!(
+        js.contains("const body = settings.signIn ? { room } : { name, room };"),
+        "the page still tells the server who it is when the server already knows, which is a \
+         field somebody will one day believe"
+    );
+    assert!(
+        js.contains("if (!settings.signIn && !name) {"),
+        "the lobby refuses to join for want of a name it is not asking for"
+    );
+    assert!(
+        js.contains("firstQuestion().focus()"),
+        "the cursor is put in a box that is not there"
+    );
+
+    assert!(
+        page.contains(r#"id="signed-in-name"#),
+        "nothing on the page says which account is about to join"
+    );
+    assert!(
+        page.contains(&format!(
+            r#"id="sign-out" href="{}""#,
+            mediacore_front::auth::LOGOUT_PATH
+        )),
+        "the sign-out link does not go where this server answers"
+    );
+
+    let (_, css) = get(addr, "/app.css").await;
+    assert!(
+        css.contains("[hidden] {\n  display: none !important;\n}"),
+        "`hidden` is set on elements this stylesheet gives a `display` to, and without a rule \
+         that outranks the user agent's, setting it does nothing at all"
+    );
+}
+
+/// Nothing about the page changes when nobody has to sign in, which is the
+/// whole of the switch's promise.
+#[tokio::test]
+async fn a_deployment_that_signs_nobody_in_is_the_page_it_always_was() {
+    let addr = spawn().await;
+
+    let (status, page) = get(addr, "/r/standup").await;
+    assert_eq!(status, 200);
+    assert!(page.contains(r#"id="name""#));
+
+    let (status, body) = get(addr, "/api/config").await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        value["signIn"], false,
+        "the lobby is told to hide the name field on a deployment with no sign-in"
+    );
+
+    let (status, body) = mint(addr, r#"{"name":"Alice","room":"standup"}"#).await;
+    assert_eq!(
+        status, 200,
+        "the token endpoint asks for a session on a deployment that has none: {body}"
     );
 }

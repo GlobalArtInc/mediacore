@@ -58,8 +58,27 @@ pub fn clean_room(raw: &str) -> Result<String, RoomError> {
     Ok(room.to_owned())
 }
 
-pub fn namespaced_room(namespace: &str, requested: &str) -> Result<String, RoomError> {
+/// The room a caller asking for `requested` actually reaches, given the
+/// namespace this front end owns.
+///
+/// Two answers, and only two: the namespace itself, or a name inside it. That
+/// is the same set of rooms this endpoint could reach when the room was a
+/// server-wide setting and no request could name one at all -- `demo`, from a
+/// body with no `room` field -- plus the `demo.` names it has minted since. A
+/// caller who sends `board`, `..` or `ops.private` lands in `demo.board`,
+/// `demo...` and `demo.ops.private`; `.` and `-` are the only punctuation the
+/// charset allows and neither can walk up a namespace.
+///
+/// The namespace resolving to *itself* rather than to `demo.demo` is not a
+/// convenience. `/` and `/r/demo` name the room everyone lands in, and a
+/// reload has to come back to the room the first load joined; composing there
+/// would put the second one in `demo.demo` and quietly split the room in two.
+pub fn room_for(namespace: &str, requested: &str) -> Result<String, RoomError> {
     let requested = clean_room(requested)?;
+    if requested == namespace {
+        return Ok(requested);
+    }
+
     let room = format!("{namespace}{ROOM_NAMESPACE_SEPARATOR}{requested}");
     if room.chars().count() > MAX_ROOM_CHARS {
         return Err(RoomError::TooLong);
@@ -164,15 +183,11 @@ mod tests {
 
     #[test]
     fn a_requested_room_stays_inside_the_namespace() {
-        assert_eq!(namespaced_room("demo", "standup").unwrap(), "demo.standup");
-        assert_eq!(
-            namespaced_room("demo", " standup ").unwrap(),
-            "demo.standup"
-        );
-        assert_eq!(namespaced_room("demo", "demo").unwrap(), "demo.demo");
+        assert_eq!(room_for("demo", "standup").unwrap(), "demo.standup");
+        assert_eq!(room_for("demo", " standup ").unwrap(), "demo.standup");
 
-        for requested in ["ops", "demo", "a.b", "..", "-", "_"] {
-            let room = namespaced_room("demo", requested).unwrap();
+        for requested in ["ops", "board", "a.b", "..", "-", "_", "Demo", "demo2"] {
+            let room = room_for("demo", requested).unwrap();
             assert!(
                 room.starts_with("demo."),
                 "`{requested}` escaped the namespace as `{room}`"
@@ -182,16 +197,39 @@ mod tests {
         }
     }
 
+    /// The namespace is a room, and it is the room the bare page has always
+    /// joined. Naming it has to reach it, or `/r/demo` and `/` would be two
+    /// different rooms and a reload would move whoever pressed it.
+    #[test]
+    fn naming_the_namespace_reaches_the_room_everyone_lands_in() {
+        assert_eq!(room_for("demo", "demo").unwrap(), "demo");
+        assert_eq!(room_for("demo", " demo ").unwrap(), "demo");
+        assert_eq!(
+            room_for("rooms.mediacore", "rooms.mediacore").unwrap(),
+            "rooms.mediacore"
+        );
+    }
+
+    /// The whole set a caller can reach, stated as the property rather than as
+    /// a composition: this room, or one under it, and nothing else.
+    #[test]
+    fn nothing_a_caller_can_ask_for_reaches_another_namespace() {
+        for requested in ["demo", "ops", "..", "-", "demo.ops", "d", "demo-other"] {
+            let room = room_for("demo", requested).unwrap();
+            assert!(
+                room == "demo" || room.starts_with("demo."),
+                "`{requested}` reached `{room}`, which is a room this front end does not own"
+            );
+        }
+    }
+
     #[test]
     fn a_room_that_cannot_be_namespaced_is_refused() {
-        assert_eq!(namespaced_room("demo", ""), Err(RoomError::Empty));
+        assert_eq!(room_for("demo", ""), Err(RoomError::Empty));
+        assert_eq!(room_for("demo", "not a room"), Err(RoomError::Charset));
+        assert_eq!(room_for("demo", "../other"), Err(RoomError::Charset));
         assert_eq!(
-            namespaced_room("demo", "not a room"),
-            Err(RoomError::Charset)
-        );
-        assert_eq!(namespaced_room("demo", "../other"), Err(RoomError::Charset));
-        assert_eq!(
-            namespaced_room("demo", &"a".repeat(MAX_ROOM_CHARS)),
+            room_for("demo", &"a".repeat(MAX_ROOM_CHARS)),
             Err(RoomError::TooLong)
         );
     }

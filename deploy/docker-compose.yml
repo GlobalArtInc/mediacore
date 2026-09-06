@@ -76,6 +76,12 @@ services:
       # A scheme or a slash in MEDIACORE_PUBLIC_HOST makes this an unusable url
       # and the front end refuses to start, naming the variable.
       MEDIACORE_FRONT_WS_URL: wss://${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
+      # The origin a browser reaches this stack at. Read only when signing in is
+      # switched on, and derived from the same one host name the certificate and
+      # the WebSocket url come from -- because the redirect uri built from it
+      # has to equal the one registered with the identity provider to the
+      # character, and a provider refuses a request over exactly that.
+      MEDIACORE_FRONT_PUBLIC_URL: https://${MEDIACORE_PUBLIC_HOST:?set MEDIACORE_PUBLIC_HOST in deploy/.env to the domain or ip visitors type, with no scheme and no trailing slash}
       MEDIACORE_FRONT_PORT: "8080"
     command: ["/usr/local/bin/mediacore-front"]
     expose:

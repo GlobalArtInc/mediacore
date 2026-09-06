@@ -97,19 +97,42 @@
             Audio only unless you ask for the camera.
           </p>
 
+          <p id="signed-in" class="signed-in" hidden>
+            Joining as <strong id="signed-in-name"></strong>.
+            <a id="sign-out" href="/auth/logout">Sign out</a>
+          </p>
+
           <form id="join-form" novalidate>
-            <label for="name">Your name</label>
-            <input
-              id="name"
-              name="name"
-              type="text"
-              maxlength="40"
-              placeholder="Alice"
-              autocomplete="off"
-              autocapitalize="words"
-              spellcheck="false"
-              disabled
-            />
+            <div class="field">
+              <label for="join-room">Room</label>
+              <input
+                id="join-room"
+                name="room"
+                type="text"
+                maxlength="64"
+                placeholder="standup"
+                autocomplete="off"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                disabled
+              />
+            </div>
+
+            <div class="field" id="name-field">
+              <label for="name">Your name</label>
+              <input
+                id="name"
+                name="name"
+                type="text"
+                maxlength="40"
+                placeholder="Alice"
+                autocomplete="off"
+                autocapitalize="words"
+                spellcheck="false"
+                disabled
+              />
+            </div>
 
             <label class="toggle" for="with-video">
               <input id="with-video" name="with-video" type="checkbox" disabled />

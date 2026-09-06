@@ -28,6 +28,14 @@ import {
   storageOf,
   writePrefs,
 } from "/prefs.js";
+import {
+  addressedRoom,
+  composedRoom,
+  offeredRoom,
+  plainRoom,
+  roomPath,
+  roomTitle,
+} from "/room.js";
 import { createDenoiser } from "/denoise.js";
 import {
   afterRefusal,
@@ -192,11 +200,22 @@ const el = {
   leave: document.getElementById("leave"),
   audio: document.getElementById("audio"),
   footUrl: document.getElementById("foot-url"),
+  joinRoom: document.getElementById("join-room"),
+  nameField: document.getElementById("name-field"),
+  signedIn: document.getElementById("signed-in"),
+  signedInName: document.getElementById("signed-in-name"),
 };
 
 const query = new URLSearchParams(location.search);
-const requestedRoom = query.get("room");
 const wantsSimulcast = query.get("simulcast") !== "0";
+
+/**
+ * Which room this tab was opened at. `/r/standup` is the room's own address --
+ * it is what a reload comes back to and what somebody pastes to a colleague --
+ * and a `?room=` from before rooms had one still names a room, so it is
+ * honoured and then quietly corrected.
+ */
+const arrival = addressedRoom(location.pathname, location.search);
 
 /**
  * What this browser is allowed to remember, and where. The offer travels with
@@ -216,13 +235,25 @@ let storageComplained = false;
  */
 let arrivalNotice = null;
 
+/**
+ * Whether the lobby is showing a refusal of the room the link named. It is
+ * about the link, so it is cleared the moment somebody starts correcting the
+ * field rather than at the next press of Join -- a page still refusing a name
+ * nobody is asking for any more is a page arguing with itself.
+ */
+let linkRefused = false;
+
 let lk = null;
 let media = null;
 let settings = {
   room: "demo",
   wsUrl: "",
   maxNameLength: 40,
+  maxRoomLength: 64,
   roomNamespaceSeparator: ".",
+  roomError: null,
+  signIn: false,
+  signedInAs: null,
 };
 let room = null;
 let cameraTrack = null;
@@ -268,7 +299,14 @@ async function start() {
     : prefs.camera === true;
   showBench = query.get("bench") === "1";
 
+  // A link that named its room in the query still names it. The address bar is
+  // put right on arrival rather than on joining, because it is wrong now: this
+  // load is already about that room, and a reload of the corrected URL reaches
+  // the same one.
+  if (arrival.canonical) history.replaceState(null, "", arrival.canonical);
+
   el.form.addEventListener("submit", onJoin);
+  el.joinRoom.addEventListener("input", onRoomTyped);
   el.mute.addEventListener("click", onMute);
   el.noise.addEventListener("click", onCycleNoise);
   el.audioSettings.addEventListener("click", () => toggleMenu());
@@ -301,12 +339,16 @@ async function start() {
   paintBenchToggle();
   paintControls();
 
-  settings = await loadSettings();
-  el.lobbyRoom.textContent = roomLabel();
+  settings = await loadSettings(arrival.room);
   el.name.maxLength = settings.maxNameLength;
+  el.joinRoom.maxLength = settings.maxRoomLength;
   // `maxLength` only binds what a person types, so a longer name out of storage
   // would sit in the field and be refused by the server on submit.
-  if (prefs.name) el.name.value = prefs.name.slice(0, settings.maxNameLength);
+  if (prefs.name && !settings.signIn) {
+    el.name.value = prefs.name.slice(0, settings.maxNameLength);
+  }
+  paintSignIn();
+  offerRoom();
   el.footUrl.textContent = settings.wsUrl;
 
   if (!window.isSecureContext || !navigator.mediaDevices) {
@@ -414,20 +456,114 @@ function remember(patch) {
 function ready() {
   el.join.disabled = false;
   el.name.disabled = false;
+  el.joinRoom.disabled = false;
   el.withVideo.disabled = false;
   el.lobbyStatus.textContent = "";
-  el.name.focus();
+  firstQuestion().focus();
 }
 
-function roomLabel() {
-  if (!requestedRoom) return settings.room;
-  const separator = settings.roomNamespaceSeparator || ".";
-  return `${settings.room}${separator}${requestedRoom}`;
+/**
+ * Which box the cursor belongs in. With signing in switched on there is only
+ * one question left in the lobby, and it is the room.
+ */
+function firstQuestion() {
+  return settings.signIn ? el.joinRoom : el.name;
 }
 
-async function loadSettings() {
+/**
+ * The lobby, once the server has said whether anybody has to sign in.
+ *
+ * The name field does not go quiet, it goes away: with a session, the name is
+ * the provider's and the server reads it off the session, so a box asking for
+ * one would be a box whose contents are thrown out. What replaces it is the
+ * name that will actually be used and a way out of it.
+ *
+ * Nothing here decides anything. Whether this deployment signs people in and
+ * who is signed in are both the server's answers, arriving on the request the
+ * page was making anyway.
+ */
+function paintSignIn() {
+  if (!settings.signIn) return;
+
+  el.nameField.hidden = true;
+  el.name.value = "";
+
+  // A page can only be here with a session -- `/` redirects otherwise -- so the
+  // name is missing only when the session ran out between the page loading and
+  // this answer. Saying nothing is right: the sentence would have a hole in it,
+  // and the press of Join that follows is refused by the server with the reason
+  // and the instruction to reload.
+  if (!settings.signedInAs) return;
+
+  el.signedInName.textContent = settings.signedInAs;
+  el.signedIn.hidden = false;
+}
+
+/**
+ * Which room the lobby starts on, and what it says about it.
+ *
+ * A room the URL named is a room this tab is about, so it goes in the title
+ * too -- four tabs of four rooms are otherwise four tabs called `mediacore`. A
+ * remembered one is a suggestion nobody has accepted yet, and the tab stays
+ * unnamed until somebody joins.
+ *
+ * A name that cannot be a room is put in the field rather than thrown away.
+ * The person following that link cannot edit the URL they were sent, but they
+ * can edit the field, and they cannot fix what they cannot see.
+ */
+function offerRoom() {
+  const offer = offeredRoom(arrival.room, prefs.room, settings.room);
+  el.joinRoom.value = offer.room;
+
+  if (settings.roomError) {
+    linkRefused = true;
+    // No preview of a room that cannot exist. The field holds what the link
+    // said, because that is what has to be corrected and nobody can correct
+    // what they cannot see; the sentence below it says what is wrong with it.
+    el.lobbyRoom.textContent = "\u2026";
+    fail(
+      el.lobbyError,
+      `This link does not name a room this server can open: ${settings.roomError}. ` +
+        `Type one that can be, then press Join.`,
+    );
+    return;
+  }
+
+  paintLobbyRoom();
+  if (offer.source === "link") document.title = roomTitle(offer.room);
+}
+
+/** Somebody correcting the room: the preview follows, and the link's refusal goes. */
+function onRoomTyped() {
+  paintLobbyRoom();
+  if (!linkRefused) return;
+  linkRefused = false;
+  hide(el.lobbyError);
+}
+
+/**
+ * The room on the server, under the name a person typed. It is a preview and
+ * never a decision: the room the page actually joins is the one the token came
+ * back naming, and everything shown after that is derived from it.
+ */
+function paintLobbyRoom() {
+  const typed = el.joinRoom.value.trim();
+  el.lobbyRoom.textContent =
+    typed === ""
+      ? "\u2026"
+      : composedRoom(settings.room, typed, settings.roomNamespaceSeparator);
+}
+
+/**
+ * The lobby's own configuration, and -- when this load was addressed to a room
+ * -- whether that name can be a room at all. The page keeps no second opinion
+ * about what a room name may contain: it asks the one function that decides,
+ * on the one request it was making anyway, and prints the answer.
+ */
+async function loadSettings(room) {
+  const asked = room === null ? "" : `?${new URLSearchParams({ room })}`;
   try {
-    const response = await fetch("/api/config");
+    const response = await fetch(`/api/config${asked}`);
     if (response.ok) return await response.json();
   } catch (error) {
     console.warn("could not read the page configuration", error);
@@ -441,14 +577,17 @@ async function onJoin(event) {
   ensureAudioContext();
 
   const name = el.name.value.trim();
-  if (!name) {
+  if (!settings.signIn && !name) {
     fail(el.lobbyError, "Type a name so other people know who is talking.");
     el.name.focus();
     return;
   }
 
   const withVideo = el.withVideo.checked;
-  remember({ name, camera: withVideo });
+  // A name that was never typed is not a preference. With signing in on, the
+  // one this browser remembers from before the switch was thrown stays where it
+  // is, unread, rather than being overwritten with a name out of a directory.
+  remember(settings.signIn ? { camera: withVideo } : { name, camera: withVideo });
   busy(true, "Asking for the microphone...");
 
   const opened = await media.openMicrophone();
@@ -462,7 +601,7 @@ async function onJoin(event) {
 
   let credentials;
   try {
-    credentials = await mintToken(name);
+    credentials = await mintToken(name, el.joinRoom.value);
   } catch (error) {
     await media.release();
     busy(false, "");
@@ -486,9 +625,11 @@ async function onJoin(event) {
   if (withVideo) await startCamera();
 }
 
-async function mintToken(name) {
-  const body = { name };
-  if (requestedRoom) body.room = requestedRoom;
+async function mintToken(name, room) {
+  // With signing in switched on the browser stops saying who it is. The server
+  // reads that off the session and would ignore a `name` here, so none is sent:
+  // a field that is read and discarded is a field somebody will one day believe.
+  const body = settings.signIn ? { room } : { name, room };
 
   let response;
   try {
@@ -542,8 +683,21 @@ async function connect(credentials) {
 }
 
 function enterRoom(credentials) {
-  el.roomName.textContent = credentials.room;
-  el.footUrl.textContent = `${credentials.url} - ${credentials.identity}`;
+  // Everything said about the room from here is derived from the name the
+  // token came back with, and not from the field: the server composes the room
+  // it issued a token for, and a page that titled itself from what was typed
+  // would be naming a room it is not necessarily in.
+  const address = plainRoom(
+    credentials.room,
+    settings.room,
+    settings.roomNamespaceSeparator,
+  );
+
+  el.roomName.textContent = address;
+  document.title = roomTitle(address);
+  showAddress(address);
+  remember({ room: address });
+  el.footUrl.textContent = `${credentials.url} - ${credentials.room} - ${credentials.identity}`;
   hide(el.roomError);
   el.lobby.hidden = true;
   el.room.hidden = false;
@@ -556,6 +710,23 @@ function enterRoom(credentials) {
     arrivalNotice = null;
   }
   el.mute.focus();
+}
+
+/**
+ * The address bar catches up at the moment there is a room to catch up with.
+ * Until then `/` is honest: nothing has been joined, and a URL that named a
+ * room somebody was still typing would be a link to a room nobody is in.
+ *
+ * `replaceState`, not `pushState`. Back would otherwise return to the lobby's
+ * URL while the page is still in the room -- nothing here listens for
+ * `popstate` -- and leaving the room is what the Leave button is for. The room
+ * survives the leave in the URL and in the field, so pressing it and changing
+ * your mind costs one press rather than the link you no longer have.
+ */
+function showAddress(room) {
+  const path = roomPath(room, location.search);
+  if (path === `${location.pathname}${location.search}`) return;
+  history.replaceState(null, "", path);
 }
 
 async function leave(reason) {
@@ -584,7 +755,7 @@ async function leave(reason) {
   el.room.hidden = true;
   el.lobby.hidden = false;
   busy(false, reason || "");
-  el.name.focus();
+  firstQuestion().focus();
 }
 
 async function discardRoom() {
@@ -2512,6 +2683,7 @@ function setState(kind, label) {
 function busy(active, message) {
   el.join.disabled = active;
   el.name.disabled = active;
+  el.joinRoom.disabled = active;
   el.withVideo.disabled = active;
   el.join.textContent = active ? "Joining..." : "Join";
   el.lobbyStatus.textContent = message;
@@ -2521,6 +2693,7 @@ function block(message) {
   fail(el.lobbyError, message);
   el.join.disabled = true;
   el.name.disabled = true;
+  el.joinRoom.disabled = true;
   el.withVideo.disabled = true;
 }
 

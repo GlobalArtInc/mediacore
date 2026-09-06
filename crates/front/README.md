@@ -1,6 +1,8 @@
 # mediacore-front
 
-A single-page room. Someone opens the URL, types a name, and hears everyone else in the room.
+A single-page room. Someone opens `/r/<room>`, types a name, and hears everyone else in that room.
+A room is an address: the URL is what you paste to a colleague, and reloading it comes back to the
+same room rather than to the front page.
 Audio only by default; from inside the room you can choose the microphone, choose which noise
 suppressor runs -- ours, the browser's, or none -- change the rest of the browser's audio
 processing, share a screen, and tick one box in the lobby to publish the camera with simulcast.
@@ -8,7 +10,9 @@ Calls start on our own denoiser, and every one of those choices is remembered by
 made it. Behind the **Bench** button in the control bar is the bandwidth bench — per remote
 track, which layer is arriving and what it costs, next to the browser's own view of the link. The
 binary serves the page and mints access tokens; it never carries media and never talks to the SFU
-itself.
+itself. Point it at an OpenID Connect provider and it stops asking for a name: visitors are sent
+there, come back signed in, and type only the room — see "Signing people in" below. That is a
+switch, and it is off unless an issuer is configured.
 
 ```
 mediacore-front
@@ -21,14 +25,22 @@ mediacore-front
 | `MEDIACORE_API_KEY` | yes | | API key, becomes `iss` in the token. Must match a key in the SFU's `keys:` map. |
 | `MEDIACORE_API_SECRET` | yes | | Shared secret the token is signed with. At least 32 characters. Never leaves the process. |
 | `MEDIACORE_FRONT_WS_URL` | yes | | What the browser is told to connect to, e.g. `wss://rooms.example.com`. `ws://` or `wss://` followed by a bare host; a path, a userinfo or a second scheme is refused, because those are what a `MEDIACORE_PUBLIC_HOST` holding a URL turns into. |
-| `MEDIACORE_FRONT_ROOM` | no | `demo` | The room everyone lands in, and the namespace every other room hangs off. Letters, digits, `-`, `_`, `.`. |
+| `MEDIACORE_FRONT_ROOM` | no | `demo` | The room `/` offers, and the namespace every other room hangs off. `/r/standup` reaches `demo.standup`; `/` and `/r/demo` are the same room. Letters, digits, `-`, `_`, `.`. |
 | `MEDIACORE_FRONT_PORT` | no | `8080` | TCP port for the page and the token endpoint. |
+| `MEDIACORE_FRONT_OIDC_ISSUER` | no | | **The switch.** Set it and the page signs people in against that provider; leave it unset and nothing below is read, no sign-in route exists, and the page is exactly what it was. An `https://` URL, a realm path allowed, no query. |
+| `MEDIACORE_FRONT_OIDC_CLIENT_ID` | with the issuer | | The client registered with the provider. |
+| `MEDIACORE_FRONT_OIDC_CLIENT_SECRET` | with the issuer | | The client secret. Read from the environment, never written anywhere, and rendered `<redacted>` by `Debug` exactly as `MEDIACORE_API_SECRET` is. No minimum length: the provider chose it, not this process. |
+| `MEDIACORE_FRONT_PUBLIC_URL` | with the issuer | | The origin a browser reaches this front end at, e.g. `https://10.251.10.201:5400`. An origin: no path, no query. The redirect URI (`<this>/auth/callback`) and the post-logout URI (`<this>/`) are derived from it, and both have to match what is registered with the provider to the character. |
+| `MEDIACORE_FRONT_OIDC_SCOPES` | no | `openid profile email` | What to ask the provider for. `offline_access` is deliberately not in the default: nothing here ever spends a refresh token. |
+| `MEDIACORE_FRONT_SESSION_TTL` | no | `43200` | How long a session lasts, in seconds, between 60 and 30 days. |
 
 Anything required and missing, a secret that is too short, a URL that is not a WebSocket URL, a
 port that is not a number and a room name with a space in it are all refused at startup with the
-name of the variable in the message. The process does not start half-configured. `Config`'s
-`Debug` is written by hand and renders `api_secret` as `<redacted>`, so the secret cannot reach a
-log through a stray `{config:?}`.
+name of the variable in the message. The process does not start half-configured, and that includes
+the sign-in: an issuer with no client id beside it is refused by name rather than starting a process
+that serves the page, redirects nobody and fails at the first press of Join. `Config`'s `Debug` is
+written by hand and renders both `api_secret` and `oidc.client_secret` as `<redacted>`, so neither
+can reach a log through a stray `{config:?}`.
 
 `RUST_LOG` is honoured; without it the crate logs at `info`.
 
@@ -36,12 +48,14 @@ log through a stray `{config:?}`.
 
 | Route | Purpose |
 |---|---|
-| `GET /` | the page |
+| `GET /` | the page, offering the configured room -- or, with signing in switched on and no session, a `302` to the provider |
+| `GET /r/<room>` | the same page, addressed to a room -- for every room name, including one that cannot be a room |
 | `GET /app.css`, `GET /app.js` | the page's assets, compiled into the binary |
 | `GET /media.js` | the capture side: microphone, processing, device choice, screen share; no DOM |
 | `GET /bench.js` | reads the browser's WebRTC statistics; no DOM |
 | `GET /readout.js` | draws the video tiles and the numbers; no statistics |
 | `GET /prefs.js` | what this browser remembers between visits; no DOM, no storage of its own |
+| `GET /room.js` | reading and writing a room's address; no DOM, no opinion about what a room name may contain |
 | `GET /denoise.js` | our denoiser: the support probe, the audio graph, the overload watch |
 | `GET /denoise-probe.js` | the two AudioWorklet processors that measure the node; loaded by `addModule`, not imported |
 | `GET /denoise-gate.js` | wraps the vendored processor so it says when its wasm is live; loaded by `addModule` *before* it |
@@ -49,8 +63,10 @@ log through a stray `{config:?}`.
 | `GET /vendor/livekit-client-<version>.esm.js` | the browser SDK, also compiled into the binary |
 | `GET /vendor/rnnoise-<version>.wasm`, `-simd-<version>.wasm` | RNNoise, `application/wasm`, `immutable` |
 | `GET /vendor/rnnoise-worklet-<version>.js` | the worklet that drives it |
-| `GET /api/config` | the default room and the public WebSocket URL, for the lobby |
-| `POST /api/token` | `{"name": "...", "room": "..."}` in, `{"url","token","room","identity","name"}` out |
+| `GET /api/config` | the lobby's configuration; `?room=<name>` asks whether that name can be a room, and the answer is `roomError`. Also `signIn` and `signedInAs` |
+| `POST /api/token` | `{"name": "...", "room": "..."}` in, `{"url","token","room","identity","name"}` out. With signing in on, `name` is ignored and a session is required |
+| `GET /auth/callback` | where the provider comes back to. **Only registered when the switch is on**; a 404 otherwise |
+| `GET /auth/logout` | ends the session here and at the provider. `?returnUrl=` is validated against `MEDIACORE_FRONT_PUBLIC_URL` |
 | `GET /healthz` | `ok` |
 
 A refused request answers `400` with `{"error": "..."}`; that string is what the visitor is shown.
@@ -68,6 +84,52 @@ outright without it, so the alternative was not a tighter policy but a dead feat
 `the_policy_buys_wasm_and_nothing_else` in `src/http.rs` fails if anything else is ever added
 alongside it.
 
+## A room is an address
+
+`/r/standup` is where a room lives. Opening it goes to that room, reloading it comes back to the
+same room, and it is the link somebody pastes into a chat window -- so it carries the room name and
+nothing else. No token, no ticket, no display name: a token is minted per load and lives in memory
+for the length of the connection, and a URL is written down and forwarded.
+
+Four decisions, and the reasons they went that way.
+
+**`/r/<room>` shows the lobby with the room filled in; it does not join.** Two reasons, and either
+would be enough. A browser will not hand over a microphone without a gesture, and the click that
+submits the lobby is that gesture -- it is what lets the `AudioContext` start and what Safari in
+particular wants before it will play the room's audio, and after a load with no activation at all
+there is nothing to spend. And arriving in a call with a live microphone without having pressed
+anything is its own failure, the one that ends in "I did not know I was in". So a link costs one
+press of Join, and the lobby knows which room it is for.
+
+**The address bar catches up at the moment there is a room to catch up with.** Joining rewrites the
+URL to the room that was actually joined -- with `replaceState`, not `pushState`, because Back would
+otherwise leave the URL naming the lobby while the page is still in the room, and nothing here
+listens for `popstate`. Leaving keeps it: the lobby is offering that room, F5 reaches the same
+lobby, and rejoining costs the press it should. A room somebody is still typing is not an address
+and does not get one.
+
+**The name in the roster header and the tab title is the name a person says.** The tab is
+`standup · mediacore`, room first, because four tabs of the same call are four identical entries in
+a tab strip and the first two centimetres are all a squeezed tab shows. The header carries
+`standup`, which is what the URL says and what a person would repeat out loud; the composed room
+the SFU knows, `demo.standup`, is in the footer beside the socket and the identity, for whoever is
+reading a room list at the same time. Both are derived from the room the token came back naming
+rather than from what was typed, so the page can never be titled after a room it is not in.
+
+**A room name that cannot be one is refused in the lobby, with the reason, before anything is
+joined.** `/r/not%20a%20room` serves the page like any other name -- a 404 would answer a mangled
+link with a dead end, and somebody who was *sent* that link cannot edit it. The page reads the room
+out of its own URL, asks `/api/config?room=...` about it on the request it was making anyway, and
+prints the answer: *a room name may only contain letters, digits, `-`, `_` and `.`*. The name stays
+in the field, because that is what has to be corrected, and the refusal clears the moment somebody
+starts correcting it. There is no second notion of a valid room name in the browser: `clean_room`
+in `src/name.rs` is the only one, and the page asks it rather than keeping an opinion that would
+drift from it the first time either moved.
+
+`?room=<name>` was how a room was named before rooms had URLs, and links carrying it are in
+people's chat histories. It still works and is corrected on arrival: `/?room=standup&video=1`
+becomes `/r/standup?video=1`, keeping the parameters that are instructions for this visit.
+
 ## The token endpoint can only reach its own rooms
 
 `POST /api/token` mints a join token for anyone who asks, without a password, a session or a
@@ -78,14 +140,195 @@ something.
 
 So a `room` in the request body is **namespaced, not honoured**: it is checked for charset and
 length and then prefixed with `MEDIACORE_FRONT_ROOM` and a `.`, and the composed name is length-
-checked again. `?room=standup` with the default configuration reaches `demo.standup`. Nothing a
-caller can put in that field escapes the `demo.` prefix — `.` and `-` are the only punctuation the
-charset allows, and neither can walk up a namespace.
+checked again. `/r/standup` with the default configuration reaches `demo.standup`. Nothing a caller
+can put in that field escapes the `demo.` prefix — `.` and `-` are the only punctuation the charset
+allows, and neither can walk up a namespace.
+
+The one name that is not composed is the namespace itself: `demo` reaches `demo`, not `demo.demo`.
+That is not a convenience, it is what makes the address work. `/` and `/r/demo` name the room
+everyone lands in, and a reload has to come back to the room the first load joined; composing there
+would put the second one somewhere else and split the room in two. It widens nothing: `demo` is the
+room a body with no `room` field has always been given, so the set a caller can reach is what it
+always was — this room, or one under it, and no third thing. `room_for` in `src/name.rs` is that
+rule, and `nothing_a_caller_can_ask_for_reaches_another_namespace` states it as the property rather
+than as a composition.
 
 Always issuing the configured room would have been simpler, and was rejected: a shareable link to a
 side room is most of what makes the page usable in front of a group, and it costs one prefix to
 keep it safe. The response's `room` field carries the composed name, so the page shows people the
 room they are actually in.
+
+## Signing people in
+
+Off by default, and off is not a degraded mode: with `MEDIACORE_FRONT_OIDC_ISSUER` unset there is no
+provider, no session store worth the name, no `/auth/*` route to find, and the lobby asks for a name
+the way it always has. That is deliberate. The stand this was built for has to stay quick to check,
+and a self-signed certificate on a callback URL makes every round trip a chore.
+
+With it set, `/` and `/r/<room>` answer a browser with no session with a `302` to the provider, and
+the page comes back with the room still in the address and the name already known.
+
+### The round trip
+
+```
+  GET /r/standup                     no session
+    -> remember { return_to: "/r/standup", nonce, pkce verifier } under a random `state`
+    -> Set-Cookie: __Host-mediacore_login_<state>=<secret>
+    -> 302 <provider>/authorize?response_type=code&response_mode=query&client_id=…
+             &redirect_uri=<public>/auth/callback&scope=…&state=…&nonce=…
+             &code_challenge=S256(verifier)&code_challenge_method=S256
+
+  GET /auth/callback?code=…&state=…
+    -> the `state` names a login this process started, and spends it
+    -> the login cookie proves this is the browser the sign-in left from
+    -> POST <provider>/token   (server to server, client_secret_post, code_verifier)
+    -> validate the id token; ask userinfo for what it did not carry
+    -> Set-Cookie: __Host-mediacore_session=<id>.<hmac>
+    -> 302 /r/standup
+```
+
+Authorization code with PKCE `S256`, and nothing else. No implicit, no hybrid, no `response_type=token`,
+whatever the provider says it also supports: the code comes back through the browser and is redeemed
+from this process, so the credential worth stealing never touches a URL bar, a history entry or a
+`Referer` header. `response_mode=query`, because the fragment is visible only to the page and the page
+is exactly who should not see it.
+
+**The room lives on this side of the wire, keyed by `state`.** Not in the redirect, not in a `next=`
+parameter, not in a cookie: all three are the browser's to edit, and all three end as a redirect to
+somewhere else wearing this host's name. What comes back carries `state` and nothing about where
+anybody was going, so there is nothing to edit. The callback answers with a `302` rather than a page
+that redirects itself, which means the address bar lands on the clean `/r/standup` and the back
+button holds no entry with a `code` in it.
+
+**The login cookie is not decoration.** Without it, anybody can hand you a working callback URL and
+sign you quietly into *their* account, and then read whatever you type next. The cookie holds a
+secret; the login holds its `sha256`; the callback compares them and refuses if it cannot.
+
+### The ID token is where implementations get this wrong
+
+An ID token is a signed statement about who somebody is. A validator that skips a check turns it
+into an unsigned one, so every check has a test in `tests/oidc.rs` that breaks exactly that check and
+watches the sign-in be refused:
+
+| check | what it stops |
+|---|---|
+| signature, against the provider's JWKS | a token anybody minted |
+| **`alg` is `RS256`, decided here and never read off the token** | the classic forgery: name `HS256`, and get a validator to verify the provider's *public* key — which anybody can fetch — as an HMAC secret. `alg: none` goes the same way |
+| the key is chosen by `kid` | a token signed with a key that is in the set for something else |
+| `iss` | tokens from any other provider |
+| `aud`, plus `azp` when there is more than one audience | a real token minted for another client on the same provider |
+| `exp`, with a minute of leeway | a token from last week |
+| `nonce`, against the one this login issued, compared whole | a real token from another sign-in, replayed into this one |
+
+The JWKS is cached for an hour. A token naming a `kid` that is not in it triggers **one** refetch, and
+not one per token: a stream of invented `kid`s would otherwise be a way to make this server hammer the
+provider. A refetch that fails keeps the keys already held — a provider having a bad minute should not
+stop people signing in with keys that have not changed. The discovery document is treated the same way,
+and its `issuer` must equal the configured one (RFC 8414 §3.3), which is also what catches a trailing
+slash or an `http`/`https` mix-up in configuration.
+
+`userinfo` is asked afterwards for anything the ID token did not carry — plenty of providers put only
+`sub` in the token, and a roster of UUIDs is not a room. It is allowed to fail: the signed token
+already said who this is. What it is not allowed to do is disagree, and a `sub` that does not match
+refuses the whole sign-in (OpenID Connect 5.3.2).
+
+### Identity is `sub`, the name is `name`
+
+The LiveKit identity every token carries is the provider's `sub`. Display name is `name`, else
+`preferred_username`, else `email`, else the `sub` — because a roster entry with no text at all is
+worse than an ugly one. **Never the email as the identity**: an address changes hands and a `sub` does
+not, and an identity is what a room is keyed by.
+
+Whatever the directory returns goes through the same `clean_name` a typed name does and is cut to the
+same 40 characters. A provider is not a source of short printable strings, and that name goes into a
+token and onto everybody's screen.
+
+One consequence worth knowing: a LiveKit identity is unique within a room, so **one person joining the
+same room twice replaces their own first participant** rather than sitting beside it. That is the right
+answer for a call — the alternative is somebody's abandoned tab in the roster with a live microphone in
+it — but it is a change from the anonymous path, where two people typing `Alice` get two seats.
+
+### The session, and the cookie
+
+`__Host-mediacore_session=<id>.<hmac>`, `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. The browser
+holds an opaque id and nothing else — not the `sub`, not the roles, not the ID token — and everything
+about a person stays in this process, keyed by 256 bits nobody can guess. The signature is HMAC-SHA256
+over the id with a key made at startup, checked in constant time, so a garbled or invented cookie is
+refused without a lookup. The page's JavaScript has no use for the value and `HttpOnly` means it could
+not read it if it did.
+
+`__Host-` is why the front end has to be reached over TLS with the switch on: a browser refuses the
+prefix without `Secure`, and refuses `Secure` outside a secure context. `http://localhost` counts as
+one, so local development works; a plain-http LAN address does not, and no cookie will be set at all.
+
+`SameSite=Lax` rather than `Strict`: arriving from the provider's redirect is a top-level cross-site
+navigation, and `Strict` would drop the cookie exactly there. `Lax` still means a cross-site `POST`
+carries no session, so nothing on another origin can mint a token as anybody.
+
+**The store is memory, and a restart signs everybody out.** One process, one stand: there is no second
+replica for a login to be finished on, and a session that survived a restart would have to be written
+somewhere this crate has nowhere to write. It costs a person one press of the provider's
+already-signed-in page. It costs nobody in a call anything at all — see below.
+
+### The token endpoint stops being anonymous
+
+With the switch on, `POST /api/token` needs a session and **reads the `name` field and discards it**.
+That is the entire point of having signed anybody in: a browser that can still name itself here is a
+browser that can join as somebody else. The name and the identity both come out of the session; the
+room is the one thing the body is still believed about, and it is namespaced exactly as before. No
+session is `401` with a sentence the lobby prints.
+
+With the switch off it behaves precisely as it did: a name on trust, no session, no cookie.
+
+### Signing out
+
+`GET /auth/logout` closes the session here and then sends the browser to the provider's
+`end_session_endpoint` with `id_token_hint`, because ending only this side leaves the provider's own
+session standing and the next press of Join signs the same person back in without a prompt — which
+reads as the button not working.
+
+The `post_logout_redirect_uri` handed to the provider is always `<MEDIACORE_FRONT_PUBLIC_URL>/`,
+because that is the value registered with it and a provider refuses any other. `?returnUrl=` is
+therefore for the local half — where somebody lands when the provider publishes no
+`end_session_endpoint` or cannot be reached — and it is validated against this front end's own origin
+first: a redirect that forwards anywhere is a phishing link wearing this host's name.
+
+A cross-site request to it is refused (`Sec-Fetch-Site`), so another page cannot sign somebody out with
+an `<img>` tag. A browser that sends no such header is trusted, because refusing it would break signing
+out rather than protect it.
+
+### What happens when a session ends mid-call
+
+**Nothing.** The LiveKit token was minted at the moment of joining, carries its own six-hour lifetime,
+and is the SFU's to judge; the media connection is between the browser and the SFU and this process is
+not in it. Nothing on the page re-checks a session while a call is running — `/api/config` is fetched
+once at load and `/api/token` once at join — so an expiring session cannot drop anybody. It is felt at
+the *next* page load, which redirects to the provider, and at the next press of Join, which answers
+`401` with "this sign-in has ended. Reload the page to sign in again."
+`a_session_that_ends_does_not_end_a_call` in `tests/oidc.rs` is that property.
+
+### What happens when the provider is unreachable
+
+Signing in stops; nothing else does. A page asked for with no session answers **503** with a sentence
+saying the provider could not be reached and that nothing is wrong with the account — rather than a
+blank page, a redirect loop, or a lobby that would fail at Join. A callback that cannot redeem its code
+answers the same way. Sessions already open keep working, because nothing about them needs the
+provider; calls already running are untouched for the reason above. Every request out has a ten-second
+timeout, and a timeout, a refused connection, an untrusted certificate and a name that does not resolve
+are all one answer to whoever is looking at the page — the distinction is in the log.
+
+If the host reaches the outside through a proxy, `HTTPS_PROXY` and `NO_PROXY` are honoured.
+
+### The gap: roles are read and not enforced
+
+The provider's `roles` claim is read into the session and **nothing consults it**. With the switch on,
+anybody the provider will sign in can enter any room whose name they know — signing in says who
+somebody is, and this front end has no rule about who may be where.
+
+That gap is deliberate rather than overlooked. There is no model here of which rooms exist or who owns
+one, and inventing a rule — "a room named after a role needs that role" — would be a guess that is
+worse than the gap, because it would look like an answer. When there is a real rule it goes next to
+`room_for` in `src/name.rs`, which is already the one place that decides which room a request reaches.
 
 ## Nothing is fetched at runtime
 
@@ -147,7 +390,7 @@ texts.
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `?room=<name>` | the configured room | joins `<configured>.<name>`; see the namespacing section above |
+| `?room=<name>` | the configured room | the old way of naming a room, still honoured and rewritten to `/r/<name>` on arrival; see "A room is an address" above |
 | `?video=1` | off | ticks the camera box in the lobby, so joining publishes the camera as well as the microphone; `?video=0` unticks it, and either one outranks what the box was left at last time |
 | `?res=180\|360\|720` | `720` | capture resolution for the camera |
 | `?simulcast=0` | simulcast on | publishes a single encoding instead of a ladder |
@@ -489,13 +732,13 @@ changes:
 | the microphone's `deviceId` | `media.selectMicrophone()`, once the browser will say the device is still there |
 | echo cancellation and automatic gain | `media.setProcessing()` |
 | the name typed in the lobby | the field, cut to the length this server will accept |
+| the room this browser last joined | the room field at `/`, unless the URL names one, which always wins |
 | the camera box in the lobby | the checkbox, unless `?video=` says otherwise for this visit |
 
-**Nothing the server minted is ever written.** Not the token, not the identity, not the room they
-were for. A token expires, a copy of one on disk outlives the call it was issued for, and every
-script this origin ever runs can read it — and all it would save anybody is one press of Join. The
-list of fields that may be stored is a single line in `assets/prefs.js`, and a test fails if it
-grows one.
+**Nothing the server minted is ever written.** Not the token and not the identity. A token expires,
+a copy of one on disk outlives the call it was issued for, and every script this origin ever runs
+can read it — and all it would save anybody is one press of Join. The list of fields that may be
+stored is a single line in `assets/prefs.js`, and a test fails if it grows one.
 
 Some things are deliberately **not** remembered, and each one is a decision rather than an
 oversight. **Muted or not**: this page has no "join muted" control, so restoring it would mean
@@ -503,8 +746,15 @@ arriving silent with nothing in the lobby having said so — the failure being "
 for the first minute". **The bandwidth bench**: it is a diagnostic view that takes every video onto
 its own tiles, `?bench=1` already opens it for the people who want it that way, and a room that
 opens into a panel of statistics looks broken. **The tile in the middle and the pinned share**:
-both name somebody who was in the room at the time, which is not a fact about this browser. **The
-room**: that is the link, not a preference.
+both name somebody who was in the room at the time, which is not a fact about this browser.
+
+The room changed sides when rooms got addresses. It used to be "that is the link, not a
+preference"; it is now both. It is not a credential and never was — it is in the URL bar of the tab
+that joined it and in the link that was pasted to get there, and it opens nothing on its own, since
+a token still has to be minted for it per load. What remembering buys is that somebody who joins
+`standup` every morning is offered `standup` when they arrive at `/` with nothing else to go on. A
+link outranks it every time, so a remembered room can never put anybody somewhere their link did
+not say.
 
 A remembered choice is not treated as truer than a chosen one. It goes back in through the same
 calls the controls make, on the far side of the same denoiser probe, so a machine that cannot run
@@ -771,6 +1021,18 @@ forbids what it should. A test that a file *contains a phrase* is not a statemen
 none is written here: a substring survives every change that matters, so it can only ever fail for
 the wrong reason.
 
+**The sign-in is tested against a provider that only exists inside the test**, in `tests/oidc.rs`:
+an axum router on a loopback port serving a discovery document, a JWKS, a token endpoint and a
+userinfo endpoint, with the test driving the round trip the way a browser would — follow the `302`,
+read `state` and `nonce` out of the URL the browser was sent to, mint the ID token that provider
+would have minted, carry the cookies back, and see where it lands. Nothing there reaches the network.
+That shape is what makes the interesting failures reachable, and most of the file is one of them at a
+time: each ID-token check broken on its own, a callback in the wrong browser, a callback replayed, a
+`state` this server never issued, a provider that is down, a provider describing itself as somebody
+else, a userinfo response about somebody else, a `returnUrl` pointing off this origin, and a stream of
+tokens naming keys that never existed. `nothing_of_the_client_secret_escapes` is the one that says the
+secret reaches exactly one place, which is the body of the token request.
+
 **The behaviour is tested in `tests/browser-modules.test.mjs`**, run through
 `tests/browser_modules.rs`, which shells out to `node --test`. It needs no package manager, no
 bundler and no browser, and it drives the real modules:
@@ -791,10 +1053,17 @@ bundler and no browser, and it drives the real modules:
 - `prefs.js`, on a `Storage` that holds a value, one that throws on the way in and one that throws
   on the way out: that a blob written by one visit is the choices that visit made, that a token
   handed to it is not written down, that a suppressor which is no longer on offer comes back as
-  nothing without costing the four fields beside it, that a blob of the wrong shape entirely is not
+  nothing without costing the five fields beside it, that a room is kept for its shape and not
+  judged for its validity, that a blob of the wrong shape entirely is not
   a broken page, and that a remembered microphone the browser can see is gone is never asked for —
   while one it will not say anything about is asked for, and the capture module opens the default
   and says so when it turns out to be missing.
+- `room.js`, where a room's address is read and written: that the room comes out of `/r/<room>`
+  and out of a legacy `?room=` with the canonical URL to correct it to, that a percent sequence
+  which will not decode is shown rather than thrown, that the other parameters of a visit survive
+  the correction, that a link outranks a remembered room and a remembered room outranks the
+  server's own, and that a spoken name survives the round trip through the room the SFU knows and
+  back.
 - `stage.js`, which is where the stage's decisions live precisely so they can be argued with here:
   that a pinned share survives the room being reordered under it, that a share ending names whose it
   was, that a browser with no fullscreen and one that refuses and one that silently ignores the
@@ -948,7 +1217,10 @@ missing; hover it before assuming the bench is broken.
 ## Deployment
 
 The page must be served over TLS: a browser hands out the microphone only in a secure context, and
-a TLS page can only open `wss`. Put the front end and the SFU's `/rtc*` behind one TLS origin, so
+a TLS page can only open `wss`. With signing in switched on there is a third reason — the session
+cookie is `__Host-`-prefixed and a browser refuses that outside a secure context, so on plain http
+no cookie is set at all and nobody can stay signed in. `http://localhost` counts as secure; a plain
+LAN address does not. Put the front end and the SFU's `/rtc*` behind one TLS origin, so
 the certificate the visitor accepted covers both. `deploy/` in the repository root does exactly
 that, and its README covers the case that actually bites — a host with a public IP and no domain
 name. Media does not pass through the proxy; it is UDP straight to the host, and the SFU advertises
@@ -993,11 +1265,13 @@ by identity, but the list showed both as "Alice". When a display name appears mo
 one is suffixed with the last four characters of its identity — `Alice (a1b2)` — and a name that
 appears once is left alone.
 
-**One page, not a redirect to `/room`.** The name never enters a URL or the browser history, and
-more importantly the click that submits it is a user activation: `getUserMedia` and the playback
-of remote audio both happen inside that same gesture. After a redirect the room page loads with no
-activation at all, and Safari in particular then refuses to start audio until something else is
-clicked. `?room=<name>` still picks the room, so a link to a specific room is a link people can share.
+**One page, and `/r/<room>` is an address rather than a redirect.** The room has a URL and the
+display name does not: the name never enters a URL or the browser history, and the click that
+submits it is a user activation that `getUserMedia` and the playback of remote audio both happen
+inside. That is also why following a link to a room lands in the lobby with the room filled in
+instead of joining on arrival — a page that loaded with no activation at all has nothing to spend,
+and Safari in particular then refuses to start audio until something else is clicked. One page, one
+gesture, and a link that names the room. See "A room is an address" above.
 
 **Identities are `<slug>-<8 hex>`.** The token's `sub` is the participant identity and the SFU
 displaces an existing participant when the same identity joins again, so two people typing "Alice"

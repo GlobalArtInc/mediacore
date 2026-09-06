@@ -719,7 +719,7 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
 | `crates/server` | HTTP and WebSocket endpoints, the `livekit.RoomService` server API and its `/swagger` page, binary |
-| `crates/front` | the browser front end: one page, an audio room, a token endpoint |
+| `crates/front` | the browser front end: one page, an audio room, a token endpoint, and an optional OpenID Connect sign-in |
 
 `crates/room` owns all shared state and knows nothing about transport; `crates/transport` speaks
 str0m types and knows nothing about the LiveKit protocol; `crates/sfu` is pure packet arithmetic

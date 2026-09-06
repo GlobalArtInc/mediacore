@@ -2,7 +2,8 @@
 
 Three containers, one host, one URL. Someone opens it, types a name, and hears
 everyone else in the room. Audio by default; the camera stays off unless
-somebody ticks the box in the lobby.
+somebody ticks the box in the lobby. Point it at an identity provider and it
+stops asking for a name — see "Signing people in" below.
 
 ```
                               the host
@@ -73,12 +74,14 @@ their own. `docker compose up -d --build` again after changing any code. Every
 variable is explained in `.env.example`, including what breaks when it is
 missing.
 
-Everyone who opens the URL lands in `MEDIACORE_FRONT_ROOM`. Adding
-`?room=standup` to the link puts that visitor in `demo.standup` instead; rooms
-are created on demand and disappear when the last person leaves. The prefix is
-not decoration: the front end mints tokens without asking anyone who they are,
-so it is confined to `MEDIACORE_FRONT_ROOM` and the namespace hanging off it,
-and cannot issue a token for a room named anything else on the same SFU.
+Everyone who opens the bare URL lands in `MEDIACORE_FRONT_ROOM`. A room has an
+address of its own: `https://meet.example.com/r/standup` puts that visitor in
+`demo.standup`, and it is a link to paste to a colleague — reloading it comes
+back to the same room. Rooms are created on demand and disappear when the last
+person leaves. The prefix is not decoration: the front end mints tokens without
+asking anyone who they are, so it is confined to `MEDIACORE_FRONT_ROOM` and the
+namespace hanging off it, and cannot issue a token for a room named anything
+else on the same SFU.
 
 Ports the host must accept:
 
@@ -519,6 +522,58 @@ stuck in `in-progress` or `failed`, with bytes sent and zero received — the sa
 picture for both causes, which is why the host-side check above is the one that
 decides.
 
+## Signing people in (optional)
+
+Out of the box anybody with the link types a name and joins. Point the front end
+at an OpenID Connect provider and it stops asking: visitors are sent there, come
+back signed in, and type only the room.
+
+Four variables switch it on, in `deploy/.env`:
+
+```
+MEDIACORE_FRONT_OIDC_ISSUER=https://sso.example.com
+MEDIACORE_FRONT_OIDC_CLIENT_ID=…
+MEDIACORE_FRONT_OIDC_CLIENT_SECRET=…
+```
+
+`MEDIACORE_FRONT_PUBLIC_URL` is not among them: it is derived in
+`docker-compose.yml` from `MEDIACORE_PUBLIC_HOST`, so the redirect URI is built
+from the same host name as the certificate and cannot drift from it.
+
+**Register two URLs with the provider before you start**, and register them
+exactly, including the port:
+
+```
+redirect              https://<MEDIACORE_PUBLIC_HOST>/auth/callback
+post-logout redirect  https://<MEDIACORE_PUBLIC_HOST>/
+```
+
+A provider refuses a request whose redirect URI it does not recognise, and the
+error page it shows says nothing useful. This is the failure to expect first.
+
+**It needs real TLS**, more than the rest of the stack does. The session cookie
+is `__Host-` prefixed, which a browser will not accept without `Secure`, which it
+will not send outside a secure context. On plain http nothing is stored and
+nobody stays signed in, with no error anywhere. `MEDIACORE_TLS=internal` is fine
+— a warning clicked through is a secure context — and so is `http://localhost`
+while developing.
+
+Two things worth knowing before you turn it on:
+
+- **A restart signs everybody out.** Sessions live in the front end's memory.
+  Nobody in a call is dropped by it: the join token was minted at join, has its
+  own six-hour life and is the SFU's to check. It costs each person one press of
+  the provider's already-signed-in page at their next page load.
+- **Signing in says who somebody is, not where they may go.** The provider's
+  roles are read and not enforced: anybody the provider will sign in can still
+  enter any room whose name they know. `crates/front/README.md` has the reasoning
+  and where a rule would go if there were one.
+
+If the provider cannot be reached, signing in stops and nothing else does: a page
+asked for with no session answers `503` saying so, sessions already open keep
+working, and calls already running are untouched. `HTTPS_PROXY` and `NO_PROXY`
+are honoured for the calls the front end makes to the provider.
+
 ## Notes
 
 - **Changing `.env`** takes effect on `docker compose up -d`; changing the
@@ -544,12 +599,14 @@ decides.
   allow. See that directory's README to move to another version. swagger-ui,
   under `crates/server/assets/vendor/`, is vendored into the SFU on the same
   terms and for the same reasons.
-- **What this is not.** One node, no TURN, no recording, and a room that anyone
-  with the URL can join under any name. There *is* a room management API —
+- **What this is not.** One node, no TURN, no recording, and — unless you switch
+  signing in on — a room that anyone with the URL can join under any name. There
+  *is* a room management API —
   `livekit.RoomService`, documented at `/swagger` — but it needs a token signed
   with `MEDIACORE_API_SECRET`, which the front end never hands out. The token
-  endpoint is unauthenticated, which is why it is confined to
+  endpoint is unauthenticated by default, which is why it is confined to
   `MEDIACORE_FRONT_ROOM` and the namespace below it: put the front end on an SFU
   that is also serving something real and it still cannot reach that something's
-  rooms. It is a stack you can put in front of people, not a service to run a
+  rooms. That confinement holds with signing in switched on too — a session says
+  who somebody is, not which rooms exist. It is a stack you can put in front of people, not a service to run a
   business on.

@@ -168,6 +168,36 @@ select {
   font: inherit;
 }
 
+/* The lobby asks two questions now -- which room, and who you are -- and two
+   boxes with no air between them read as one field split in half. The air is on
+   the field rather than between an input and the next label because with
+   signing in switched on the name field is not there at all, and a rule that
+   measured from the input above would then be measuring from nothing. */
+.lobby .field + .field {
+  margin-top: 1rem;
+}
+
+/* Signing in replaces the name field with a sentence, so it sits where the
+   field would have been and reads as part of the same question. */
+.signed-in {
+  margin: 0 0 1.3rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.signed-in strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* `hidden` is an attribute the browser honours with a user-agent rule, and
+   every `display` in this file outranks a user-agent rule. Without this,
+   hiding a `label` or a `.status` here does nothing at all -- which is a
+   whole class of bug that only shows up as an element that will not go away. */
+[hidden] {
+  display: none !important;
+}
+
 .toggle {
   display: flex;
   align-items: center;

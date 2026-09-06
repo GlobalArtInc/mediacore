@@ -72,6 +72,11 @@ services:
       MEDIACORE_FRONT_WS_URL: ws://127.0.0.1:7880
       MEDIACORE_FRONT_ROOM: ${MEDIACORE_FRONT_ROOM:-demo}
       MEDIACORE_FRONT_PORT: "8080"
+      # No sign-in here, and no `env_file` that could switch one on by accident.
+      # This file is for a loopback check over plain http, where the session
+      # cookie could not be stored anyway -- it is `__Host-` prefixed, which a
+      # browser refuses without `Secure`. Signing in is a thing for the TLS
+      # stack in docker-compose.yml.
     command: ["/usr/local/bin/mediacore-front"]
     ports:
       - "127.0.0.1:8080:8080"

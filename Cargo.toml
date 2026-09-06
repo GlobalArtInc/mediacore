@@ -23,6 +23,7 @@ base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+hmac = "0.12"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 pbjson = "0.9"
 pbjson-build = "0.9"
@@ -31,6 +32,14 @@ prost = "0.14"
 prost-build = "0.14"
 prost-reflect = "0.16"
 protox = "0.9"
+rand = "0.9"
+# The one thing in this workspace that opens an outbound connection: the front
+# end talking to an identity provider. Native roots rather than a bundled set,
+# because an internal provider is very often signed by a CA that is in the
+# machine's trust store and in no bundle; `system-proxy`, because a host that
+# reaches the outside through one says so in the environment and nothing else
+# here would read it.
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls-native-roots", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order, so a JSON object is written in the order it was built rather
 # than alphabetically. It is the OpenAPI document at /swagger that needs it:
@@ -40,6 +49,7 @@ serde = { version = "1", features = ["derive"] }
 # sit next to each other and ListRooms is somewhere else.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 thiserror = "2"
 tokio-tungstenite = "0.29"
@@ -47,4 +57,5 @@ tower-http = { version = "0.7", features = ["cors", "set-header"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }

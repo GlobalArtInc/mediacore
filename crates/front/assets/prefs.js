@@ -1,14 +1,22 @@
 /**
  * What one browser remembers between visits: the noise suppressor, the
- * microphone, the name typed in the lobby, whether the camera box was ticked,
- * and the two processing switches beside them. Preferences, and nothing else.
+ * microphone, the name typed in the lobby, the room it last joined, whether the
+ * camera box was ticked, and the two processing switches beside them.
+ * Preferences, and nothing else.
  *
- * **Nothing the server minted is ever written here.** Not the token, not the
- * identity, not the room it was for. Those are issued per visit and expire;
- * a copy of one in `localStorage` outlives the call it was for, is readable by
- * every script this origin ever runs, and buys the person nothing they do not
- * get from pressing Join again. A device id and a display name are preferences
- * about this browser, which is a different kind of thing.
+ * **Nothing the server minted is ever written here.** Not the token and not the
+ * identity. Those are issued per visit and expire; a copy of one in
+ * `localStorage` outlives the call it was for, is readable by every script this
+ * origin ever runs, and buys the person nothing they do not get from pressing
+ * Join again. A device id and a display name are preferences about this
+ * browser, which is a different kind of thing.
+ *
+ * The room is on that side of the line too, now that a room has an address. It
+ * is not a credential and never was: it is in the URL bar of the tab that
+ * joined it, in the link that was pasted to get there, and it opens nothing on
+ * its own -- a token still has to be minted for it, per load. What it buys is
+ * that somebody who joins `standup` every morning is offered `standup` when
+ * they arrive at `/` with nothing else to go on. A link always outranks it.
  *
  * Nothing here touches the DOM, and nothing here reaches for `localStorage` on
  * its own: the store is handed in, so `node --test` can hand it one that
@@ -34,7 +42,7 @@
 /**
  * One key, one JSON object, written whole whenever anything in it changes. A
  * scattering of keys written from wherever is a storage surface nobody can read
- * as a whole, and this one is five fields.
+ * as a whole, and this one is six fields.
  *
  * The version is in the key and not inside the blob, and every read validates
  * field by field. A version number can only say which shape wrote a value; it
@@ -55,6 +63,7 @@ export const PREFS_KEY = "mediacore.front.v1";
  */
 export const NOTHING_REMEMBERED = Object.freeze({
   name: null,
+  room: null,
   camera: null,
   noise: null,
   microphone: null,
@@ -72,7 +81,7 @@ export const STORAGE_REFUSED =
 /** Long enough for any name a person types, short enough that a hostile blob is not a payload. */
 const NAME_LIMIT = 200;
 
-const FIELDS = ["name", "camera", "noise", "microphone", "processing"];
+const FIELDS = ["name", "room", "camera", "noise", "microphone", "processing"];
 
 /**
  * The store, where this browser has one and will admit to it. Reading the
@@ -116,7 +125,7 @@ export function readPrefs(store, offer) {
  * version writes — a blob edited by hand, half a write, a field an older page
  * wrote and this one no longer means, a suppressor that has since been taken
  * out of the list — comes back as "nothing was remembered about that". One
- * field at a time, so one unreadable value never costs the other four.
+ * field at a time, so one unreadable value never costs the other five.
  */
 export function sanitize(raw, offer) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return NOTHING_REMEMBERED;
@@ -125,6 +134,12 @@ export function sanitize(raw, offer) {
   const settable = listOf(offer && offer.processing);
 
   const name = typeof raw.name === "string" ? raw.name.trim().slice(0, NAME_LIMIT) : "";
+  // A stored room is checked for shape and not for validity. What may be a room
+  // name is `clean_room`'s answer and the server gives it; a copy of that rule
+  // here would be a second one, and the two would drift the first time either
+  // moved. A room that is no longer allowed comes back, is offered in the
+  // lobby, and is refused with the reason when somebody presses Join.
+  const room = typeof raw.room === "string" ? raw.room.trim().slice(0, NAME_LIMIT) : "";
   const processing = {};
   if (raw.processing && typeof raw.processing === "object") {
     for (const key of settable) {
@@ -134,6 +149,7 @@ export function sanitize(raw, offer) {
 
   return {
     name: name === "" ? null : name,
+    room: room === "" ? null : room,
     camera: typeof raw.camera === "boolean" ? raw.camera : null,
     noise: engines.includes(raw.noise) ? raw.noise : null,
     // The system default is remembered as nothing at all, because that is what
@@ -145,7 +161,7 @@ export function sanitize(raw, offer) {
 }
 
 /**
- * Writes the five fields and drops the ones nothing is remembered about, so the
+ * Writes the six fields and drops the ones nothing is remembered about, so the
  * blob on disk is always the shape this version writes and never accumulates
  * whatever a caller happened to be holding.
  *
