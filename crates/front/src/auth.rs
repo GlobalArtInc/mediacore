@@ -16,14 +16,21 @@
 //! Three things, and each of them is a separate way of getting this wrong:
 //!
 //!   * that this process started this sign-in -- the `state` names a login in
-//!     a map only this process writes to, and it is spent on the way past, so a
-//!     replayed callback finds nothing
+//!     a map only this process writes to
 //!   * that it came back to the browser it left from -- the login cookie holds
 //!     a secret whose fingerprint was stored with the login. Without this
 //!     somebody can send you a working callback URL and quietly sign you into
 //!     *their* account, and then read whatever you do next
 //!   * that the token is about this sign-in -- the `nonce`, checked in
 //!     [`crate::oidc::validate_id_token`]
+//!
+//! In that order, and the order is load bearing. The login is spent *after* the
+//! browser has been proved, not on the way past: a callback that cannot show
+//! the cookie has redeemed no code, so there is nothing to spend, and spending
+//! anyway let anybody who had merely read a `state` -- from an address bar, from
+//! the provider's access log -- end that sign-in by fetching one URL. Once the
+//! cookie checks out the login is gone whatever happens next, which is the whole
+//! of the protection against a code being redeemed twice.
 //!
 //! ## When it goes wrong the answer is a page, not a redirect
 //!
@@ -35,14 +42,15 @@
 
 use axum::extract::{Query, State};
 use axum::http::header::{COOKIE, LOCATION, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+use crate::log::quoted;
 use crate::oidc::{ProviderError, local_path, safe_return_url};
 use crate::session::{
-    Login, Session, fingerprint, login_cookie, login_cookie_name, random_token, same_secret,
-    session_cookie, spent_login_cookie, spent_session_cookie,
+    LOGIN_COOKIE, Login, NotFinished, Session, fingerprint, login_cookie, random_token,
+    same_secret, session_cookie, spent_login_cookie, spent_session_cookie,
 };
 use crate::state::{Front, Shared};
 
@@ -74,13 +82,75 @@ pub fn signed_in(front: &Front, headers: &HeaderMap) -> Option<Session> {
         .find_map(|cookie| front.sessions.lookup(cookie))
 }
 
+/// Whether this request is somebody arriving, rather than something another
+/// page made this browser fetch.
+///
+/// A sign-in in flight costs this process an entry in a bounded map and costs
+/// the browser a cookie, and only a person opening the page will ever finish
+/// one. Everything else that reaches `/` or `/r/<room>` -- an `<img>` on
+/// somebody else's page, a prefetch, a crawler that speaks `Sec-Fetch-*`, a
+/// widget fetching the origin -- would start a sign-in nobody is at the other
+/// end of, and doing that thousands of times is how the map was filled and the
+/// cookie jar with it.
+///
+/// `Sec-Fetch-Dest: document` is most of the test: a top-level navigation, which
+/// is what an address bar, a link and a redirect back from the provider all
+/// produce. A browser that sends no such header is trusted, the same way
+/// [`logout`] trusts one that sends no `Sec-Fetch-Site` -- refusing them would
+/// break signing in for old browsers rather than protect anything, and a
+/// scripted flood can set any header it likes anyway. What this closes is the
+/// shape that needs no script at all: `<img src="https://host/r/a">` on a page
+/// somebody else controls.
+///
+/// The method is the other half, and it is the half that catches what sends no
+/// `Sec-Fetch-*` at all. Axum answers `HEAD` from the same handler as `GET`, and
+/// a `HEAD` is never somebody about to type a password: it is a monitor, a link
+/// unfurler or a crawler, every one of which would otherwise start a sign-in
+/// nobody will ever come back to finish.
+fn somebody_arriving(method: &Method, headers: &HeaderMap) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+
+    if let Some(destination) = header("sec-fetch-dest")
+        && destination != "document"
+    {
+        return false;
+    }
+
+    // A page the browser fetched because it *might* be wanted. Chrome sends
+    // `Sec-Purpose`, older Chrome `Purpose`, Firefox `X-moz`; none of them is a
+    // person who is about to type a password.
+    ![header("sec-purpose"), header("purpose"), header("x-moz")]
+        .into_iter()
+        .flatten()
+        .any(|purpose| purpose.contains("prefetch") || purpose.contains("prerender"))
+}
+
 /// Sends a browser to the provider, remembering where it was going.
 ///
 /// `uri` is the request this server is answering, so the path in it is a path
 /// on this server; [`local_path`] is still asked, because `//evil.example` is
 /// a path a request can carry and a `Location` built from it leaves this
 /// origin.
-pub async fn start_sign_in(front: &Front, uri: &Uri) -> Response {
+///
+/// The order of the last two steps is deliberate: the redirect is built first
+/// and the login is remembered only once there is somewhere to send the person.
+/// A provider having a bad ten minutes would otherwise fill the map with
+/// sign-ins that never left this process.
+pub async fn start_sign_in(
+    front: &Front,
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response {
     let Some(provider) = front.provider.as_ref() else {
         return page(
             StatusCode::NOT_FOUND,
@@ -89,29 +159,54 @@ pub async fn start_sign_in(front: &Front, uri: &Uri) -> Response {
         );
     };
 
+    if !somebody_arriving(method, headers) {
+        return page(
+            StatusCode::UNAUTHORIZED,
+            "Not signed in",
+            "This page signs you in when you open it yourself. Nothing was started for whatever \
+             asked for it here.",
+        );
+    }
+
     let return_to = uri
         .path_and_query()
         .map(ToString::to_string)
         .and_then(|path| local_path(&path))
         .unwrap_or_else(|| "/".to_owned());
 
-    let secret = random_token();
+    // The secret this browser already holds, if it has one. Reusing it is what
+    // keeps a browser to a single login cookie however many times it loads the
+    // page, and it leaves any sign-in already in flight in this browser able to
+    // finish -- the fingerprint stored with that login is of this same secret.
+    let secret = cookies(headers, LOGIN_COOKIE)
+        .next()
+        .map_or_else(random_token, str::to_owned);
+
     let login = Login::new(
         return_to,
         random_token(),
         random_token(),
         fingerprint(&secret),
     );
-    let state = front.sessions.start_login(login.clone());
 
-    match provider.authorize(&state, &login).await {
-        Ok(url) => with_cookie(found(&url), &login_cookie(&state, &secret)),
+    // 256 random bits, minted here rather than by the store because the
+    // redirect is built before anything is remembered. It comes back in the
+    // callback's query string, so it has to be unguessable and safe in a URL.
+    let state = random_token();
+    let url = match provider.authorize(&state, &login).await {
+        Ok(url) => url,
         Err(error) => {
-            tracing::error!(%error, "nobody can be sent to sign in");
+            tracing::error!(error = %quoted(&error), "nobody can be sent to sign in");
 
-            unreachable_page()
+            return unreachable_page();
         }
+    };
+
+    if !front.sessions.start_login(&state, login) {
+        return busy_page();
     }
+
+    with_cookie(found(&url), &login_cookie(&secret))
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,31 +228,48 @@ pub async fn callback(
         return refused_page();
     };
 
-    // The login is spent whatever happens next. A callback that got this far
-    // has used up its `state`, and leaving it in the map would leave a code
-    // redeemable a second time by whoever else has the URL.
-    let Some(login) = front.sessions.finish_login(state) else {
-        tracing::warn!("a callback arrived with a state this process never issued or has spent");
+    // The browser is checked and the login is spent in that order, under one
+    // lock. A callback that cannot show the cookie has redeemed no code, so
+    // there is nothing to spend -- and spending anyway is a way for anybody who
+    // learned the `state` to end somebody else's sign-in without holding a
+    // thing. Once the check passes the login is gone whatever happens next,
+    // which is what stops a code being redeemed twice.
+    let login = match front.sessions.finish_login(state, |login| {
+        cookies(&headers, LOGIN_COOKIE)
+            .any(|secret| same_secret(&fingerprint(secret), &login.browser))
+    }) {
+        Ok(login) => login,
+        Err(NotFinished::Unknown) => {
+            tracing::warn!(
+                "a callback arrived with a state this process never issued or has spent"
+            );
 
-        return refused_page();
+            return refused_page();
+        }
+        Err(NotFinished::WrongBrowser) => {
+            tracing::warn!(
+                "a callback arrived in a browser that cannot show the secret this sign-in started \
+                 with, so it is somebody else's sign-in being finished here"
+            );
+
+            // No `Set-Cookie` on the way out either. This refusal is answered
+            // to whoever asked, and whoever asked may be a browser that was
+            // made to fetch the callback by a page somewhere else -- clearing
+            // the login cookie there would take away the proof its own sign-in
+            // is about to need.
+            return refused_page();
+        }
     };
 
-    let name = login_cookie_name(state);
-    let proved =
-        cookies(&headers, &name).any(|secret| same_secret(&fingerprint(secret), &login.browser));
+    let answer = complete(&front, &login, &query).await;
 
-    let answer = if !proved {
-        tracing::warn!(
-            "a callback arrived in a browser that cannot show the secret this sign-in started \
-             with, so it is somebody else's sign-in being finished here"
-        );
-
-        refused_page()
-    } else {
-        complete(&front, &login, &query).await
-    };
-
-    with_cookie(answer, &spent_login_cookie(state))
+    // The cookie is one per browser, so it is spent only when nothing else in
+    // this browser is still relying on it: a second tab may be at the provider
+    // with a login of its own whose proof is this same secret.
+    match front.sessions.another_login_in(&login.browser) {
+        true => answer,
+        false => with_cookie(answer, &spent_login_cookie()),
+    }
 }
 
 async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Response {
@@ -165,7 +277,12 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
         // Logged as the provider's own code and nothing else. An
         // `error_description` is a string from another system and this one has
         // no business rendering it.
-        tracing::info!(%error, "the provider did not sign this person in");
+        //
+        // Through `quoted` because this parameter is not the provider's: it
+        // arrives in a query string anybody can write, and written straight
+        // into the line a `%0a` in it wrote a *second* line that read as one of
+        // this process's own. See `crate::log`.
+        tracing::info!(error = %quoted(error), "the provider did not sign this person in");
 
         return match error {
             ACCESS_DENIED => page(
@@ -193,7 +310,7 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
         Ok(identity) => identity,
         Err(error) => {
             let unreachable = matches!(error, ProviderError::Unreachable);
-            tracing::warn!(%error, "this sign-in could not be finished");
+            tracing::warn!(error = %quoted(&error), "this sign-in could not be finished");
 
             return if unreachable {
                 unreachable_page()
@@ -263,7 +380,7 @@ pub async fn logout(
         .and_then(|value| value.to_str().ok())
         && !matches!(site.trim(), "same-origin" | "none")
     {
-        tracing::warn!(%site, "a sign-out was asked for by another site");
+        tracing::warn!(site = %quoted(site), "a sign-out was asked for by another site");
 
         return page(
             StatusCode::FORBIDDEN,
@@ -354,6 +471,23 @@ fn refused_page() -> Response {
         "Not signed in",
         "This sign-in did not start here, or it has already finished. Go back to the front page \
          and try again.",
+    )
+}
+
+/// What somebody arriving during a flood is told.
+///
+/// It is deliberately the answer *this* person gets rather than one somebody
+/// else gets: the alternative was making room by dropping a sign-in already in
+/// flight, which reads as a working page for the newcomer and a refused
+/// callback for whoever was halfway through typing a password. A person who
+/// tries again in a minute gets in; a person thrown out mid-sign-in has no idea
+/// what happened.
+fn busy_page() -> Response {
+    page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Nobody can sign in",
+        "This server is already holding as many sign-ins as it will hold at once, so this one \
+         could not be started. Try again in a minute.",
     )
 }
 

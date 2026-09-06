@@ -5,7 +5,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use mediacore_auth::{AuthError, Claims, VideoGrant};
@@ -14,6 +14,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth;
 use crate::config::Config;
+use crate::log::quoted;
 use crate::name::{NameError, RoomError, clean_name, identity_for, room_for};
 use crate::session::Session;
 use crate::state::{Front, Shared};
@@ -179,9 +180,14 @@ fn content_security_policy(ws_url: &str) -> HeaderValue {
 /// stays open because it is what the page asks before it can show anything at
 /// all. The two things worth protecting are who is signed in, which only a
 /// session says, and a join token, which only `/api/token` mints.
-async fn index(State(front): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+async fn index(
+    State(front): State<Shared>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     if front.requires_sign_in() && auth::signed_in(&front, &headers).is_none() {
-        return auth::start_sign_in(&front, &uri).await;
+        return auth::start_sign_in(&front, &method, &headers, &uri).await;
     }
 
     asset("text/html; charset=utf-8", NO_CACHE, INDEX_HTML).into_response()
@@ -408,7 +414,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
         if status.is_server_error() {
-            tracing::error!(error = %self, "token request failed");
+            tracing::error!(error = %quoted(&self), "token request failed");
         }
 
         let body = ApiErrorBody {
@@ -434,7 +440,7 @@ async fn token(
     State(front): State<Shared>,
     headers: HeaderMap,
     body: Result<Json<TokenRequest>, JsonRejection>,
-) -> Result<Json<TokenResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let config = &front.config;
     let session = match front.requires_sign_in() {
         true => Some(auth::signed_in(&front, &headers).ok_or(ApiError::NotSignedIn)?),
@@ -480,15 +486,26 @@ async fn token(
     };
 
     let token = mediacore_auth::issue(&config.api_secret, &claims)?;
-    tracing::info!(%identity, %room, "issued a token");
+    // The identity is the provider's `sub` with the switch on, and `clean_subject`
+    // has already refused a control character in it. Quoted anyway: it is the one
+    // field on this line that another system chose, and a log line's shape should
+    // not rest on a check made in a different file. `room` is this crate's own
+    // composition over a charset of letters, digits, `-`, `_` and `.`.
+    tracing::info!(identity = %quoted(&identity), %room, "issued a token");
 
-    Ok(Json(TokenResponse {
+    let body = Json(TokenResponse {
         url: config.ws_url.clone(),
         token,
         room,
         identity,
         name,
-    }))
+    });
+
+    // A join token is a bearer credential with six hours in it. Nothing between
+    // here and the browser is supposed to keep a copy -- and while no cache
+    // stores a `POST` response unasked, the header is what says so rather than
+    // leaving it to a rule somebody has to know.
+    Ok(([(header::CACHE_CONTROL, NO_STORE)], body))
 }
 
 /// The name and the identity of somebody signed in.

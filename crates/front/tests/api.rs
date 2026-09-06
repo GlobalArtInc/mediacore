@@ -98,6 +98,34 @@ async fn head_of(addr: SocketAddr, path: &str) -> String {
         .to_owned()
 }
 
+/// The head of a `POST`, for the one thing about a minted token that is not in
+/// its body.
+async fn post_head(addr: SocketAddr, path: &str, body: &str) -> String {
+    let exchange = async {
+        let mut socket = TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.expect("request");
+
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).await.expect("response");
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("http response did not arrive in time");
+
+    response
+        .split_once("\r\n\r\n")
+        .expect("http response without a body")
+        .0
+        .to_owned()
+}
+
 async fn mint(addr: SocketAddr, body: &str) -> (u16, serde_json::Value) {
     let (status, raw) = request(addr, "POST /api/token", body).await;
     let value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("json response, got {raw}"));
@@ -203,6 +231,26 @@ async fn a_token_is_issued_that_the_server_accepts() {
         "the grant names a source nothing on the page publishes"
     );
     assert!(claims.iss == API_KEY);
+}
+
+/// A join token is a bearer credential with six hours in it, and the response
+/// that carries it says so. No cache stores a `POST` response unasked, so this
+/// is a header nothing is currently relying on -- which is the reason to set it
+/// now rather than the reason to leave it out: the rule that keeps it safe
+/// lives in somebody else's software, and a proxy in front is somebody else's
+/// software.
+#[tokio::test]
+async fn a_minted_token_is_never_something_to_keep_a_copy_of() {
+    let addr = spawn().await;
+    let head = post_head(addr, "/api/token", r#"{"name":"Alice"}"#)
+        .await
+        .to_lowercase();
+
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(
+        head.contains("cache-control: no-store"),
+        "the response carrying a join token does not say not to keep a copy of it: {head}"
+    );
 }
 
 #[tokio::test]

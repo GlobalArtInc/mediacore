@@ -171,16 +171,18 @@ the page comes back with the room still in the address and the name already know
 ### The round trip
 
 ```
-  GET /r/standup                     no session
-    -> remember { return_to: "/r/standup", nonce, pkce verifier } under a random `state`
-    -> Set-Cookie: __Host-mediacore_login_<state>=<secret>
+  GET /r/standup                     no session, and a person arriving
+    -> build the redirect first, then remember
+       { return_to: "/r/standup", nonce, pkce verifier } under a random `state`
+    -> Set-Cookie: __Host-mediacore_login=<secret>   (one per browser, reused)
     -> 302 <provider>/authorize?response_type=code&response_mode=query&client_id=…
              &redirect_uri=<public>/auth/callback&scope=…&state=…&nonce=…
              &code_challenge=S256(verifier)&code_challenge_method=S256
 
   GET /auth/callback?code=…&state=…
-    -> the `state` names a login this process started, and spends it
+    -> the `state` names a login this process started
     -> the login cookie proves this is the browser the sign-in left from
+    -> and only then is the login spent
     -> POST <provider>/token   (server to server, client_secret_post, code_verifier)
     -> validate the id token; ask userinfo for what it did not carry
     -> Set-Cookie: __Host-mediacore_session=<id>.<hmac>
@@ -204,6 +206,56 @@ button holds no entry with a `code` in it.
 sign you quietly into *their* account, and then read whatever you type next. The cookie holds a
 secret; the login holds its `sha256`; the callback compares them and refuses if it cannot.
 
+**It is one cookie per browser, and the browser check comes before the spend.** Both of those were
+the other way round and both were wrong. A cookie named after the `state` meant every signed-out page
+load left a *different* one alive for ten minutes with nothing to clear it, so a browser made to
+fetch this origin — `<img src="https://host/r/a">` on any page anywhere — collected them by the
+hundred until its jar started evicting cookies that mattered. One name costs nothing: what the cookie
+says is *which browser*, and two tabs signing in at once are the same browser, so they share it and
+each keep their own `state`, nonce and room. It is cleared by the callback only once no other sign-in
+in that browser is still relying on it. And spending the login before checking the cookie meant that
+anybody who read a `state` — it is in the address bar while the provider's page is open, and in the
+provider's access log afterwards — could end that sign-in with one fetch, holding nothing. A callback
+that fails the browser check has redeemed no code, so it now leaves the login exactly where it found
+it, and sets no cookie on the way out either.
+
+### A flood of page loads cannot lock anybody out
+
+Starting a sign-in costs an unauthenticated `GET /`, so the map of sign-ins in flight is capped at
+4096 — and what happens *at* the cap is the whole of it. Dropping the oldest to make room dropped the
+person who had been waiting longest at the provider, which is the person still typing a password;
+four thousand requests take under a second from one host, so anybody could end any sign-in in flight,
+and a sustained stream made signing in impossible for everyone. A full map now refuses the newcomer
+instead, with **503** and a sentence saying to try again in a minute. A newcomer failing during a
+flood is survivable; somebody thrown out halfway through is not.
+
+Two things keep the map from filling in the first place. A request that is not a person arriving is
+answered `401` and starts nothing: `Sec-Fetch-Dest` saying `image`, `iframe` or `empty`, a prefetch,
+or a `HEAD` — which axum answers from the same handler and which is always a monitor, a crawler or a
+link unfurler rather than somebody about to type a password. So the shape that needs no script at
+all, an `<img src="https://host/r/a">` on a page somebody only had to look at, costs neither an entry
+nor a cookie. A browser that sends no `Sec-Fetch-*` is otherwise trusted, the same way signing out
+trusts one that sends no `Sec-Fetch-Site`: refusing it would break signing in for old browsers rather
+than protect anything, and a scripted flood can set any header it likes anyway. And the redirect to
+the provider is built *before* anything is remembered, so a provider having a bad ten minutes does
+not leave the map full of sign-ins that never left this process.
+
+`a_flood_of_anonymous_page_loads_does_not_lock_anybody_out` in `tests/oidc.rs` is the whole sequence:
+somebody at the provider, four thousand page loads from somebody with no account, and the first
+person's callback still landing on `/r/standup`.
+
+### Nothing from outside writes a line of the log
+
+A `tracing` field written with `%` goes into the line exactly as it came, so a value carrying a
+newline writes *two* lines and the second one reads as one this binary wrote. It needed no account:
+`GET /` for a `state`, then `/auth/callback?state=…&error=%0a…`, and the log grew a convincing
+`signed somebody in subject=admin`. Everything from outside — a query parameter, a header, a `kid`, an
+error carrying a string a provider chose — now goes through `quoted` in `src/log.rs` on its way to a
+field: quoted so the reader can see where somebody else's words start and stop, escaped for anything
+that starts a line or reorders one, and cut at 200 characters with a `…` so a megabyte of `?error=`
+costs the log a line rather than a megabyte. Printable text outside ASCII is left alone, because a
+display name is `Роман` far more often than it is an attack.
+
 ### The ID token is where implementations get this wrong
 
 An ID token is a signed statement about who somebody is. A validator that skips a check turns it
@@ -216,7 +268,7 @@ watches the sign-in be refused:
 | **`alg` is `RS256`, decided here and never read off the token** | the classic forgery: name `HS256`, and get a validator to verify the provider's *public* key — which anybody can fetch — as an HMAC secret. `alg: none` goes the same way |
 | the key is chosen by `kid` | a token signed with a key that is in the set for something else |
 | `iss` | tokens from any other provider |
-| `aud`, plus `azp` when there is more than one audience | a real token minted for another client on the same provider |
+| `aud`, plus `azp` whenever the token carries one | a real token minted for another client on the same provider (OpenID Connect 3.1.3.7, both steps: `azp` is verified when it is present, not only when there are several audiences) |
 | `exp`, with a minute of leeway | a token from last week |
 | `nonce`, against the one this login issued, compared whole | a real token from another sign-in, replayed into this one |
 
@@ -225,7 +277,12 @@ not one per token: a stream of invented `kid`s would otherwise be a way to make 
 provider. A refetch that fails keeps the keys already held — a provider having a bad minute should not
 stop people signing in with keys that have not changed. The discovery document is treated the same way,
 and its `issuer` must equal the configured one (RFC 8414 §3.3), which is also what catches a trailing
-slash or an `http`/`https` mix-up in configuration.
+slash or an `http`/`https` mix-up in configuration. Every endpoint the document names has to be an
+`http` or `https` URL, **including the two optional ones** — `userinfo_endpoint` and
+`end_session_endpoint` are the ones that produce an outbound request carrying an access token and a
+`Location` a browser follows. One door described as `javascript:` refuses the whole document rather
+than being quietly dropped: it is either broken or hostile, and neither is a document to take the
+other four values from.
 
 `userinfo` is asked afterwards for anything the ID token did not carry — plenty of providers put only
 `sub` in the token, and a roster of UUIDs is not a room. It is allowed to fail: the signed token
@@ -279,6 +336,12 @@ room is the one thing the body is still believed about, and it is namespaced exa
 session is `401` with a sentence the lobby prints.
 
 With the switch off it behaves precisely as it did: a name on trust, no session, no cookie.
+
+Either way the response carrying the token is sent `Cache-Control: no-store`, as is `/api/config`
+once it starts saying who is signed in. No cache stores a `POST` response unasked, so this is a
+header nothing currently relies on — which is the reason to set it rather than to leave it out, since
+the rule that makes it safe lives in somebody else's software and a proxy in front is somebody else's
+software.
 
 ### Signing out
 

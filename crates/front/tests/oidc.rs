@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -32,7 +32,9 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mediacore_front::config::{Config, OidcConfig, TOKEN_TTL};
 use mediacore_front::http;
+use mediacore_front::log::MAX_LOGGED_CHARS;
 use mediacore_front::oidc::{Expected, IdTokenError, pkce_challenge, validate_id_token};
+use mediacore_front::session::MAX_PENDING_LOGINS;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -435,6 +437,10 @@ struct Staged {
     token_form: Option<String>,
     token_status: Option<u16>,
     issuer: Option<String>,
+    /// What the discovery document says these two doors are, when a test wants
+    /// something other than a URL there.
+    userinfo_endpoint: Option<String>,
+    end_session_endpoint: Option<String>,
     jwks_kid: Option<String>,
     jwks_fetches: usize,
     ended_sessions: Vec<String>,
@@ -493,21 +499,28 @@ async fn fake_provider() -> Arc<Fake> {
 
 async fn fake_discovery(State(fake): State<Arc<Fake>>) -> Json<Value> {
     let base = fake.base();
-    let issuer = fake
-        .staged
-        .lock()
-        .unwrap()
-        .issuer
-        .clone()
-        .unwrap_or_else(|| base.clone());
+    let (issuer, userinfo, end_session) = {
+        let staged = fake.staged.lock().unwrap();
+        (
+            staged.issuer.clone().unwrap_or_else(|| base.clone()),
+            staged
+                .userinfo_endpoint
+                .clone()
+                .unwrap_or_else(|| format!("{base}/user_info")),
+            staged
+                .end_session_endpoint
+                .clone()
+                .unwrap_or_else(|| format!("{base}/end_session")),
+        )
+    };
 
     Json(json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
-        "userinfo_endpoint": format!("{base}/user_info"),
+        "userinfo_endpoint": userinfo,
         "jwks_uri": format!("{base}/jwks"),
-        "end_session_endpoint": format!("{base}/end_session"),
+        "end_session_endpoint": end_session,
     }))
 }
 
@@ -802,7 +815,7 @@ async fn a_page_asked_for_with_no_session_is_sent_to_the_provider() {
     assert!(
         cookies
             .iter()
-            .any(|cookie| cookie.starts_with("__Host-mediacore_login_")),
+            .any(|cookie| cookie.starts_with("__Host-mediacore_login=")),
         "the browser was sent away with nothing to prove the callback comes back to it: {cookies:?}"
     );
 
@@ -961,13 +974,22 @@ async fn a_callback_arriving_in_another_browser_is_refused() {
     let wrong = visit_with(
         front,
         &path,
-        &[format!(
-            "__Host-mediacore_login_{}=a-secret-this-browser-made-up",
-            query["state"]
-        )],
+        &["__Host-mediacore_login=a-secret-this-browser-made-up".to_owned()],
     )
     .await;
     assert_eq!(wrong.status, 400);
+
+    // Neither attempt spent the sign-in, and neither answered with anything
+    // that would clear a login cookie: both of them are shapes that arrive in
+    // *somebody else's* browser, fetched by a page they did not write.
+    for attempt in [&stranger, &wrong] {
+        assert!(
+            attempt.cookies().is_empty(),
+            "a refused callback set a cookie, and in the browser it was aimed at that is the \
+             proof its own sign-in is about to need: {:?}",
+            attempt.cookies()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1481,6 +1503,479 @@ async fn with_the_switch_off_there_is_no_sign_in_at_all() {
     let config = visit(front, "/api/config").await.json();
     assert_eq!(config["signIn"], false);
     assert_eq!(config["signedInAs"], Value::Null);
+}
+
+// --------------------------------------------- what a flood can and cannot do
+
+/// The flood, against the real router: somebody with no account, no session and
+/// no cookie asking for the front page as fast as a loop will go, while one
+/// real person is at the provider typing a password.
+///
+/// Every one of those page loads used to insert a pending login, and past four
+/// thousand each insert dropped the oldest -- which is the person who has been
+/// waiting longest, which is the person still typing. Their callback came back
+/// `400`, and while the stream lasted nobody could sign in at all.
+#[tokio::test]
+async fn a_flood_of_anonymous_page_loads_does_not_lock_anybody_out() {
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    // Somebody opens a room and is sent to the provider.
+    let sent_away = visit(front, "/r/standup").await;
+    assert_eq!(sent_away.status, 302);
+    let authorize = Url::parse(&sent_away.header("location").expect("a location")).unwrap();
+    let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+    let cookies = sent_away.live_cookies();
+
+    // And while they are typing, the flood.
+    let mut refused = 0;
+    for _ in 0..(MAX_PENDING_LOGINS + 64) {
+        if visit(front, "/").await.status == 503 {
+            refused += 1;
+        }
+    }
+
+    // They finish typing. This is the assertion, and it is made before the one
+    // about the flood itself so that a change which goes back to evicting is
+    // reported as "the sign-in was thrown out" rather than as a flood that
+    // never filled anything.
+    fake.stage_id_token(signed(&claims(&fake.base(), &query["nonce"]), Some(KID)));
+    let back = visit_with(
+        front,
+        &format!(
+            "/auth/callback?code=an-authorization-code&state={}",
+            query["state"]
+        ),
+        &cookies,
+    )
+    .await;
+
+    assert_eq!(
+        back.status, 302,
+        "a flood of anonymous page loads threw out the sign-in somebody was in the middle of: {}",
+        back.body
+    );
+    assert_eq!(back.header("location").as_deref(), Some("/r/standup"));
+
+    assert!(
+        refused >= 64,
+        "only {refused} of the flood were turned away, so this run never reached the ceiling and \
+         the assertion above proves nothing"
+    );
+}
+
+/// Five signed-out page loads used to leave five differently named cookies,
+/// each alive for ten minutes and cleared by nothing. A browser made to fetch
+/// this origin -- `<img src="https://host/r/a">`, `/r/b`, and so on -- collected
+/// them until its jar started evicting cookies that mattered, or until the
+/// `Cookie` header outgrew what the proxy in front would accept.
+#[tokio::test]
+async fn a_browser_that_keeps_loading_the_page_holds_one_login_cookie() {
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    let mut jar: Vec<String> = Vec::new();
+    let mut first_load = None;
+
+    for room in ["/r/standup", "/r/retro", "/r/a", "/r/b", "/"] {
+        let answer = visit_with(front, room, &jar).await;
+        assert_eq!(answer.status, 302);
+
+        let authorize = Url::parse(&answer.header("location").expect("a location")).unwrap();
+        let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+        first_load.get_or_insert_with(|| (query["state"].clone(), query["nonce"].clone()));
+
+        // What a browser does with a `Set-Cookie`: replace what it holds under
+        // that name, and keep everything else.
+        for baked in answer.live_cookies() {
+            let name = baked.split('=').next().unwrap().to_owned();
+            jar.retain(|held| !held.starts_with(&format!("{name}=")));
+            jar.push(baked);
+        }
+    }
+
+    let logins: Vec<_> = jar
+        .iter()
+        .filter(|cookie| cookie.starts_with("__Host-mediacore_login"))
+        .collect();
+    assert_eq!(
+        logins.len(),
+        1,
+        "five page loads left this browser {} login cookies, and nothing but a matching callback \
+         ever clears one: {logins:?}",
+        logins.len()
+    );
+
+    // And the one cookie it holds is still the secret the *first* of those
+    // sign-ins was started with. That is what makes one cookie per browser
+    // safe: somebody who opened five tabs can still finish in the first one.
+    let (state, nonce) = first_load.expect("a state and a nonce from the first load");
+    fake.stage_id_token(signed(&claims(&fake.base(), &nonce), Some(KID)));
+
+    let back = visit_with(
+        front,
+        &format!("/auth/callback?code=an-authorization-code&state={state}"),
+        &jar,
+    )
+    .await;
+    assert_eq!(
+        back.status, 302,
+        "the first tab's sign-in could no longer be finished, so a later page load rotated the \
+         cookie out from under it: {}",
+        back.body
+    );
+    assert_eq!(back.header("location").as_deref(), Some("/r/standup"));
+}
+
+/// A page on somebody else's site cannot make a browser start a sign-in here.
+/// `<img src="https://host/r/a">` is a `GET` of a room address with the
+/// browser's own cookies, and answering it with a login was how a cookie was
+/// planted and a place in the map taken, thousands at a time, from a page the
+/// person only had to look at.
+#[tokio::test]
+async fn nothing_but_a_person_arriving_starts_a_sign_in() {
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    for (what, headers) in [
+        (
+            "an <img> on another page",
+            vec![("Sec-Fetch-Dest", "image")],
+        ),
+        (
+            "a script fetching this origin",
+            vec![("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors")],
+        ),
+        ("an iframe", vec![("Sec-Fetch-Dest", "iframe")]),
+        (
+            "a prefetch",
+            vec![
+                ("Sec-Fetch-Dest", "document"),
+                ("Sec-Purpose", "prefetch;prerender"),
+            ],
+        ),
+        (
+            "an older browser's prefetch",
+            vec![("Sec-Fetch-Dest", "document"), ("Purpose", "prefetch")],
+        ),
+    ] {
+        let answer = request(front, "GET /r/standup", &headers, "").await;
+
+        assert_eq!(
+            answer.status, 401,
+            "{what} was answered with a sign-in of its own"
+        );
+        assert!(
+            answer.cookies().is_empty(),
+            "{what} left a cookie behind: {:?}",
+            answer.cookies()
+        );
+        assert!(
+            answer.cookies().is_empty(),
+            "{what} left a cookie in the browser it was aimed at: {:?}",
+            answer.cookies()
+        );
+        assert!(
+            answer.header("location").is_none(),
+            "{what} was sent to the provider"
+        );
+    }
+
+    // A `HEAD`, which axum answers from the same handler and which no browser
+    // ever makes for a page somebody is reading.
+    let looked_at = request(front, "HEAD /r/standup", &[], "").await;
+    assert_eq!(
+        looked_at.status, 401,
+        "a monitor, a crawler or a link unfurler started a sign-in nobody will come back for"
+    );
+    assert!(looked_at.cookies().is_empty());
+
+    // A person opening the same address is not touched by any of it.
+    let arriving = request(
+        front,
+        "GET /r/standup",
+        &[
+            ("Sec-Fetch-Dest", "document"),
+            ("Sec-Fetch-Mode", "navigate"),
+        ],
+        "",
+    )
+    .await;
+    assert_eq!(
+        arriving.status, 302,
+        "a browser saying it is navigating was not sent to sign in"
+    );
+}
+
+/// A `state` is not a secret: it is in the address bar while the provider's
+/// page is open, and in the provider's access log for ever. Spending the login
+/// before the browser was checked meant anybody who read one could end that
+/// sign-in with a single fetch, holding nothing.
+#[tokio::test]
+async fn somebody_who_only_knows_the_state_cannot_end_a_sign_in() {
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    let sent_away = visit(front, "/r/standup").await;
+    let authorize = Url::parse(&sent_away.header("location").expect("a location")).unwrap();
+    let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+    let path = format!(
+        "/auth/callback?code=an-authorization-code&state={}",
+        query["state"]
+    );
+
+    // Somebody else, with the state and nothing else, fetching the callback --
+    // three times, in case the first was the one that counted.
+    for _ in 0..3 {
+        assert_eq!(visit(front, &path).await.status, 400);
+    }
+
+    fake.stage_id_token(signed(&claims(&fake.base(), &query["nonce"]), Some(KID)));
+    let back = visit_with(front, &path, &sent_away.live_cookies()).await;
+
+    assert_eq!(
+        back.status, 302,
+        "a stranger who knew the state ended somebody else's sign-in without holding the cookie \
+         it needed: {}",
+        back.body
+    );
+}
+
+// ------------------------------------------------------ what reaches the log
+
+/// Everything this test binary logs, so that a test can read back the lines the
+/// front end wrote. Other tests in this file write into it at the same time, so
+/// every assertion below is written to be about *this* test's own lines and no
+/// others.
+static WRITTEN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+#[derive(Clone)]
+struct Captured;
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        WRITTEN.lock().unwrap().extend_from_slice(buf);
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        Captured
+    }
+}
+
+/// The same subscriber `main.rs` installs, writing into `WRITTEN` instead of
+/// standard error. It has to be this one: what the two tests below are about is
+/// how the fmt layer *renders* a field, and a different layer would render it
+/// differently.
+fn capture_logs() {
+    static ONCE: Once = Once::new();
+
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("mediacore_front=info"))
+            .with_writer(Captured)
+            .with_ansi(false)
+            .try_init();
+    });
+}
+
+fn logged() -> String {
+    String::from_utf8_lossy(&WRITTEN.lock().unwrap()).into_owned()
+}
+
+/// The whole sequence needs no account and no provider: `GET /` for a state and
+/// a matching login cookie, then a callback carrying an `error` of your
+/// choosing. `%0a` decodes to a real newline, and a field written with `%` goes
+/// into the line as it came -- so the log grew a second line, in this process's
+/// own format, saying somebody had been signed in as `admin`.
+#[tokio::test]
+async fn nothing_a_callback_carries_can_write_a_line_of_the_log() {
+    capture_logs();
+
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    let sent_away = visit(front, "/").await;
+    let authorize = Url::parse(&sent_away.header("location").expect("a location")).unwrap();
+    let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+
+    // A date no real line in this run can carry, so that a line beginning with
+    // it is this test's forgery and nobody else's.
+    let forged = "access_denied\n1999-01-01T00:00:00Z  INFO mediacore_front::auth: signed \
+                  somebody in subject=admin roles=9";
+
+    let refused = visit_with(
+        front,
+        &format!(
+            "/auth/callback?state={}&error={}",
+            query["state"],
+            urlencoded(forged)
+        ),
+        &sent_away.live_cookies(),
+    )
+    .await;
+    assert_eq!(refused.status, 403);
+
+    let written = logged();
+    for line in written.lines() {
+        assert!(
+            !line.starts_with("1999-01-01T00:00:00Z"),
+            "an unauthenticated visitor wrote a line of this process's log, and it reads as one \
+             this binary wrote: {line}"
+        );
+    }
+    assert!(
+        written.contains("access_denied"),
+        "the reason the provider gave stopped being logged at all, which is the other way to get \
+         this wrong"
+    );
+}
+
+/// The same parameter, as long as a request will carry. A log line is a record
+/// somebody has to read and something has to store, and neither of those is the
+/// visitor's to decide the size of.
+#[tokio::test]
+async fn a_log_line_carries_a_bounded_amount_of_somebody_elses_text() {
+    capture_logs();
+
+    let fake = fake_provider().await;
+    let front = front_signing_in_against(&fake.base()).await;
+
+    let sent_away = visit(front, "/").await;
+    let authorize = Url::parse(&sent_away.header("location").expect("a location")).unwrap();
+    let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+
+    // A count, not `MAX_LOGGED_CHARS`: an assertion written against the
+    // constant it is testing agrees with any value that constant is given,
+    // including a million.
+    const SENT: usize = 2000;
+
+    let refused = visit_with(
+        front,
+        &format!(
+            "/auth/callback?state={}&error={}",
+            query["state"],
+            "z".repeat(SENT)
+        ),
+        &sent_away.live_cookies(),
+    )
+    .await;
+    assert_eq!(refused.status, 403);
+
+    let ours: Vec<_> = logged()
+        .lines()
+        .filter(|line| line.contains("zzzzzzzzzz"))
+        .map(str::to_owned)
+        .collect();
+
+    assert_eq!(
+        ours.len(),
+        1,
+        "expected exactly one log line about this callback, found {}",
+        ours.len()
+    );
+    for line in ours {
+        assert!(
+            line.chars().count() < SENT,
+            "a visitor sent {SENT} characters of `error` and the line they were written into is \
+             {} characters long, so how much a log holds is theirs to decide",
+            line.chars().count()
+        );
+        assert!(
+            line.ends_with('…'),
+            "the value was cut and the line does not say so, so it reads as all there was: {line}"
+        );
+    }
+
+    const {
+        assert!(
+            MAX_LOGGED_CHARS < SENT,
+            "the ceiling is no longer below what this test sends, so it proves nothing"
+        )
+    };
+}
+
+// ------------------------------------- what a hostile provider cannot do next
+
+/// OpenID Connect core 3.1.3.7 step 5: an `azp` that is present has to be this
+/// client, whatever `aud` says. Checking it only when there was more than one
+/// audience left a token carrying `aud: <us>` and `azp: <somebody else>`
+/// accepted -- a token the provider minted for another client and addressed to
+/// us, which is a statement about that client's sign-in and not about ours.
+#[tokio::test]
+async fn an_id_token_naming_another_party_is_refused_however_many_audiences_it_has() {
+    let mut claims = claims("https://sso.example.test", "a-nonce");
+    claims["azp"] = json!("the-ticketing-system");
+    let token = signed(&claims, Some(KID));
+
+    let refused = validate_id_token(
+        &token,
+        &published_keys(KID),
+        &expected("https://sso.example.test", "a-nonce"),
+    )
+    .expect_err("a token whose `azp` names another client");
+
+    assert!(
+        matches!(refused, IdTokenError::WrongParty),
+        "`azp` was only checked when the token carried several audiences, got {refused}"
+    );
+
+    // And the same token with `azp` naming us is what a provider that sets the
+    // claim at all actually sends, so it has to keep working.
+    let mut ours = self::claims("https://sso.example.test", "a-nonce");
+    ours["azp"] = json!(CLIENT_ID);
+    assert!(
+        validate_id_token(
+            &signed(&ours, Some(KID)),
+            &published_keys(KID),
+            &expected("https://sso.example.test", "a-nonce"),
+        )
+        .is_ok(),
+        "a token whose `azp` is this client was refused, so every provider that sets the claim \
+         signs nobody in"
+    );
+}
+
+/// The three endpoints this cannot work without were checked for being URLs and
+/// the two optional ones were not -- and those two are the ones that produce a
+/// browser redirect and an outbound request carrying an access token.
+#[tokio::test]
+async fn a_provider_that_describes_a_door_as_something_that_is_not_a_url_is_refused() {
+    for door in ["userinfo_endpoint", "end_session_endpoint"] {
+        let fake = fake_provider().await;
+        {
+            let mut staged = fake.staged.lock().unwrap();
+            match door {
+                "userinfo_endpoint" => {
+                    staged.userinfo_endpoint = Some("javascript:alert(1)".to_owned());
+                }
+                _ => staged.end_session_endpoint = Some("javascript:alert(1)".to_owned()),
+            }
+        }
+
+        let front = front_signing_in_against(&fake.base()).await;
+        let answer = visit(front, "/").await;
+
+        assert_eq!(
+            answer.status, 503,
+            "a document describing its `{door}` as `javascript:` was taken as a description of a \
+             provider, and the other four values were taken from it too"
+        );
+        assert!(
+            answer.header("location").is_none(),
+            "somebody was sent to a provider whose own document does not parse: {:?}",
+            answer.header("location")
+        );
+    }
 }
 
 fn urlencoded(value: &str) -> String {

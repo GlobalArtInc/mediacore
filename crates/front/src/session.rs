@@ -47,9 +47,21 @@ use sha2::{Digest, Sha256};
 /// cookie for `.example.com` -- can plant a session cookie on this one.
 pub const SESSION_COOKIE: &str = "__Host-mediacore_session";
 
-/// One cookie per sign-in in flight, named after the login it belongs to, so
-/// two tabs signing in at once do not overwrite each other's proof.
-pub const LOGIN_COOKIE_PREFIX: &str = "__Host-mediacore_login_";
+/// One cookie per **browser**, not one per sign-in in flight.
+///
+/// It used to carry the `state` in its name, which read well -- two tabs
+/// signing in at once each held their own proof -- and was a way for a browser
+/// to end up holding hundreds of cookies for this origin: every signed-out page
+/// load left a differently named one alive for ten minutes, and nothing but a
+/// matching callback ever cleared one. Abandoned sign-ins, crawlers and
+/// prefetches piled up on their own, and `<img src="https://host/r/a">` on any
+/// page anywhere planted them deliberately, until the jar evicted cookies that
+/// mattered or the `Cookie` header outgrew what a proxy in front would accept.
+///
+/// One name means a browser holds one, however many times it loads the page.
+/// Two tabs signing in at once therefore share a secret, which costs nothing:
+/// what the cookie proves is *which browser*, and it is the same browser.
+pub const LOGIN_COOKIE: &str = "__Host-mediacore_login";
 
 /// How long a sign-in may take. Long enough to find a password manager and a
 /// second factor, short enough that a login left open in a tab is not a
@@ -59,11 +71,22 @@ pub const LOGIN_TTL: Duration = Duration::from_secs(600);
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
 /// A sign-in in flight is 200 bytes and lives ten minutes, and starting one
-/// costs an unauthenticated `GET /`. That is a slow leak rather than a fast
-/// one, but it is still a leak, so it has a ceiling: past this many the oldest
-/// are dropped, which costs whoever owned them one more press of Join and
-/// costs this process nothing.
-const MAX_PENDING_LOGINS: usize = 4096;
+/// costs an unauthenticated `GET /`. That is a leak, so it has a ceiling --
+/// and what happens *at* the ceiling is the whole of the decision.
+///
+/// This used to drop the oldest entry to make room. The oldest entry is not the
+/// most abandoned one; it is the one that has been waiting longest at the
+/// provider, which is to say the person currently typing a password. Four
+/// thousand `GET /`s take under a second from one host, so anybody could
+/// evict any sign-in in flight, and a sustained stream made signing in
+/// impossible for everybody rather than for the person flooding.
+///
+/// So a full map refuses the newcomer instead. Somebody who arrives during a
+/// flood is told to try again in a moment, which is survivable; somebody
+/// halfway through signing in is not interrupted, which is the part that was
+/// not. Nothing an unauthenticated request does can reach an entry that is
+/// already there.
+pub const MAX_PENDING_LOGINS: usize = 4096;
 
 const TOKEN_BYTES: usize = 32;
 
@@ -142,10 +165,27 @@ pub struct Identity {
     pub id_token: String,
 }
 
+/// Why a callback was not allowed to finish a sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotFinished {
+    /// No live login of that name: never issued here, already spent, or ten
+    /// minutes old.
+    Unknown,
+    /// The login is there and this is not the browser that started it. **It is
+    /// left where it is**: a callback that fails this check has redeemed no
+    /// code and spent nothing, and the person it belongs to is still at the
+    /// provider with the same `state` in their address bar.
+    WrongBrowser,
+}
+
 #[derive(Default)]
 struct Store {
     logins: HashMap<String, Login>,
     sessions: HashMap<String, Session>,
+    /// Whether the "no room for another sign-in" line has already been written
+    /// for this episode. One line per episode and not one per request: a flood
+    /// is exactly the moment not to write five thousand log lines a second.
+    said_it_is_full: bool,
 }
 
 pub struct Sessions {
@@ -188,50 +228,108 @@ impl Sessions {
         self.ttl
     }
 
-    /// Remembers a sign-in and answers with the `state` that names it. The
-    /// state is 256 random bits: it is what comes back in the callback's query
-    /// string, so it has to be unguessable and it has to be safe in a URL.
-    pub fn start_login(&self, login: Login) -> String {
-        let state = random_token();
+    /// Remembers a sign-in in flight under the `state` that will name it in the
+    /// callback, and says whether there was room.
+    ///
+    /// The `state` is the caller's rather than this method's because the
+    /// redirect to the provider is built *before* anything is remembered: a
+    /// provider that cannot be reached should not leave behind a login nobody
+    /// can ever finish, holding one of the four thousand places for the next
+    /// ten minutes.
+    ///
+    /// `false` means the map is full, and the caller has to say so to the
+    /// person rather than push somebody else out -- see [`MAX_PENDING_LOGINS`]
+    /// for why that is the trade.
+    pub fn start_login(&self, state: &str, login: Login) -> bool {
         let Ok(mut store) = self.store.lock() else {
-            return state;
+            return false;
+        };
+
+        // Only when it matters. Sweeping the whole map on every request is an
+        // O(n) walk paid for by the flood it is meant to survive; the entries
+        // that ran out are checked again at `finish_login` anyway, so leaving
+        // them lying about below the ceiling costs nothing but memory that is
+        // already accounted for.
+        if store.logins.len() >= MAX_PENDING_LOGINS {
+            let now = Instant::now();
+            store.logins.retain(|_, login| login.expires_at > now);
+        }
+
+        if store.logins.len() >= MAX_PENDING_LOGINS {
+            if !store.said_it_is_full {
+                store.said_it_is_full = true;
+                tracing::warn!(
+                    pending = store.logins.len(),
+                    "more sign-ins are in flight than this process will hold, so nobody new can \
+                     start one until some of them run out"
+                );
+            }
+
+            return false;
+        }
+
+        store.said_it_is_full = false;
+        store.logins.insert(state.to_owned(), login);
+
+        true
+    }
+
+    /// Takes the login this `state` names, *once*, and only for a browser that
+    /// can show what the sign-in started with.
+    ///
+    /// The order is the point, and `proved` is a closure rather than a second
+    /// call so that both happen under one lock. Spending the login first and
+    /// checking the browser afterwards -- which is what this did -- meant that
+    /// anybody who learned an in-flight `state` could end that sign-in without
+    /// holding anything at all, and a `state` is not a secret: it is in the
+    /// address bar while the provider's page is open, and in the provider's
+    /// access log for ever.
+    ///
+    /// Taking it once is still the whole of the protection against a code being
+    /// redeemed twice: a callback replayed from a history entry or a kept link
+    /// finds nothing the second time.
+    pub fn finish_login(
+        &self,
+        state: &str,
+        proved: impl FnOnce(&Login) -> bool,
+    ) -> Result<Login, NotFinished> {
+        let Ok(mut store) = self.store.lock() else {
+            return Err(NotFinished::Unknown);
+        };
+
+        let Some(login) = store.logins.get(state) else {
+            return Err(NotFinished::Unknown);
+        };
+        if login.expires_at <= Instant::now() {
+            store.logins.remove(state);
+
+            return Err(NotFinished::Unknown);
+        }
+        if !proved(login) {
+            return Err(NotFinished::WrongBrowser);
+        }
+
+        store.logins.remove(state).ok_or(NotFinished::Unknown)
+    }
+
+    /// Whether some other sign-in in flight is still relying on this browser's
+    /// secret.
+    ///
+    /// One cookie per browser means the callback cannot simply clear it when it
+    /// is done: the other tab may be at the provider with a login of its own
+    /// whose proof is that same secret. A lock this cannot take answers "yes",
+    /// because a cookie left to run out its ten minutes is a smaller harm than
+    /// a sign-in that cannot be finished.
+    pub fn another_login_in(&self, browser: &str) -> bool {
+        let Ok(store) = self.store.lock() else {
+            return true;
         };
 
         let now = Instant::now();
-        store.logins.retain(|_, login| login.expires_at > now);
-
-        if store.logins.len() >= MAX_PENDING_LOGINS {
-            // Oldest first, because the oldest is the one most likely to have
-            // been abandoned. Dropping the *new* one would let a flood lock
-            // out the people arriving during it.
-            let oldest = store
-                .logins
-                .iter()
-                .min_by_key(|(_, login)| login.expires_at)
-                .map(|(state, _)| state.clone());
-
-            if let Some(oldest) = oldest {
-                tracing::warn!(
-                    pending = store.logins.len(),
-                    "more sign-ins are in flight than this process keeps, dropping the oldest"
-                );
-                store.logins.remove(&oldest);
-            }
-        }
-
-        store.logins.insert(state.clone(), login);
-        state
-    }
-
-    /// Takes the login this `state` names, and takes it *once*. A callback
-    /// replayed -- from a history entry, from a link somebody kept -- finds
-    /// nothing the second time, which is the whole of the protection against a
-    /// code being redeemed twice.
-    pub fn finish_login(&self, state: &str) -> Option<Login> {
-        let mut store = self.store.lock().ok()?;
-        let login = store.logins.remove(state)?;
-
-        (login.expires_at > Instant::now()).then_some(login)
+        store
+            .logins
+            .values()
+            .any(|login| login.expires_at > now && login.browser == browser)
     }
 
     /// Opens a session and answers with the cookie value for it: the id, a
@@ -407,26 +505,19 @@ pub fn spent_session_cookie() -> String {
     session_cookie("", 0)
 }
 
-pub fn login_cookie_name(state: &str) -> String {
-    format!("{LOGIN_COOKIE_PREFIX}{state}")
-}
-
 /// The proof that the callback comes back to the browser the login left from.
-/// `Path=/` because `__Host-` demands it; the name carries the state, so it is
-/// still one cookie per sign-in.
-pub fn login_cookie(state: &str, secret: &str) -> String {
+/// `Path=/` because `__Host-` demands it; one name, for the reasons on
+/// [`LOGIN_COOKIE`]. Setting it again with the secret the browser already holds
+/// is how the ten minutes are restarted for a browser that is signing in again.
+pub fn login_cookie(secret: &str) -> String {
     format!(
-        "{}={secret}; Max-Age={}; Path=/; HttpOnly; Secure; SameSite=Lax",
-        login_cookie_name(state),
+        "{LOGIN_COOKIE}={secret}; Max-Age={}; Path=/; HttpOnly; Secure; SameSite=Lax",
         LOGIN_TTL.as_secs()
     )
 }
 
-pub fn spent_login_cookie(state: &str) -> String {
-    format!(
-        "{}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax",
-        login_cookie_name(state)
-    )
+pub fn spent_login_cookie() -> String {
+    format!("{LOGIN_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax")
 }
 
 #[cfg(test)]
@@ -542,6 +633,25 @@ mod tests {
         );
     }
 
+    /// A login in flight, started the way [`crate::auth::start_sign_in`] does.
+    fn started(sessions: &Sessions, going_to: &str, browser: &str) -> String {
+        let state = random_token();
+        assert!(
+            sessions.start_login(
+                &state,
+                Login::new(
+                    going_to.to_owned(),
+                    random_token(),
+                    random_token(),
+                    fingerprint(browser),
+                ),
+            ),
+            "there was no room for a sign-in in an empty store"
+        );
+
+        state
+    }
+
     /// The callback spends the login. A second callback carrying the same
     /// `state` -- a reload, a back button, somebody's copy of the link -- finds
     /// nothing, and the authorization code it carries can never be redeemed
@@ -549,20 +659,25 @@ mod tests {
     #[test]
     fn a_login_can_only_be_finished_once() {
         let sessions = sessions();
-        let state = sessions.start_login(Login::new(
-            "/r/standup".to_owned(),
-            "a-nonce".to_owned(),
-            "a-verifier".to_owned(),
-            fingerprint("the-cookie"),
-        ));
+        let state = random_token();
+        sessions.start_login(
+            &state,
+            Login::new(
+                "/r/standup".to_owned(),
+                "a-nonce".to_owned(),
+                "a-verifier".to_owned(),
+                fingerprint("the-cookie"),
+            ),
+        );
 
         let login = sessions
-            .finish_login(&state)
+            .finish_login(&state, |_| true)
             .expect("the login just started");
         assert_eq!(login.return_to, "/r/standup");
         assert_eq!(login.nonce, "a-nonce");
-        assert!(
-            sessions.finish_login(&state).is_none(),
+        assert_eq!(
+            sessions.finish_login(&state, |_| true).err(),
+            Some(NotFinished::Unknown),
             "the same state finished a login twice, so a code could be redeemed twice"
         );
     }
@@ -570,67 +685,116 @@ mod tests {
     #[test]
     fn a_state_this_process_never_issued_finishes_nothing() {
         let sessions = sessions();
-        sessions.start_login(Login::new(
-            "/".to_owned(),
-            "a-nonce".to_owned(),
-            "a-verifier".to_owned(),
-            fingerprint("the-cookie"),
-        ));
+        started(&sessions, "/", "the-cookie");
 
-        assert!(sessions.finish_login(&random_token()).is_none());
-        assert!(sessions.finish_login("").is_none());
+        assert_eq!(
+            sessions.finish_login(&random_token(), |_| true).err(),
+            Some(NotFinished::Unknown)
+        );
+        assert_eq!(
+            sessions.finish_login("", |_| true).err(),
+            Some(NotFinished::Unknown)
+        );
     }
 
+    /// The `state` is not a secret: it is in the address bar while the
+    /// provider's page is open, and in the provider's access log afterwards. A
+    /// callback that fails the browser check has redeemed nothing, so it must
+    /// leave the sign-in exactly where it found it -- otherwise anybody who
+    /// read a `state` anywhere can end that sign-in by fetching one URL.
+    #[test]
+    fn a_callback_that_cannot_prove_the_browser_leaves_the_sign_in_standing() {
+        let sessions = sessions();
+        let state = started(&sessions, "/r/standup", "the-cookie");
+
+        assert_eq!(
+            sessions.finish_login(&state, |_| false).err(),
+            Some(NotFinished::WrongBrowser)
+        );
+        assert_eq!(
+            sessions
+                .finish_login(&state, |login| login.browser == fingerprint("the-cookie"))
+                .map(|login| login.return_to),
+            Ok("/r/standup".to_owned()),
+            "somebody who knew nothing but the state ended a sign-in they could not finish"
+        );
+    }
+
+    /// Two tabs, one browser. They keep their own `state`, their own nonce and
+    /// their own room, and they share the one login cookie -- which is what the
+    /// cookie is for: it says *which browser*, and there is one browser here.
     #[test]
     fn two_sign_ins_at_once_do_not_stand_on_each_other() {
         let sessions = sessions();
-        let first = sessions.start_login(Login::new(
-            "/r/standup".to_owned(),
-            "nonce-one".to_owned(),
-            "verifier-one".to_owned(),
-            fingerprint("cookie-one"),
-        ));
-        let second = sessions.start_login(Login::new(
-            "/r/retro".to_owned(),
-            "nonce-two".to_owned(),
-            "verifier-two".to_owned(),
-            fingerprint("cookie-two"),
-        ));
+        let first = started(&sessions, "/r/standup", "one-browser");
+        let second = started(&sessions, "/r/retro", "one-browser");
 
         assert_ne!(first, second);
         assert_eq!(
-            sessions.finish_login(&second).unwrap().return_to,
-            "/r/retro"
+            sessions
+                .finish_login(&second, |_| true)
+                .map(|login| login.return_to),
+            Ok("/r/retro".to_owned())
+        );
+        assert!(
+            sessions.another_login_in(&fingerprint("one-browser")),
+            "the second tab's callback would have cleared the login cookie the first tab still \
+             has to prove itself with"
         );
         assert_eq!(
-            sessions.finish_login(&first).unwrap().return_to,
-            "/r/standup",
+            sessions
+                .finish_login(&first, |_| true)
+                .map(|login| login.return_to),
+            Ok("/r/standup".to_owned()),
             "a second tab signing in threw away the first tab's room"
         );
-
-        assert_ne!(
-            login_cookie_name(&first),
-            login_cookie_name(&second),
-            "two sign-ins at once share a cookie name, so the second overwrites the first's proof"
+        assert!(
+            !sessions.another_login_in(&fingerprint("one-browser")),
+            "the login cookie would be left standing with nothing left to prove"
         );
     }
 
+    /// The flood, at the store: four thousand sign-ins nobody will ever finish,
+    /// started by somebody with no account and no cookie, while one real person
+    /// is at the provider typing a password. Dropping the oldest to make room
+    /// dropped exactly that person, because the oldest entry is the one that
+    /// has been waiting longest -- so a newcomer is refused instead.
     #[test]
-    fn a_login_that_was_never_finished_does_not_pile_up_for_ever() {
+    fn a_flood_of_sign_ins_does_not_throw_out_the_one_somebody_is_in_the_middle_of() {
         let sessions = sessions();
+        let victim = started(&sessions, "/r/standup", "the-victims-browser");
+
+        let mut refused = 0;
         for _ in 0..(MAX_PENDING_LOGINS + 16) {
-            sessions.start_login(Login::new(
+            let flood = Login::new(
                 "/".to_owned(),
                 random_token(),
                 random_token(),
-                fingerprint("the-cookie"),
-            ));
+                fingerprint(&random_token()),
+            );
+            if !sessions.start_login(&random_token(), flood) {
+                refused += 1;
+            }
         }
+
+        assert!(
+            refused >= 16,
+            "{refused} of the flood were refused, so the ceiling let the map grow past it"
+        );
 
         let pending = sessions.store.lock().unwrap().logins.len();
         assert!(
             pending <= MAX_PENDING_LOGINS,
             "{pending} sign-ins are in flight, which is more than this process said it would keep"
+        );
+
+        assert!(
+            sessions
+                .finish_login(&victim, |login| login.browser
+                    == fingerprint("the-victims-browser"))
+                .is_ok(),
+            "a flood of anonymous page loads threw out the sign-in somebody was in the middle of, \
+             so nobody can sign in while it lasts"
         );
     }
 
@@ -703,8 +867,31 @@ mod tests {
         );
 
         assert!(spent_session_cookie().contains("Max-Age=0"));
-        assert!(login_cookie("a-state", "a-secret").contains("HttpOnly; Secure; SameSite=Lax"));
-        assert!(spent_login_cookie("a-state").contains("Max-Age=0"));
+        assert!(login_cookie("a-secret").contains("HttpOnly; Secure; SameSite=Lax"));
+        assert!(spent_login_cookie().contains("Max-Age=0"));
+    }
+
+    /// One name, whatever the sign-in. The old one carried the `state`, so a
+    /// browser that loaded the page a hundred times held a hundred cookies for
+    /// ten minutes each -- and anything that could make a browser fetch this
+    /// origin could plant them by the hundred.
+    #[test]
+    fn a_browser_can_only_ever_hold_one_login_cookie() {
+        let one = login_cookie("a-secret");
+        let another = login_cookie("a-different-secret");
+
+        let name = |cookie: &str| cookie.split('=').next().unwrap().to_owned();
+        assert_eq!(
+            name(&one),
+            name(&another),
+            "two sign-ins left two cookies, so a browser collects one per page load: {one}"
+        );
+        assert_eq!(name(&one), LOGIN_COOKIE);
+        assert_eq!(name(&spent_login_cookie()), LOGIN_COOKIE);
+        assert!(
+            one.starts_with("__Host-"),
+            "the login cookie lost its `__Host-` prefix, so a sibling host can set one: {one}"
+        );
     }
 
     #[test]

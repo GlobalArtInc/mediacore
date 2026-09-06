@@ -34,8 +34,8 @@
 //!     because the classic forgery is to name a symmetric algorithm and get a
 //!     validator to verify an RSA public key against itself as an HMAC secret
 //!   * `iss`, against the configured issuer
-//!   * `aud`, against this client id -- with `azp` checked too when the token
-//!     is addressed to more than one audience
+//!   * `aud`, against this client id -- and `azp` against it too whenever the
+//!     token carries one, not only when it is addressed to several audiences
 //!   * `exp`, with a minute of leeway for clock skew
 //!   * `nonce`, against the one *this* sign-in issued, compared whole
 //!
@@ -59,6 +59,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use url::{Origin, Url};
 
+use crate::log::quoted;
 use crate::name::{MAX_NAME_CHARS, clean_name};
 use crate::session::{Identity, Login, same_secret};
 
@@ -478,11 +479,16 @@ pub fn validate_id_token(
         })?
         .claims;
 
-    // A token addressed to several audiences has to say which of them asked for
-    // it, and it has to be us. OpenID Connect core 3.1.3.7, and the check that
-    // stops a token minted for another client on the same provider being
-    // presented here.
-    if strings_in(&raw.aud).len() > 1 && raw.azp.as_deref() != Some(expected.audience) {
+    // OpenID Connect core 3.1.3.7, both halves of it. A token addressed to
+    // several audiences has to say which of them asked for it (step 4), and an
+    // `azp` that is there at all has to be us (step 5) -- whatever `aud` says.
+    // The second half used to be conditional on the first, which left a token
+    // carrying `aud: <us>` and `azp: <somebody else>` accepted: it is a token
+    // the provider minted for another client and merely addressed to us, and
+    // whether that is possible is the provider's business rather than a thing
+    // to assume.
+    let party = raw.azp.as_deref();
+    if (party.is_some() || strings_in(&raw.aud).len() > 1) && party != Some(expected.audience) {
         return Err(IdTokenError::WrongParty);
     }
 
@@ -587,7 +593,7 @@ impl Provider {
             Err(error) => match self.discovery.read().await.as_ref() {
                 Some(stale) => {
                     tracing::warn!(
-                        %error,
+                        error = %quoted(&error),
                         "the identity provider's configuration could not be refreshed, carrying \
                          on with the copy this process already has"
                     );
@@ -620,11 +626,28 @@ impl Provider {
             });
         }
 
+        // Every door in the document, including the two that are optional.
+        // Those two are the ones that most wanted checking: `end_session` is
+        // put in a `Location` a browser follows, and `userinfo` is fetched with
+        // an access token in the header. A document that describes one of its
+        // own doors as `javascript:` or as `not a url` is either broken or
+        // hostile, and neither is a document to take the other four values
+        // from -- so one bad endpoint refuses the whole thing rather than being
+        // quietly dropped.
         for (what, endpoint) in [
-            ("authorization endpoint", &found.authorization_endpoint),
-            ("token endpoint", &found.token_endpoint),
-            ("jwks uri", &found.jwks_uri),
+            (
+                "authorization endpoint",
+                Some(&found.authorization_endpoint),
+            ),
+            ("token endpoint", Some(&found.token_endpoint)),
+            ("jwks uri", Some(&found.jwks_uri)),
+            ("userinfo endpoint", found.userinfo_endpoint.as_ref()),
+            ("end session endpoint", found.end_session_endpoint.as_ref()),
         ] {
+            let Some(endpoint) = endpoint else {
+                continue;
+            };
+
             if web_url(endpoint).is_none() {
                 return Err(ProviderError::NotAUrl {
                     what,
@@ -669,7 +692,7 @@ impl Provider {
             Err(error) => match self.keys.read().await.as_ref() {
                 Some(stale) => {
                     tracing::warn!(
-                        %error,
+                        error = %quoted(&error),
                         "the identity provider's signing keys could not be refreshed, carrying on \
                          with the ones this process already has"
                     );
@@ -715,7 +738,10 @@ impl Provider {
         let keys = self.signing_keys(false).await?;
         let person = match validate_id_token(&id_token, &keys, &expected) {
             Err(IdTokenError::UnknownKey(kid)) => {
-                tracing::info!(%kid, "the id token names a signing key this process has not seen");
+                tracing::info!(
+                    kid = %quoted(&kid),
+                    "the id token names a signing key this process has not seen"
+                );
                 let keys = self.signing_keys(true).await?;
 
                 validate_id_token(&id_token, &keys, &expected)?
@@ -757,7 +783,7 @@ impl Provider {
             Ok(fetched) => fetched,
             Err(error) => {
                 tracing::warn!(
-                    %error,
+                    error = %quoted(&error),
                     "the provider would not say more about who signed in, going with what the id \
                      token carried"
                 );
@@ -845,7 +871,7 @@ impl Provider {
 /// a DNS name that does not resolve are the same thing to whoever is looking at
 /// the page; the distinction is in the log, where `error` carries the original.
 fn unreachable_provider(error: reqwest::Error) -> ProviderError {
-    tracing::warn!(%error, "the identity provider could not be reached");
+    tracing::warn!(error = %quoted(&error), "the identity provider could not be reached");
 
     ProviderError::Unreachable
 }
@@ -867,7 +893,7 @@ async fn read<T: serde::de::DeserializeOwned>(
     }
 
     response.json().await.map_err(|error| {
-        tracing::warn!(%error, "the identity provider's {what} could not be read");
+        tracing::warn!(error = %quoted(&error), "the identity provider's {what} could not be read");
 
         ProviderError::Unreadable(what)
     })
