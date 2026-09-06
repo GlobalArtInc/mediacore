@@ -2,4 +2,11 @@
 *.log
 .DS_Store
 config.yaml
+# Where `cargo run` with the shipped sample puts its session records: the
+# default `sessions.directory` is relative, so a checkout is where they land.
+/sessions
+# And where the outbox lands if somebody points a local run at a webhook
+# endpoint: `events.directory` is relative by default too. Nothing creates it
+# until a destination is configured.
+/events
 deploy/.env

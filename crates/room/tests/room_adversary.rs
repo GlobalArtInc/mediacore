@@ -3,8 +3,39 @@
 //! first; they assert the fixed behaviour now, and the messages say what a
 //! person loses when one of them goes red again.
 
+use std::ops::Deref;
+use std::sync::Arc;
+
+use mediacore_events::Bus;
 use mediacore_proto::mediacore;
 use mediacore_room::*;
+use mediacore_session::SessionStore;
+
+/// A registry with a session store of its own, and a directory that goes when
+/// the test does. Every registry records what happens in its rooms somewhere,
+/// so there is no registry without one.
+struct Harness {
+    registry: Registry,
+    _records: tempfile::TempDir,
+}
+
+impl Deref for Harness {
+    type Target = Registry;
+
+    fn deref(&self) -> &Registry {
+        &self.registry
+    }
+}
+
+fn registry(defaults: RoomDefaults) -> Harness {
+    let records = tempfile::TempDir::new().expect("a directory for session records");
+    let sessions = SessionStore::open(records.path()).expect("an empty session store opens");
+
+    Harness {
+        registry: Registry::new(defaults, Arc::new(sessions), Arc::new(Bus::new())),
+        _records: records,
+    }
+}
 
 fn spec(identity: &str) -> ParticipantSpec {
     ParticipantSpec {
@@ -53,7 +84,7 @@ fn policy_metadata() -> RoomOptions {
 /// which is the whole reason the sweep has a clock of its own.
 #[test]
 fn a_grace_that_runs_out_on_an_empty_room_does_not_wait_for_the_next_person() {
-    let registry = Registry::new(RoomDefaults::default());
+    let registry = registry(RoomDefaults::default());
     let room = registry.create("meeting", policy_metadata(), Adoption::Always);
 
     let (alice_tx, _alice_rx) = signal_channel();
@@ -108,7 +139,7 @@ fn a_grace_that_runs_out_on_an_empty_room_does_not_wait_for_the_next_person() {
 /// destroyed under the people in it by a rule that no longer exists.
 #[test]
 fn switching_the_session_policy_off_calls_the_countdown_off() {
-    let registry = Registry::new(RoomDefaults::default());
+    let registry = registry(RoomDefaults::default());
     let room = registry.create("meeting", policy_metadata(), Adoption::Always);
 
     let (alice_tx, mut alice_rx) = signal_channel();
@@ -121,7 +152,7 @@ fn switching_the_session_policy_off_calls_the_countdown_off() {
 
     // The backoffice decides the meeting is open ended after all and sends
     // `{"sessionPolicy":{"minHumans":0}}` through UpdateRoomMetadata.
-    room.set_session_policy(Some(0), None);
+    registry.set_session_policy(&room, Some(0), None);
     assert_eq!(room.settings().min_humans, 0);
     assert_eq!(
         room.session_ends_at_ms(),
@@ -144,7 +175,7 @@ fn switching_the_session_policy_off_calls_the_countdown_off() {
 /// participant from its roster on a `DISCONNECTED` update and on nothing else.
 #[test]
 fn a_participant_hidden_by_the_api_leaves_everybody_elses_roster() {
-    let registry = Registry::new(RoomDefaults::default());
+    let registry = registry(RoomDefaults::default());
     let (alice_tx, mut alice_rx) = signal_channel();
     let (bob_tx, mut bob_rx) = signal_channel();
     let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
@@ -202,7 +233,7 @@ fn a_participant_hidden_by_the_api_leaves_everybody_elses_roster() {
 /// called the same thing.
 #[test]
 fn a_token_for_bob_cannot_seize_the_session_of_the_person_called_bob_hash_7() {
-    let registry = Registry::new(RoomDefaults::default());
+    let registry = registry(RoomDefaults::default());
 
     // Two different people, both named by the backoffice, both legitimate.
     let (victim_tx, mut victim_rx) = signal_channel();
@@ -246,7 +277,7 @@ fn a_token_for_bob_cannot_seize_the_session_of_the_person_called_bob_hash_7() {
 /// the person the backoffice called `bob#7`.
 #[test]
 fn removing_bob_does_not_reach_the_person_called_bob_hash_7() {
-    let registry = Registry::new(RoomDefaults::default());
+    let registry = registry(RoomDefaults::default());
     let (first_tx, _first_rx) = signal_channel();
     let (second_tx, _second_rx) = signal_channel();
     let (victim_tx, _victim_rx) = signal_channel();

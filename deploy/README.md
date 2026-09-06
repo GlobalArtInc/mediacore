@@ -204,6 +204,47 @@ every Try-it-out comes back 404 with an HTML body rather than a Twirp error,
 `/twirp` is not on 5400 either — the request reached the front end, which has no
 such path, and the two halves are not one origin after all.
 
+### The volumes this release adds
+
+The server now keeps a record of every meeting — one JSON file per meeting,
+read back at `/api/rooms/<room>/sessions`, `/api/rooms/<room>/session` and
+`/api/sessions/<id>`. They are written under `sessions.directory`, which
+`mediacore.yaml.template` sets to `/var/lib/mediacore/sessions`, and
+`docker-compose.yml` mounts a named `sessions` volume there. Using the compose
+file in this repository, `docker compose up -d --build` creates it and there is
+nothing to do.
+
+**A deployment whose compose file is not in this repository has to add that
+volume itself**, or every meeting it records goes with the container on the next
+release — which is the one failure this feature exists to prevent. The image
+creates the directory owned by the user the server runs as, so a *named* volume
+mounted over it inherits that ownership and works; a bind mount from a host
+directory does not, and the directory has to be `chown 10001:10001` first. The
+server refuses to start when it cannot write there, deliberately: one that
+answers with an empty history because it never opened its own directory is a
+failure nobody discovers until they are asked what happened at a meeting last
+week.
+
+Nothing prunes it. One small file per meeting, so
+`find /var/lib/mediacore/sessions -name '*.json' -mtime +90 -delete` is the
+whole of a retention policy for whoever wants one, and costs nothing to whoever
+does not.
+
+The second volume is `events`, at `/var/lib/mediacore/events`: the outbox of
+events promised to a webhook endpoint or a broker and not yet taken by one. It
+stays empty until `events.webhooks.urls` or `events.kafka.brokers` names
+somebody, and it does not need pruning — a record exists only while an event is
+in a queue, and the queue is bounded, so the directory is bounded with it. The
+same ownership rule applies: a named volume inherits the image's ownership and
+works, a bind mount wants `chown 10001:10001` first, and the server refuses to
+start when it cannot write there.
+
+**A deployment that adds webhooks without adding that volume loses exactly the
+events its endpoint was away for**, which is the one thing the outbox is there
+to prevent. Everything announced is also recorded, so what is lost is the
+notification and never the fact: the meeting is still under
+`/api/rooms/<room>/sessions`.
+
 ## TLS without a domain
 
 This is the part that goes wrong, and the shape of the answer matters more than

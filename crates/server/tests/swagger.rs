@@ -26,6 +26,10 @@ async fn spawn_server() -> SocketAddr {
     config.rtc.port_range_start = 0;
     config.rtc.port_range_end = 0;
     config.rtc.bind_address = "127.0.0.1".to_owned();
+    // A directory of this server's own for session records: a test must
+    // never write into the tree, and two servers sharing a store would
+    // read each other's meetings back.
+    config.sessions.directory = tempfile::TempDir::new().unwrap().keep();
 
     let state = AppState::start(config).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -521,6 +525,52 @@ async fn the_grant_the_page_names_is_the_grant_the_server_asks_for() {
             );
         }
     }
+}
+
+/// The session endpoints are not Twirp and not generated from a descriptor,
+/// so nothing else would notice if the page and the router drifted apart. This
+/// is the half that watches the page; `tests/sessions.rs` calls every path in
+/// the same table and watches the server.
+#[tokio::test]
+async fn every_session_endpoint_is_on_the_page_with_a_grant_on_it() {
+    let addr = spawn_server().await;
+    let document = specification(addr).await;
+
+    for endpoint in mediacore_server::sessions::ENDPOINTS {
+        let operation = document["paths"][endpoint.path]["get"].clone();
+
+        assert!(
+            operation.is_object(),
+            "`GET {}` is served by this server and missing from the page, so the only place a \
+             caller could learn it exists is the source",
+            endpoint.path
+        );
+        assert_eq!(operation["operationId"], json!(endpoint.operation));
+        assert_eq!(
+            operation["security"],
+            json!([{ Grant::List.claim(): [] }, { Grant::Admin.claim(): [] }]),
+            "`{}` is documented without the grants it actually wants; a generated client sends \
+             no token and gets a 401 it cannot explain",
+            endpoint.path
+        );
+        assert!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"].is_object(),
+            "`{}` is documented with no successful answer, so nobody can tell what comes back",
+            endpoint.path
+        );
+
+        let parameters = operation["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{}` documents no path parameter", endpoint.path));
+        assert_eq!(parameters[0]["name"], json!(endpoint.parameter.0));
+        assert_eq!(parameters[0]["in"], json!("path"));
+    }
+
+    assert!(
+        document["components"]["schemas"]["session.Session"]["properties"]["participants"]
+            .is_object(),
+        "the page describes a meeting without saying who was at it"
+    );
 }
 
 #[tokio::test]

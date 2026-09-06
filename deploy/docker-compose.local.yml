@@ -43,6 +43,12 @@ services:
     volumes:
       - ./mediacore.yaml.template:/etc/mediacore/mediacore.yaml.template:ro
       - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
+      # The record of every meeting, kept outside the container so that
+      # rebuilding the image does not take the history with it.
+      - sessions:/var/lib/mediacore/sessions
+      # Events promised to somebody and not yet taken by them. Empty until a
+      # destination is configured.
+      - events:/var/lib/mediacore/events
     ports:
       # The browser talks to the SFU directly here: signalling on 7880 and
       # media on 7882. Both are bound to loopback only. With no Caddy in this
@@ -86,3 +92,7 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  sessions:
+  events:

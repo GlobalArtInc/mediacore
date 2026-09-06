@@ -19,6 +19,33 @@ room:
   departure_timeout: 20
   max_participants: 0
 
+sessions:
+  # One JSON file per meeting, read back at /api/rooms/<room>/sessions. On a
+  # volume, not in the image: the container is replaced on every release and
+  # anything written inside it goes with the old one. docker-compose.yml
+  # mounts the `sessions` volume here.
+  directory: /var/lib/mediacore/sessions
+
+events:
+  # Nothing is delivered anywhere until a destination is named here: no
+  # endpoint, no broker, no outbox directory and no task. What happens in a room
+  # is recorded either way, under sessions.directory above.
+  #
+  # To post webhooks, put the endpoints in urls and name the key that signs
+  # them. The shape and the signature are LiveKit's, so a receiver already
+  # taking LiveKit's webhooks takes these unchanged.
+  #
+  #   webhooks:
+  #     urls:
+  #       - https://backoffice.example/mediacore/events
+  #     api_key: "${MEDIACORE_API_KEY}"
+  #
+  # The outbox holds what has been promised and not yet taken. On a volume, not
+  # in the image: an endpoint that is away over a release would otherwise lose
+  # exactly the events it was away for. docker-compose.yml mounts the `events`
+  # volume here.
+  directory: /var/lib/mediacore/events
+
 twirp:
   # Also answer the room API at /twirp/livekit.RoomService/<Method>, which is
   # the path LiveKit's server SDKs build in generated code and cannot be

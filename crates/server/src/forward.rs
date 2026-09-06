@@ -1199,6 +1199,10 @@ mod tests {
         config.rtc.port_range_start = 0;
         config.rtc.port_range_end = 0;
         config.rtc.bind_address = "127.0.0.1".to_owned();
+        // A directory of this server's own for session records: a test must
+        // never write into the tree, and two servers sharing a store would
+        // read each other's meetings back.
+        config.sessions.directory = tempfile::TempDir::new().unwrap().keep();
 
         AppState::start(config)
             .await

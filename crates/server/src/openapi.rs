@@ -7,7 +7,9 @@ use prost_reflect::{
 use serde_json::{Map, Value, json};
 
 use crate::rooms::{self, Grant, Method, Support};
+use crate::sessions::{self, Answer, Endpoint};
 use crate::twirp::Code;
+use mediacore_session::{DEFAULT_PAGE, MAX_PAGE};
 
 /// The OpenAPI document for `mediacore.RoomService`, generated from the
 /// protobuf descriptors the build keeps.
@@ -48,6 +50,16 @@ const OPENAPI_VERSION: &str = "3.0.3";
 
 const SERVED_TAG: &str = "Room service";
 const REFUSED_TAG: &str = "Not implemented here";
+const SESSIONS_TAG: &str = "Sessions";
+
+/// The record of one meeting, and one stretch of somebody being at it.
+///
+/// The only two schemas on this page not read off the descriptors, because
+/// there is no protobuf behind them: LiveKit has no session record, so there
+/// is nothing to vendor and nothing to generate from. They are held against
+/// the real JSON by a test rather than by a descriptor.
+const SESSION_SCHEMA: &str = "session.Session";
+const ATTENDANCE_SCHEMA: &str = "session.Attendance";
 
 /// Twirp's error body, the shape every one of these methods fails in.
 const ERROR_SCHEMA: &str = "twirp.Error";
@@ -108,8 +120,14 @@ fn build() -> Value {
         );
     }
 
+    for endpoint in sessions::ENDPOINTS {
+        paths.insert(endpoint.path.to_owned(), session_path(endpoint));
+    }
+
     let mut components = schemas.finish();
     components.insert(ERROR_SCHEMA.to_owned(), error_schema());
+    components.insert(SESSION_SCHEMA.to_owned(), session_schema());
+    components.insert(ATTENDANCE_SCHEMA.to_owned(), attendance_schema());
 
     json!({
         "openapi": OPENAPI_VERSION,
@@ -132,6 +150,13 @@ fn build() -> Value {
                 "description":
                     "On the wire, and refused with `unimplemented` (501). Listed so that a \
                      caller reads why rather than guessing from a bare status.",
+            },
+            {
+                "name": SESSIONS_TAG,
+                "description":
+                    "What happened in a room, as opposed to what is happening in it. Plain \
+                     `GET`s, not Twirp: LiveKit has no session record, so there is no generated \
+                     client anywhere that would call these and nothing to be compatible with.",
             },
         ],
         "paths": Value::Object(paths),
@@ -427,6 +452,16 @@ fn preamble() -> String {
     );
 
     text.push_str(
+        "## What happened, as opposed to what is happening\n\n\
+         Three endpoints under **Sessions** below are not Twirp and not part of this service: \
+         plain `GET`s at `/api/rooms/<room>/sessions`, `/api/rooms/<room>/session` and \
+         `/api/sessions/<id>`. A *session* is one meeting; a *room* is the place it happened in, \
+         which outlives it and holds the next one. They are here because this page is where \
+         somebody integrating against this server looks, and an endpoint nobody can find is an \
+         endpoint nobody calls.\n\n",
+    );
+
+    text.push_str(
         "## Try it out is not a sandbox\n\n\
          Every button on this page sends a real call to the server that served the page. \
          `DeleteRoom` really deletes the room and hangs up on everybody in it. \
@@ -512,6 +547,221 @@ fn preamble() -> String {
     );
 
     text
+}
+
+/// One session endpoint, from the same table the router reads.
+fn session_path(endpoint: &Endpoint) -> Value {
+    let mut operation = Map::new();
+    operation.insert("operationId".to_owned(), json!(endpoint.operation));
+    operation.insert("summary".to_owned(), json!(endpoint.summary));
+    operation.insert(
+        "description".to_owned(),
+        json!(session_description(endpoint)),
+    );
+    operation.insert("tags".to_owned(), json!([SESSIONS_TAG]));
+    // Either grant, which is what a list of two requirements means in OpenAPI.
+    // `roomList` reads every room on the server; `roomAdmin` reads the one its
+    // token names.
+    operation.insert(
+        "security".to_owned(),
+        json!([
+            { Grant::List.claim(): [] },
+            { Grant::Admin.claim(): [] },
+        ]),
+    );
+    operation.insert("x-mediacore-implemented".to_owned(), json!(true));
+    let mut parameters = vec![json!({
+        "name": endpoint.parameter.0,
+        "in": "path",
+        "required": true,
+        "description": endpoint.parameter.1,
+        "schema": { "type": "string" },
+    })];
+    // Only the list pages, because only the list can be long. The other two
+    // answer with one meeting.
+    if endpoint.answer == Answer::List {
+        parameters.push(json!({
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": format!(
+                "How many meetings this page holds. {DEFAULT_PAGE} by default, {MAX_PAGE} at \
+                 most; a larger number is capped rather than refused."
+            ),
+            "schema": { "type": "integer", "minimum": 1, "maximum": MAX_PAGE, "default": DEFAULT_PAGE },
+        }));
+        parameters.push(json!({
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description":
+                "How many meetings to skip, counting back from the most recent. Read `total` off \
+                 the answer to know when there are no more.",
+            "schema": { "type": "integer", "minimum": 0, "default": 0 },
+        }));
+    }
+    operation.insert("parameters".to_owned(), json!(parameters));
+
+    let mut responses = Map::new();
+    responses.insert(
+        "200".to_owned(),
+        json!({
+            "description": session_answer_description(endpoint.answer),
+            "content": { "application/json": { "schema": session_answer(endpoint.answer) } },
+        }),
+    );
+    responses.insert("401".to_owned(), failure(&[Code::Unauthenticated]));
+    if endpoint.answer == Answer::One {
+        responses.insert("404".to_owned(), failure(&[Code::NotFound]));
+    } else {
+        responses.insert("403".to_owned(), failure(&[Code::PermissionDenied]));
+    }
+    responses.insert("500".to_owned(), failure(&[Code::Internal]));
+    operation.insert("responses".to_owned(), Value::Object(responses));
+
+    json!({ "get": Value::Object(operation) })
+}
+
+fn session_description(endpoint: &Endpoint) -> String {
+    let scope = match endpoint.answer {
+        Answer::One => {
+            "**Grant:** `roomList`, or `roomAdmin` whose `room` claim is the room the meeting              happened in. A meeting the token may not read answers `not_found`, identically to              an id that names nothing, so this cannot be used to find out which meetings exist              elsewhere."
+        }
+        _ => {
+            "**Grant:** `roomList`, or `roomAdmin` whose `room` claim is the room in the path.              Anything else is `permission_denied`."
+        }
+    };
+
+    format!(
+        "{}\n\n{scope}\n\nTimes are milliseconds since the epoch, as JSON numbers. This reads          the record rather than the registry, so a room that no longer exists still answers for          the meetings it held.",
+        endpoint.description
+    )
+}
+
+fn session_answer(answer: Answer) -> Value {
+    let session = json!({ "$ref": format!("#/components/schemas/{SESSION_SCHEMA}") });
+
+    match answer {
+        Answer::List => json!({
+            "type": "object",
+            "required": ["sessions", "total"],
+            "properties": {
+                "sessions": { "type": "array", "items": session },
+                "total": {
+                    "type": "integer",
+                    "description":
+                        "How many meetings the room has held altogether, of which this page is a \
+                         part.",
+                },
+            },
+        }),
+        Answer::Perhaps => json!({
+            "type": "object",
+            "required": ["session"],
+            "properties": { "session": { "nullable": true, "allOf": [session] } },
+        }),
+        Answer::One => json!({
+            "type": "object",
+            "required": ["session"],
+            "properties": { "session": session },
+        }),
+    }
+}
+
+fn session_answer_description(answer: Answer) -> &'static str {
+    match answer {
+        Answer::List => {
+            "One page of the room's meetings, newest first, with `total` saying how many                          there were. An empty list for a room that has never held one."
+        }
+        Answer::Perhaps => {
+            "The meeting running now, or `null`. No meeting is an answer and not a                             failure, so this is 200 either way."
+        }
+        Answer::One => "The meeting.",
+    }
+}
+
+fn session_schema() -> Value {
+    json!({
+        "type": "object",
+        "title": "Session",
+        "description":
+            "One meeting held in one room. A room created over the room service outlives its              meetings and holds many; a room that exists only because somebody walked into it is              gone when they leave, and its meeting is still recorded. The room is named rather              than identified by sid, because a meeting that survives a blink spans two rooms with              two sids and one name.",
+        "required": ["id", "room", "startedAtMs", "participants"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description":
+                    "`SE_` and twelve hex digits. What a recording or a transcript hangs off                      later, because those belong to a meeting and not to a room.",
+            },
+            "room": { "type": "string", "description": "The room's name." },
+            "startedAtMs": {
+                "type": "integer",
+                "format": "int64",
+                "description":
+                    "When the room reached the number of people it needs -- one, unless the room                      carries a `sessionPolicy` asking for more.",
+            },
+            "endedAtMs": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description":
+                    "When the meeting ended, or null while it is running. A meeting ends when the                      room falls below its floor and the grace period runs out, which is why this                      can be later than the last person's `leftAtMs`.",
+            },
+            "endedBy": {
+                "type": "string",
+                "nullable": true,
+                "enum": ["grace", "closed", "restart"],
+                "description":
+                    "`grace`: nobody came back before the grace period ran out, the ordinary end                      of a meeting. `closed`: the room was deleted under it. `restart`: the server                      was still holding this meeting when it stopped, so `endedAtMs` is the last                      moment the record knows about rather than when the meeting really ended.",
+            },
+            "participants": {
+                "type": "array",
+                "items": { "$ref": format!("#/components/schemas/{ATTENDANCE_SCHEMA}") },
+                "description":
+                    "Every stretch of attendance, oldest first. One entry per stretch and not per                      person: somebody who dropped out and came back is two.",
+            },
+        },
+    })
+}
+
+fn attendance_schema() -> Value {
+    json!({
+        "type": "object",
+        "title": "Attendance",
+        "description": "One stretch of one connection being at one meeting.",
+        "required": ["sid", "identity", "kind", "joinedAtMs"],
+        "properties": {
+            "sid": {
+                "type": "string",
+                "description":
+                    "The connection, as `PA_` and twelve hex digits -- the same sid the roster                      and the server log carry.",
+            },
+            "identity": {
+                "type": "string",
+                "description":
+                    "The identity the room used, suffix included: a person's second connection is                      `alice#2`.",
+            },
+            "name": { "type": "string", "description": "The display name, or empty." },
+            "kind": {
+                "type": "string",
+                "enum": ["standard", "egress", "agent"],
+                "description":
+                    "A person, a recorder or a bot. Only `standard` counts towards the number of                      people a room needs, which is why a room of recorders is not a meeting.",
+            },
+            "joinedAtMs": {
+                "type": "integer",
+                "format": "int64",
+                "description":
+                    "When they arrived. Can be earlier than `startedAtMs`: the first person into                      a room with a floor of two was waiting for the second.",
+            },
+            "leftAtMs": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description": "When they left, or null while they are still here.",
+            },
+        },
+    })
 }
 
 fn error_schema() -> Value {

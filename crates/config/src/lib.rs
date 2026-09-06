@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -22,6 +22,12 @@ pub const DEFAULT_SWEEP_INTERVAL_MS: u32 = 1_000;
 pub const DEFAULT_BWE_RECOVERY_STEP_MS: u32 = 1_000;
 pub const DEFAULT_BWE_QUEUE_PRESSURE_MS: u32 = 150;
 pub const DEFAULT_BWE_MAX_OVERRUN_PERCENT: u32 = 150;
+pub const DEFAULT_EVENT_QUEUE: u32 = 10_000;
+pub const DEFAULT_EVENT_ATTEMPTS: u32 = 5;
+pub const DEFAULT_EVENT_TIMEOUT_MS: u32 = 5_000;
+pub const DEFAULT_EVENT_BACKOFF_MS: u32 = 1_000;
+pub const DEFAULT_EVENT_MAX_BACKOFF_MS: u32 = 30_000;
+pub const DEFAULT_KAFKA_TOPIC: &str = "mediacore";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -36,6 +42,126 @@ pub struct Config {
     pub rtc: RtcConfig,
     pub video: VideoConfig,
     pub twirp: TwirpConfig,
+    pub sessions: SessionConfig,
+    pub events: EventConfig,
+}
+
+/// Who is told what happened, and how hard this server tries to tell them.
+///
+/// Nothing in here is on by default: with no webhook endpoint and no broker
+/// there are no destinations, no outbox directory is made and no task is
+/// started. The record of every meeting is kept either way, which is what
+/// makes it safe for this whole block to be absent -- an event is a
+/// notification that something changed and never the only copy of it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventConfig {
+    /// The outbox: one JSON file per event that has been promised to a
+    /// destination and not yet taken by it.
+    ///
+    /// Created at start, and only when there is a destination to deliver to.
+    /// The server refuses to start if it cannot be created, for the same
+    /// reason the session directory does: a deployment that believes it has an
+    /// outbox and has not got one finds out during the outage it was for.
+    ///
+    /// Relative paths are relative to the working directory. In a container
+    /// name a path on a volume, or a restart during an outage loses exactly
+    /// the events the outbox was holding for it.
+    pub directory: PathBuf,
+
+    /// How many events one destination may fall behind before the next one is
+    /// thrown away rather than queued.
+    ///
+    /// This is the bound on two things at once: what an unreachable endpoint
+    /// costs in memory, and how large the outbox can grow, since a record
+    /// exists exactly while an event is in a queue. A destination this far
+    /// behind is not going to catch up, and filling a disk on its behalf would
+    /// take the server down with it -- so the loss is bounded, counted on
+    /// `/healthz`, and named in a log line.
+    pub queue: u32,
+
+    /// How many times one event is offered to one destination before this
+    /// server stops asking. At least one; the first offer is an attempt.
+    pub attempts: u32,
+
+    /// How long a single attempt may take, whether that is an endpoint that
+    /// accepts a connection and says nothing or a broker that is not there.
+    pub timeout_ms: u32,
+
+    /// The wait before the second attempt. It doubles after that, up to
+    /// `max_backoff_ms` -- the cap matters more than the doubling, because
+    /// without one an endpoint that came back a moment ago waits out a delay
+    /// measured in minutes.
+    pub backoff_ms: u32,
+    pub max_backoff_ms: u32,
+
+    pub webhooks: WebhookConfig,
+    pub kafka: KafkaConfig,
+}
+
+/// Events posted to somebody else's HTTP endpoint, in LiveKit's shape and with
+/// LiveKit's signing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Every one of these gets every event, each with a queue and a worker of
+    /// its own, so a slow endpoint delays only itself.
+    pub urls: Vec<String>,
+
+    /// Which of this server's `keys` signs the requests. The receiver reads
+    /// the key name out of the token and looks up the matching secret, exactly
+    /// as LiveKit's receiver does, so this has to be a key that is actually
+    /// configured -- and the server refuses to start if it is not, rather than
+    /// signing every webhook with nothing and having them all rejected.
+    pub api_key: String,
+}
+
+/// Events produced onto a Kafka topic.
+///
+/// Reading this block needs the `kafka` feature, which is off by default. A
+/// broker named on a build without it is refused at startup: a bus that is
+/// silently not being fed is the failure this whole subsystem exists to avoid.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KafkaConfig {
+    /// `host:port` pairs, comma separated. Empty means no broker, which is the
+    /// default and which builds no destination at all.
+    pub brokers: String,
+    pub topic: String,
+
+    /// Anything else librdkafka takes, passed through unread: `security.protocol`,
+    /// `ssl.ca.location`, `sasl.*` and the rest of a real deployment's
+    /// connection. Naming each of them here would mean a release of this
+    /// server every time a broker wanted a setting nobody had thought of.
+    pub properties: HashMap<String, String>,
+}
+
+/// Where the record of what happened in a room is kept.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// The directory holding one JSON file per meeting.
+    ///
+    /// Created at start if it is not there, and the server refuses to start if
+    /// it cannot be created or read. That is deliberate: a server that answers
+    /// `/api/rooms/<room>/sessions` with an empty list because it silently
+    /// failed to open its own directory is worse than one that will not start,
+    /// because nobody finds out until they are asked what happened at a
+    /// meeting last week.
+    ///
+    /// The default is relative, so `cargo run` in a checkout writes into the
+    /// checkout. A deployment names an absolute path on a volume that outlives
+    /// the container; a path inside the image is a path whose contents go with
+    /// the next release.
+    pub directory: PathBuf,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("sessions"),
+        }
+    }
 }
 
 /// How the room API answers, as distinct from what it does.
@@ -238,7 +364,126 @@ impl Default for Config {
             rtc: RtcConfig::default(),
             video: VideoConfig::default(),
             twirp: TwirpConfig::default(),
+            sessions: SessionConfig::default(),
+            events: EventConfig::default(),
         }
+    }
+}
+
+impl Default for EventConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("events"),
+            queue: DEFAULT_EVENT_QUEUE,
+            attempts: DEFAULT_EVENT_ATTEMPTS,
+            timeout_ms: DEFAULT_EVENT_TIMEOUT_MS,
+            backoff_ms: DEFAULT_EVENT_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_EVENT_MAX_BACKOFF_MS,
+            webhooks: WebhookConfig::default(),
+            kafka: KafkaConfig::default(),
+        }
+    }
+}
+
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        Self {
+            brokers: String::new(),
+            topic: DEFAULT_KAFKA_TOPIC.to_owned(),
+            properties: HashMap::new(),
+        }
+    }
+}
+
+impl EventConfig {
+    /// Whether anything outside this process is waiting to be told.
+    ///
+    /// Nothing is started and no directory is made when this is false, so a
+    /// deployment that has not asked for events does not grow one.
+    pub fn has_destinations(&self) -> bool {
+        !self.webhooks.urls.is_empty() || !self.kafka.brokers.trim().is_empty()
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.into())
+    }
+
+    pub fn backoff(&self) -> Duration {
+        Duration::from_millis(self.backoff_ms.into())
+    }
+
+    pub fn max_backoff(&self) -> Duration {
+        Duration::from_millis(self.max_backoff_ms.into())
+    }
+
+    fn validate(&self, keys: &HashMap<String, String>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.attempts > 0,
+            "events.attempts must be at least 1; the first offer is an attempt, and zero of them \
+             is a destination that is configured and never written to"
+        );
+        anyhow::ensure!(self.queue > 0, "events.queue must be at least 1");
+        anyhow::ensure!(
+            self.timeout_ms > 0,
+            "events.timeout_ms must not be zero; an attempt with no time to complete in never \
+             completes"
+        );
+        anyhow::ensure!(
+            self.max_backoff_ms >= self.backoff_ms,
+            "events.max_backoff_ms must not be below events.backoff_ms"
+        );
+
+        if self.has_destinations() {
+            anyhow::ensure!(
+                !self.directory.as_os_str().is_empty(),
+                "events.directory must name a directory; without an outbox an endpoint that is \
+                 away for two minutes costs two minutes of events and nothing says so"
+            );
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for url in &self.webhooks.urls {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "events.webhooks.urls entry `{url}` is not an http or https url"
+            );
+            // A destination is named by its url, and the outbox strikes a
+            // record off when every name that owed it has settled. Two
+            // entries with one name are one name: the first worker to finish
+            // deletes the record out from under the second, so a crash after
+            // that loses the event for an endpoint that never saw it, with no
+            // counter and no line. Refused here because there is no shape of
+            // this that a deployment wanted -- it is a copied line in a config
+            // file, and the second copy delivers nothing the first does not.
+            anyhow::ensure!(
+                seen.insert(url.as_str()),
+                "events.webhooks.urls names `{url}` twice; one url is one destination, so the \
+                 second copy would deliver nothing and would cost the first its outbox record"
+            );
+        }
+
+        if !self.webhooks.urls.is_empty() {
+            anyhow::ensure!(
+                !self.webhooks.api_key.is_empty(),
+                "events.webhooks.api_key must name one of the configured keys; a webhook signed \
+                 with nothing is rejected by every receiver"
+            );
+            anyhow::ensure!(
+                keys.contains_key(&self.webhooks.api_key),
+                "events.webhooks.api_key `{}` is not one of the keys this server has, so every \
+                 webhook would be signed with a secret nobody can check",
+                self.webhooks.api_key
+            );
+        }
+
+        if !self.kafka.brokers.trim().is_empty() {
+            anyhow::ensure!(
+                !self.kafka.topic.trim().is_empty(),
+                "events.kafka.topic must be set when events.kafka.brokers is"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -295,8 +540,14 @@ impl Config {
             !self.bind_addresses.is_empty(),
             "at least one bind address is required"
         );
+        anyhow::ensure!(
+            !self.sessions.directory.as_os_str().is_empty(),
+            "sessions.directory must name a directory; there is nowhere else for a meeting record \
+             to go"
+        );
         self.rtc.validate()?;
         self.video.bwe.validate()?;
+        self.events.validate(&self.keys)?;
         Ok(())
     }
 }
@@ -451,6 +702,179 @@ mod tests {
     }
 
     #[test]
+    fn meetings_are_recorded_somewhere_whether_or_not_a_config_says_so() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+
+        assert_eq!(
+            config.sessions.directory,
+            PathBuf::from("sessions"),
+            "a deployment that upgrades without touching its config still has to keep a record of \
+             its meetings; there is no configuration that turns recording off"
+        );
+
+        let chosen =
+            Config::parse("keys:\n  key1: secret1\nsessions:\n  directory: /srv/meetings\n")
+                .unwrap();
+        assert_eq!(chosen.sessions.directory, PathBuf::from("/srv/meetings"));
+
+        assert!(
+            Config::parse("keys:\n  key1: secret1\nsessions:\n  directory: \"\"\n").is_err(),
+            "an empty directory is a server that starts and quietly records nothing"
+        );
+    }
+
+    #[test]
+    fn nobody_is_told_anything_until_a_destination_is_configured() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+
+        assert!(
+            !config.events.has_destinations(),
+            "an upgrade started posting webhooks nobody asked for, at urls nobody configured"
+        );
+        assert_eq!(config.events.queue, DEFAULT_EVENT_QUEUE);
+        assert_eq!(config.events.attempts, DEFAULT_EVENT_ATTEMPTS);
+        assert_eq!(config.events.directory, PathBuf::from("events"));
+        assert_eq!(config.events.kafka.topic, DEFAULT_KAFKA_TOPIC);
+        assert!(config.events.kafka.brokers.is_empty());
+    }
+
+    #[test]
+    fn the_webhook_block_is_configurable() {
+        let config = Config::parse(
+            "keys:\n  key1: secret1\nevents:\n  directory: /var/lib/mediacore/events\n  attempts: 3\n  \
+             webhooks:\n    api_key: key1\n    urls:\n      - https://example.test/hook\n",
+        )
+        .unwrap();
+
+        assert!(config.events.has_destinations());
+        assert_eq!(
+            config.events.webhooks.urls,
+            vec!["https://example.test/hook"]
+        );
+        assert_eq!(config.events.attempts, 3);
+        assert_eq!(
+            config.events.directory,
+            PathBuf::from("/var/lib/mediacore/events")
+        );
+        assert_eq!(
+            config.events.timeout(),
+            Duration::from_millis(DEFAULT_EVENT_TIMEOUT_MS.into()),
+            "the rest of the events block kept its defaults"
+        );
+    }
+
+    /// A webhook is signed with the secret belonging to the key named here,
+    /// and a receiver looks that key up to know which secret to check. Naming
+    /// a key this server does not have produces a token nobody can verify --
+    /// on every event, silently, until somebody reads the receiver's 401s.
+    #[test]
+    fn a_webhook_signed_by_a_key_this_server_does_not_have_is_refused_at_startup() {
+        assert!(
+            Config::parse(
+                "keys:\n  key1: secret1\nevents:\n  webhooks:\n    api_key: someone-elses-key\n    \
+                 urls:\n      - https://example.test/hook\n"
+            )
+            .is_err(),
+            "every webhook this server sent would be signed with an empty secret and rejected"
+        );
+        assert!(
+            Config::parse(
+                "keys:\n  key1: secret1\nevents:\n  webhooks:\n    urls:\n      - https://example.test/hook\n"
+            )
+            .is_err(),
+            "endpoints with no signing key named at all were accepted"
+        );
+        assert!(
+            Config::parse(
+                "keys:\n  key1: secret1\nevents:\n  webhooks:\n    api_key: key1\n    urls:\n      \
+                 - example.test/hook\n"
+            )
+            .is_err(),
+            "a url with no scheme is a url nothing will ever be posted to"
+        );
+    }
+
+    /// Finding I. A destination is named by its url, and the outbox strikes a
+    /// record off once every name that owed it has settled -- so two entries
+    /// with one name are one name, the first worker to finish deletes the
+    /// record while the second has not been tried, and a crash then loses that
+    /// event with nothing to say so.
+    #[test]
+    fn the_same_endpoint_cannot_be_named_twice() {
+        let duplicated = Config::parse(
+            "keys:\n  key1: secret1\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
+             api_key: key1\n    urls:\n      - https://example.test/hook\n      - \
+             https://example.test/hook\n",
+        );
+
+        assert!(
+            duplicated.is_err(),
+            "one url named twice is one destination that owes twice and settles once: the first \
+             worker to finish deletes the outbox record while the second endpoint has not been \
+             tried, and a crash there loses the event with no counter and no line"
+        );
+        assert!(
+            Config::parse(
+                "keys:\n  key1: secret1\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
+                 api_key: key1\n    urls:\n      - https://example.test/hook\n      - \
+                 https://example.test/other\n"
+            )
+            .is_ok(),
+            "two different endpoints are two destinations and always were"
+        );
+    }
+
+    #[test]
+    fn rejects_a_delivery_policy_that_delivers_nothing() {
+        assert!(
+            Config::parse("keys:\n  key1: secret1\nevents:\n  attempts: 0\n").is_err(),
+            "a destination configured to be offered an event zero times is a destination that is \
+             configured and never written to"
+        );
+        assert!(Config::parse("keys:\n  key1: secret1\nevents:\n  queue: 0\n").is_err());
+        assert!(Config::parse("keys:\n  key1: secret1\nevents:\n  timeout_ms: 0\n").is_err());
+        assert!(
+            Config::parse(
+                "keys:\n  key1: secret1\nevents:\n  backoff_ms: 5000\n  max_backoff_ms: 1000\n"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse("keys:\n  key1: secret1\nevents:\n  nope: 1\n").is_err(),
+            "a delivery setting this server does not have must not be read as one it does"
+        );
+    }
+
+    #[test]
+    fn a_broker_can_be_named_with_settings_of_its_own() {
+        let config = Config::parse(
+            "keys:\n  key1: secret1\nevents:\n  kafka:\n    brokers: kafka1:9093,kafka2:9093\n    \
+             topic: mediacore.events\n    properties:\n      security.protocol: ssl\n",
+        )
+        .unwrap();
+
+        assert!(config.events.has_destinations());
+        assert_eq!(config.events.kafka.topic, "mediacore.events");
+        assert_eq!(
+            config
+                .events
+                .kafka
+                .properties
+                .get("security.protocol")
+                .map(String::as_str),
+            Some("ssl"),
+            "a librdkafka setting was dropped, so a broker that needs tls is unreachable and the \
+             config that says otherwise parses"
+        );
+
+        assert!(
+            Config::parse("keys:\n  key1: secret1\nevents:\n  kafka:\n    brokers: kafka1:9093\n    topic: \"\"\n")
+                .is_err(),
+            "a broker with no topic is a producer with nowhere to produce to"
+        );
+    }
+
+    #[test]
     fn rejects_config_without_keys() {
         assert!(Config::parse("port: 8080\n").is_err());
     }
@@ -565,6 +989,11 @@ mod tests {
             "the sample must not ship a policy that ends rooms nobody asked it to end"
         );
         assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
+        assert!(
+            !config.events.has_destinations(),
+            "the sample ships a destination, so copying it starts posting somebody's meetings to \
+             an address they did not choose"
+        );
         assert!(
             !config.video.bwe.enabled,
             "the sample must not turn bandwidth estimation on before the bench has passed"

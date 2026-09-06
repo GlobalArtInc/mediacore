@@ -11,6 +11,12 @@ use tokio::task::JoinHandle;
 /// called. Two things have to happen when nobody does anything at all, and
 /// neither of them can hang off a participant's session:
 ///
+/// * A meeting's grace period runs out. Every meeting has one, whether or not
+///   the deployment configured a session policy: a room falls below the number
+///   of people it needs -- one, unless a policy asks for more -- and the
+///   meeting ends when nobody has come back. The room it happened in is
+///   usually already gone by then, thrown away with the last person to leave,
+///   so there is nothing else left that could notice.
 /// * A session policy runs out. The grace is armed by the departure that drops
 ///   the room below its floor, and the room can empty completely before it
 ///   expires. Driven from a signal session, the sweep then has nobody to run
@@ -49,7 +55,8 @@ impl Caretaker {
                     tracing::debug!(
                         ended = ?swept.ended,
                         closed = ?swept.closed,
-                        "the sweep took rooms away"
+                        sessions = ?swept.sessions,
+                        "the sweep ended meetings and took rooms away"
                     );
                 }
             }

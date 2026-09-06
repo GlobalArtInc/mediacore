@@ -13,11 +13,20 @@ path = "src/lib.rs"
 name = "mediacore"
 path = "src/main.rs"
 
+[features]
+# Produce events onto a Kafka topic as well. Off by default and not compiled
+# unless asked for: it links librdkafka into the binary and wants a C toolchain
+# in whatever builds it. A config that names a broker on a build without this
+# is refused at startup rather than quietly ignored.
+kafka = ["mediacore-events/kafka"]
+
 [dependencies]
 mediacore-auth.workspace = true
 mediacore-config.workspace = true
+mediacore-events.workspace = true
 mediacore-proto.workspace = true
 mediacore-room.workspace = true
+mediacore-session.workspace = true
 mediacore-sfu.workspace = true
 mediacore-transport.workspace = true
 
@@ -38,4 +47,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 mediacore-client.workspace = true
 
+tempfile.workspace = true
 tokio-tungstenite.workspace = true

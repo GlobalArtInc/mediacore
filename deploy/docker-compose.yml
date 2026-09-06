@@ -41,6 +41,18 @@ services:
     volumes:
       - ./mediacore.yaml.template:/etc/mediacore/mediacore.yaml.template:ro
       - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
+      # The record of every meeting this server has held. Outside the image on
+      # purpose: the container is replaced on every release, and a history that
+      # lives inside it is a history that ends at the last deploy. The path
+      # matches sessions.directory in mediacore.yaml.template.
+      - sessions:/var/lib/mediacore/sessions
+      # Events promised to a webhook endpoint or a broker and not yet taken by
+      # it. Outside the image for the same reason and a sharper one: an endpoint
+      # that is away over a release would otherwise lose exactly the events it
+      # was away for, which is the outage the outbox exists for. Empty and
+      # unused until events.webhooks.urls or events.kafka.brokers names
+      # somebody. The path matches events.directory in mediacore.yaml.template.
+      - events:/var/lib/mediacore/events
     ports:
       # Signalling reaches the SFU over the compose network; this mapping is for
       # the operator on the host, not for clients. It is now also the way to
@@ -133,3 +145,5 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  sessions:
+  events:

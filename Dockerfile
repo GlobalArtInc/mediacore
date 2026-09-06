@@ -33,6 +33,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gettext-base \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home --uid 10001 mediacore
+# Where the session records and the event outbox go, made in the image and owned
+# by the user the server runs as. Docker gives a named volume the ownership of the path it is
+# mounted over, so a volume mounted at a path the image does not have would be
+# root-owned and the server -- running as uid 10001 -- would refuse to start
+# because it cannot create its own directory. deploy/docker-compose.yml mounts
+# one here.
+RUN install -d -o mediacore -g mediacore /var/lib/mediacore/sessions \
+    && install -d -o mediacore -g mediacore /var/lib/mediacore/events
 COPY --from=builder /out/mediacore /out/mediacore-front /usr/local/bin/
 USER mediacore
 WORKDIR /home/mediacore

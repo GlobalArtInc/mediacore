@@ -790,7 +790,9 @@ fn update_room_metadata(
     let room = room_of(state, &request.room)?;
     let policy = SessionPolicy::read(&request.metadata);
 
-    room.set_session_policy(policy.min_humans, policy.end_grace);
+    state
+        .registry
+        .set_session_policy(&room, policy.min_humans, policy.end_grace);
     room.set_metadata(&request.metadata);
 
     Ok(room.to_proto())

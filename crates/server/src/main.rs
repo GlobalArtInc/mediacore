@@ -26,12 +26,21 @@ async fn main() -> anyhow::Result<()> {
     let node_id = config.node_id.clone();
     let state = AppState::start(config).await?;
     let ice = state.media.local_addr();
+    // Kept past the move into the router so that the stop below can wait for
+    // the records. Meeting records are written by a thread of their own rather
+    // than on the join path, so a process that exits without waiting loses
+    // whatever that thread had not reached -- which, at the end of a working
+    // day, is the end of every meeting still running.
+    let sessions = std::sync::Arc::clone(state.registry.sessions());
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!(%addr, %ice, %node_id, "mediacore is listening");
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(shutdown())
         .await?;
+
+    sessions.flush();
+    tracing::info!("every meeting record is on the disk");
 
     Ok(())
 }

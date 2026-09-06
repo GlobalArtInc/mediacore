@@ -1,5 +1,6 @@
 pub mod bandwidth;
 pub mod caretaker;
+pub mod events;
 pub mod forward;
 pub mod http;
 pub mod media;
@@ -7,6 +8,7 @@ pub mod openapi;
 pub mod peer;
 pub mod publisher;
 pub mod rooms;
+pub mod sessions;
 pub mod signal;
 pub mod simulcast;
 pub mod state;

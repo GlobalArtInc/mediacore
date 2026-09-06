@@ -1,0 +1,33 @@
+[package]
+name = "mediacore-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Off, and not compiled unless asked for. `rdkafka` links librdkafka into the
+# binary and pulls a C toolchain into the image that builds it; an operator who
+# does not run a bus should not pay for either. Everything else about events --
+# the emitter, the outbox, the webhooks -- is always there.
+kafka = ["dep:rdkafka"]
+
+[dependencies]
+mediacore-auth.workspace = true
+mediacore-proto.workspace = true
+mediacore-session.workspace = true
+
+base64.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+rdkafka = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

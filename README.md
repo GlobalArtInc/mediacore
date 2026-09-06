@@ -76,6 +76,40 @@ grace period is a promise to the people who were in the room, so a room counting
 idle: the twenty-second departure timeout does not collect it out from under a ninety-second grace.
 It ends when it said it would, and with nobody in it there is nobody to disconnect.
 
+**A meeting can be asked about after it has happened.** A room is a place; a session is a meeting
+held in it. A room created over the API outlives its meetings and holds one after another, and a room
+that exists only because somebody walked in goes when they leave — while what happened in it does
+not. A session starts when a room reaches the number of people it needs and ends when it falls below
+and the grace period runs out, and its record carries an id, the room, a start, an end and everybody
+who was there with the times they arrived and left. `GET /api/rooms/<room>/sessions`,
+`GET /api/rooms/<room>/session` and `GET /api/sessions/<id>` answer for it; see
+[Sessions](#sessions).
+
+None of that waits for an operator to opt in. With `room.min_humans: 0` — the default, and what the
+deployment runs — the policy is off and the floor is one person, so a meeting is still one stretch of
+a room being occupied, from the first person arriving to the room emptying. `room.end_grace` still
+applies to it, which is what makes somebody whose network blinked one meeting with a gap in it rather
+than two; `end_grace: 0` ends a meeting the instant its room empties, for a deployment that would
+rather have that.
+
+Records are on disk, one JSON file per meeting under `sessions.directory`, written as the meeting
+goes on rather than emitted once it is over. An event is a notification that state changed and never
+the only copy of the fact, so a consumer that was down at half past six has to be able to come back
+and ask what it missed — and records that live in memory die with the process and take that guarantee
+with them. What a restart costs is the *end* of a meeting that was still running: nobody observed it,
+so the record is closed at the last arrival or departure written into it and says
+`"endedBy": "restart"` rather than pretending to a time it does not know.
+
+**And it can be heard about as it happens.** Six events — `room_started`, `room_finished`,
+`participant_joined`, `participant_left`, `session_started` and `session_finished` — go to whoever
+has asked to be told: an emitter inside the process, webhooks in LiveKit's shape and with LiveKit's
+signing, and a Kafka topic behind a Cargo feature that is off by default. An event is written down
+before it is attempted and struck off only once every destination has taken it, so an endpoint that
+is away for two minutes costs latency rather than two minutes of events. Nothing about any of it is
+on the path somebody joining a room walks: emitting opens no file, makes no request and waits for
+nothing. Nothing is configured by default, either — with no endpoint and no broker there is no
+outbox, no task and no cost. See [Events](#events).
+
 One person can be in a room twice. `livekit-client` keys its remote participants by identity
 throughout, so two participants sharing one identity are invisible to every client, ours included;
 the server therefore gives the second connection an identity of its own — `alice`, `alice#2`,
@@ -588,6 +622,125 @@ again, so a policy can arrive after the room did; metadata carrying no policy le
 it is rather than silently dropping it. Nothing here reads `recordingEnabled`: recording is egress,
 and there is none yet.
 
+### Sessions
+
+A **session** is one meeting; a **room** is the place it happened in, which outlives it and holds the
+next one — so `/sessions` is plural on purpose. These three are plain `GET`s and not Twirp: LiveKit
+has no session record, so there is no generated client anywhere that would call them and nothing to
+be compatible with. They are on the `/swagger` page all the same, under **Sessions**, because that
+page is where somebody integrating against this server looks.
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/rooms/<room>/sessions` | `{"sessions": [ … ], "total": n}`, newest first, one page at a time; an empty list for a room that has never held one. |
+| `GET /api/rooms/<room>/session` | `{"session": { … }}` or `{"session": null}`. No meeting in progress is an answer and not a failure, so it is 200 either way and a poller has one case to handle. |
+| `GET /api/sessions/<id>` | `{"session": { … }}`, or `not_found` (404). |
+
+They read the record rather than the registry, so a room that no longer exists still answers for the
+meetings it held.
+
+**Grants.** `roomList` reads every meeting on this server: it already returns every room and the
+whole of every room record, metadata included, so a lock here would be a lock on a door with no wall.
+`roomAdmin` reads the meetings of the room its `room` claim names, which is what lets a backoffice
+hand out a token for one meeting and show that meeting's history without handing over the run of the
+server. `roomCreate` reads nothing — it makes rooms and deletes them, and has never been a way to
+look inside one, which is why `ListParticipants` refuses it too.
+
+A refusal on the two endpoints that name a room is `permission_denied` (403); the caller supplied the
+name, so being told they may not read it tells them nothing they did not know. A session the token
+may not read is `not_found` (404) instead, byte for byte the same answer as an id that names nothing,
+because telling a token scoped to one room that some id is real but forbidden is all it needs to walk
+the id space and learn who met where.
+
+**The list is paged.** `?limit=` (100 by default, 1000 at most; a larger number is capped rather than
+refused) and `?offset=`, counting back from the most recent, with `total` on every answer so a caller
+handed a full page knows whether there is another. A room a service has been making a meeting in
+every morning for two years holds thousands of them, and one response carrying all of them would be
+built by reading thousands of files with the lock that every arrival on this server also needs. The
+other two endpoints answer with one meeting and take no window.
+
+```
+$ curl -s -H "Authorization: Bearer $TOKEN" \
+    "http://127.0.0.1:7880/api/rooms/standup/sessions?limit=1"
+{"total":37,"sessions":[{
+  "id": "SE_3f9a1c04b7de",
+  "room": "standup",
+  "startedAtMs": 1757155200000,
+  "endedAtMs": 1757156740000,
+  "endedBy": "grace",
+  "participants": [
+    {"sid": "PA_a1b2c3d4e5f6", "identity": "alice", "name": "Alice", "kind": "standard",
+     "joinedAtMs": 1757155188000, "leftAtMs": 1757156650000},
+    {"sid": "PA_9f8e7d6c5b4a", "identity": "bob", "name": "Bob", "kind": "standard",
+     "joinedAtMs": 1757155200000, "leftAtMs": 1757156650000}
+  ]
+}]}
+```
+
+Times are milliseconds since the epoch, as JSON numbers — these bodies are ours and not protobuf's,
+so an `int64` is not wrapped in quotes here the way it is on the room service. One entry per
+**stretch** of attendance rather than per person: somebody who dropped out and came back is two
+entries, which is what makes the gap answerable at all, and one person's two tabs are two entries
+under `alice` and `alice#2`. `kind` is `standard`, `egress` or `agent`, and only `standard` counts
+towards the number of people a room needs — a recorder in the room does not make a meeting, and it is
+in the record anyway, because "was this meeting recorded" is a question somebody asks a month later.
+
+`joinedAtMs` can be earlier than `startedAtMs`: the first person into a room with a floor of two was
+waiting for the second, and how long they waited is worth knowing. It is never earlier than the
+previous meeting in that room ended, however long ago the connection actually arrived — a recorder
+that sat through both halves of a room's evening has one arrival time and two meetings to appear in,
+and carrying that one time into the second record would make its stretch cover the whole of the
+first. One `sid`'s stretches never overlap, in one record or across two, so adding them up is the
+thing it looks like it is. `endedAtMs` can be later than the
+last `leftAtMs` by the length of the grace period, which is the window in which the meeting was still
+theirs to come back to. `endedBy` is `grace` when nobody came back before it ran out — the ordinary
+end — `closed` when the room was deleted under it, and `restart` when the server was still holding
+the meeting when it stopped, in which case `endedAtMs` is the last moment the record knows about, a
+lower bound and never a guess above it.
+
+**Where they live.**
+
+```yaml
+sessions:
+  directory: /var/lib/mediacore/sessions
+```
+
+One file per meeting, named by its id, rewritten in place as the meeting goes on: flushed and then
+renamed over itself, so a reader — including the next start of this server — never sees half of one.
+The directory is created at start and the server refuses to start if it cannot be, because a server
+that answers with an empty list because it never managed to open its own directory is a failure
+nobody discovers until they are asked what happened last week. There is no setting that turns
+recording off. Nothing deletes a record either, and that is why the layout is one self-describing
+file per meeting rather than a database: `find /var/lib/mediacore/sessions -mtime +90 -delete` is a
+real answer for whoever wants a retention policy, and it costs nothing to whoever does not. In a
+container the directory belongs on a volume — `deploy/docker-compose.yml` mounts one — or the history
+ends at the last release.
+
+**Written by a thread of its own, and what that costs.** A membership change is recorded in memory
+and handed to a writer thread; nobody joining a room ever waits for a disk. What a *crash* costs on
+top of the usual is a freshness window the width of that hand-off: a record may come back missing its
+last few arrivals and departures, and a meeting that began inside the window may be missing
+altogether. It never comes back saying something that did not happen — each file is written whole,
+flushed and renamed, so a record on disk is always a state the meeting really passed through — and a
+`SIGINT` waits for the queue, so a planned stop loses nothing. The trade is deliberate and this way
+round: the flush used to happen on the thread that was letting somebody into a room, under a lock
+shared by every room on the server, so one busy disk delayed joining everywhere at once. Freshness
+measured in milliseconds is worth less than that.
+
+**What it costs in memory.** An index of every meeting — id, room, start — and the full record only
+of the meetings running, the ones waiting to be written, and the ones the disk refused. A record
+nobody is at is read back from its file when somebody asks for it, so a server two years into a
+deployment holds a few hundred thousand short strings rather than a few hundred thousand records.
+
+`/healthz` carries `sessions=`, `live_sessions=`, `resident_sessions=`, `owed_sessions=` and
+`unwritten_sessions=`. The last is the one worth an alert: a record that could not be written is
+still served from memory until the process ends and is gone after that, and there is nowhere else an
+operator would find out — it comes back down if a later write of the same record lands, so a disk
+that hiccuped once is not reported for ever as a meeting that is going to be lost. `owed_sessions=`
+is the freshness window: records recorded and not yet on the disk, normally zero, and however long it
+stays up is what a crash would cost. `resident_sessions=` is the memory bound above, and an operator
+watching it climb beside a flat `live_sessions=` is watching a leak.
+
 ### The page at `/swagger`
 
 Everything above is on the server itself, at `/swagger`, with a button next to every method.
@@ -657,6 +810,228 @@ paths in `crates/server/assets/swagger.html`, and the version and licence list i
 `NOTICE.txt`. `cargo test -p mediacore-server` fails if the version, the routes and the page disagree.
 
 
+## Events
+
+A record answers a question afterwards; an event is a notification that something changed. The two
+are not alternatives and the order between them is the whole design: **nothing announced here is
+ever the only copy of the fact**. An event to a consumer that was not listening is gone — that is
+what an event is — and the answer to that is not a cleverer delivery, it is that the meeting is still
+under `/api/rooms/<room>/sessions` and the room is still in `ListRooms` when the consumer comes back.
+Everything below is built on being allowed to fail, loudly, without losing anything.
+
+Six names. Four are LiveKit's, spelled the way LiveKit spells them:
+
+| Event | When |
+|---|---|
+| `room_started` | a room came into being: created over the API, or opened by the first person to walk in |
+| `room_finished` | a room went away: deleted, swept up empty, or thrown away with the last person to leave |
+| `participant_joined` | somebody is in a room |
+| `participant_left` | somebody is not, with LiveKit's `disconnectReason` on the participant |
+| `session_started` | a meeting began: the room reached the number of people it needs |
+| `session_finished` | a meeting ended: nobody came back before the grace period ran out, or the room was taken away under it |
+
+The last two are for the thing LiveKit has no concept of. A room is a place and a session is the
+meeting held in it, so `room_started` fires when the place is made — which for a room created the
+night before is not remotely when the meeting began. A hidden participant produces its events like
+anybody else: a recorder is invisible to the people in the room on purpose, and not to whoever is
+billing for the recording.
+
+### The shape on the wire
+
+LiveKit's `WebhookEvent`, as `protojson` writes it, posted with LiveKit's headers and LiveKit's
+signature — so a deployment already receiving LiveKit's webhooks receives these without touching its
+receiver.
+
+```
+POST /hook HTTP/1.1
+Content-Type: application/webhook+json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…
+
+{"event":"participant_joined",
+ "room":{"sid":"RM_hycBMAjmt6Ub","name":"standup","creationTime":"1757155200",…},
+ "participant":{"sid":"PA_a1b2c3d4e5f6","identity":"alice","name":"Alice",…},
+ "id":"EV_1f0c9a2b7d34","createdAt":"1757155200"}
+```
+
+The nested objects are serialised by the codecs `crates/proto` generates from the schema, so they are
+the same bytes the room service would answer with and cannot drift from them. `createdAt` is in whole
+seconds and quoted, because protobuf's JSON mapping sends an `int64` as a string and a generated
+LiveKit client refuses a number where it expects one — the same reason `creationTime` inside the room
+is quoted too. Fields at their default value are left out rather than sent as nulls, again because
+that is what `protojson` does.
+
+The token is a short-lived JWT signed with the API secret, carrying the base64 SHA-256 of the body in
+its `sha256` claim. A receiver verifies the signature to know the request came from this server and
+the digest to know the body it read is the body that was signed; without the second half the first
+half is a signature over nothing in particular. `events.webhooks.api_key` says which of the `keys`
+signs, because the receiver reads that name out of the token to know which secret to check — and a
+key this server does not have is refused at startup rather than producing requests nobody can verify.
+
+**Where this differs from LiveKit, and it is the only place.** A `session_started` or
+`session_finished` carries a `session` object, which LiveKit's message has no field for. A receiver
+built on `protojson.Unmarshal` without `DiscardUnknown` will refuse to parse those two — and they are
+two event names it has no case for anyway, so the extra field is only ever on the events such a
+receiver was going to ignore. The four it does know are byte for byte what its own server would have
+sent. The session events carry no `room`: a meeting outlives the room it happened in, so a `room`
+field would be present on some of them and absent on others, which is a worse contract than never
+having one. The room's name is inside the session, where it was true throughout.
+
+### Three deliveries
+
+**In process.** `Bus::listen` hands out a queue and every event goes into every queue. The queue is
+unbounded, so emitting never waits for a consumer and nothing is ever dropped in front of one — which
+is what a consumer inside this process needs and a network consumer cannot have. Recording will hang
+off this later: a session starts, files open; a session ends, files close and are composed. It is
+deliberately not a broadcast channel, because a broadcast channel that a consumer falls behind on
+drops the oldest events and hands it a number, and "the first ninety seconds are missing" is not a
+recording.
+
+**Webhooks.** One queue and one worker per URL, so a slow endpoint delays only itself. Each attempt
+is bounded by `events.timeout_ms`; a failure is retried `events.attempts` times with the wait
+doubling from `events.backoff_ms` up to `events.max_backoff_ms`, and after that the event is
+abandoned. Giving up is loud:
+
+```
+ERROR mediacore_events::delivery: an event was abandoned: nobody at this destination will hear
+about it. What it was announcing is still on this server — a meeting under /api/sessions/<id>, a
+room under ListRooms — and this line is the only notice that the announcement did not arrive
+event=EV_1f0c9a2b7d34 kind=participant_left room="standup"
+destination="https://backoffice.example/hook" attempts=5 reason="the endpoint answered 503"
+```
+
+Everything in that line that came from outside this process — the room's name, the endpoint, the
+reason — goes through the same quoting `crates/front/src/log.rs` uses, for the same reason: a room
+named with a newline in it would otherwise write a second line, and that second line reads as one
+this binary wrote. The line that says what went missing is the last one that should be forgeable.
+
+**Kafka**, behind a Cargo feature: `cargo build --features kafka -p mediacore-server`. Off and not
+compiled by default, because `rdkafka` links librdkafka into the binary and wants a C toolchain in
+whatever builds the image, and an operator who does not run a bus should pay for neither. A broker
+named in the config on a build without the feature is **refused at startup** rather than ignored: a
+bus that is silently not being fed is exactly the failure this is all for. The body is the same bytes
+the webhooks post — one shape, two transports — keyed by room name, so one room's events share a
+partition and are read in the order they happened. The producer is built without touching the
+network, so a server configured with a broker that is not there yet starts, stays quiet, and fails
+deliveries with a bounded timeout.
+
+### The outbox
+
+The part that is easy to skip and the reason the rest is worth building. Without it, an endpoint away
+for two minutes costs every event in those two minutes, nothing retries them because nothing
+remembers them, and no line anywhere says which ones they were.
+
+An event is written to `events.directory` — one JSON file, flushed and renamed into place — **before**
+the first attempt is made, and struck off only once every destination has taken it. A record names
+the destinations that still owe it, so a broker that was down does not cause an hour of redelivery to
+the webhook endpoint that took everything the first time.
+
+**What a restart does to what is in it.** Reads it, puts it back in the order the events were emitted
+in, and hands each one to the destinations that still owe it. An event may therefore arrive twice —
+once before the process died and again after, if it died between the endpoint answering and the
+record being struck off — which is why every event carries an `id` that never changes, LiveKit's own
+field, for a consumer that wants to throw the second one away. At least once, and never at most once.
+
+**What happens when it grows.** It cannot grow without bound. A record exists exactly while an event
+is in a destination's queue, and those queues are bounded by `events.queue`, so the directory holds at
+most `queue × destinations` files. When a queue is full the event is refused before it is recorded,
+counted, and named in a log line, and the next event that destination does take carries `numDropped`
+— LiveKit's field, LiveKit's meaning — so the consumer knows it has a hole rather than inferring one
+from a gap in the timestamps. That trade is deliberate: a destination ten thousand events behind is
+not going to catch up, and filling a disk on its behalf would take the server down with it.
+
+### Where it can lose, plainly
+
+* A destination that refuses every attempt is given up on. Counted in `undelivered_events`, named in
+  the log line above.
+* A destination too far behind to queue another event has that event thrown away. Same counter, its
+  own log line, and reported as `numDropped` on the next one it takes.
+* A crash in the window between an event being emitted and its outbox record being written loses that
+  event. The window is one hand-off and one file write wide, and it is the price of the write not
+  being on the join path.
+* An outbox record that could not be written at all — a full disk — is delivered anyway and counted in
+  `unwritten_events`. It will not be retried after a restart.
+* A power cut can lose the rename of the last record written. Each is flushed before the rename, so a
+  torn record is impossible, but the directory entry is left to the filesystem.
+
+**How much of a fact goes with the notification.** For `session_started` and `session_finished`, and
+for a `participant_joined` or `participant_left` that happened while a meeting was running, the
+answer is none: the meeting is under `/api/sessions/<id>` with everybody's arrival and departure in
+it, so a lost event costs a notification and nothing else. That is the whole reason the records exist
+first.
+
+It is not the answer for the other two, and this is worth knowing before a billing consumer is built
+on them. **A room's existence is recorded nowhere durable**: a `room_started` or `room_finished` that
+is dropped is the only copy of the fact, and a room created and deleted without a meeting in it
+leaves nothing behind at all. Nor is an arrival or a departure that happened while no meeting was
+running — which is every arrival before quorum under `min_humans ≥ 2`, and every recorder that joins
+an empty room. `ListRooms` answers for rooms that still exist and cannot answer for one that has
+gone. If those facts have to survive a consumer being away, they have to be counted from the
+meetings, or the consumer has to be one that does not lose events.
+
+### Nothing here sits on the hot path
+
+```
+Bus::emit ──▶ (unbounded) ──▶ dispatcher ──▶ outbox.record
+ no I/O                        one task           │
+ no waiting                                       ├─▶ (bounded) ─▶ webhook worker ─▶ settle
+                                                  └─▶ (bounded) ─▶ kafka worker   ─▶ settle
+```
+
+`Bus::emit` takes a lock, pushes a shared pointer into each listener's queue and returns. It opens no
+file, makes no request and never awaits, so it is safe to call from the middle of somebody joining a
+room — which is where it is called from. The two blocking calls in the whole pipeline, both of them
+the outbox flushing a file, go through `spawn_blocking`, so they land on the blocking pool rather than
+on a runtime thread that is also carrying somebody's media.
+
+The meeting record is the other thing on that path and it is off it too: `SessionStore` edits the
+record in memory under its lock and wakes a thread of its own to write it, so the `fsync` and the
+rename happen with no lock held and on nobody's join. `crates/session` measures that against this
+machine's own `sync_all` rather than against a number of milliseconds, because the question is how
+many disk flushes a caller waited for and the answer has to mean the same thing on an SSD and on a
+loaded CI box.
+
+`crates/server/tests/events.rs` is the test that would catch a regression: eight people join a real
+server over WebSockets while the only configured webhook endpoint accepts connections and answers
+nothing, with a five-second timeout and five attempts thirty seconds apart. Anything on the join path
+that waited for a delivery turns that from milliseconds into seconds.
+`crates/events/tests/delivery.rs` makes the same measurement on the emitter directly, and adds the
+rest: a request a LiveKit receiver can verify, an endpoint refusing until it is let go, an event
+still owed after the process that promised it has gone, and one destination that never answers not
+holding up the one that does.
+
+### Configuration
+
+```yaml
+events:
+  directory: /var/lib/mediacore/events
+  queue: 10000
+  attempts: 5
+  timeout_ms: 5000
+  backoff_ms: 1000
+  max_backoff_ms: 30000
+  webhooks:
+    urls:
+      - https://backoffice.example/mediacore/events
+    api_key: devkey
+  kafka:
+    brokers: kafka1:9093,kafka2:9093
+    topic: mediacore
+    properties:
+      security.protocol: ssl
+      ssl.ca.location: /etc/ssl/certs/kafka-ca.pem
+```
+
+`kafka.properties` is passed to librdkafka unread, which is where a real deployment's TLS and SASL
+live; naming each setting in this server's own config would mean a release every time a broker wanted
+one nobody had thought of. In a container `directory` belongs on a volume — `deploy/docker-compose.yml`
+mounts one — or a restart during an outage loses exactly the events the outbox was holding.
+
+`/healthz` carries four more fields. `events` is how many have been announced; `owed_events` is how
+many are written down and not yet taken, which sits above zero while a destination is behind and
+climbs while one is away; `undelivered_events` is how many nobody will ever get, and is the one worth
+an alert; `unwritten_events` is outbox records that could not be written, which is durability lost
+rather than delivery lost.
+
 ## Running
 
 ```
@@ -679,6 +1054,16 @@ starts from and any of them can be overridden per room by whoever creates it.
 `sweep_interval_ms` is how often the server looks at rooms nobody is doing anything to: it is the
 only clock the registry has, and both timeouts and the session policy are enforced from it, so
 turning it up is turning off the only thing that ends a room by itself.
+
+`sessions.directory` is where the record of every meeting is kept, one JSON file per meeting. It is
+created at start, the server refuses to start if it cannot be, and there is no value that turns
+recording off; in a container it belongs on a volume. See [Sessions](#sessions).
+
+The `events` block is who is told what happens as it happens: `webhooks.urls` and `kafka.brokers` are
+the destinations, `directory` is the outbox that holds what has been promised and not yet taken, and
+`queue`, `attempts`, `timeout_ms`, `backoff_ms` and `max_backoff_ms` are how hard this server tries
+before it gives up and says so. Nothing is started until a destination is named. See
+[Events](#events).
 
 `video.dynacast_pause_delay_ms` is how long a layer nobody wants is left running before the publisher
 is told to stop it, and `video.layer_upgrade_hold_ms` is how long a layer that re-appears must keep
@@ -707,14 +1092,18 @@ the interface holding the default route. A wildcard bind never advertises the wi
 Endpoints:
 
 - `GET /` — service name
-- `GET /healthz` — room, participant, RTP and forwarding counters, whether bandwidth estimation is
-  on and how many subscribers it is allocating for, and the ICE socket address
+- `GET /healthz` — room, participant, RTP and forwarding counters, how many meetings are recorded and
+  running, how many events have been announced and how many of them nobody will ever get, whether
+  bandwidth estimation is on and how many subscribers it is allocating for, and the ICE socket
+  address
 - `GET /rtc/validate?access_token=…` — token check, returns the identity
 - `GET /rtc?access_token=…` — signalling WebSocket. `auto_subscribe=0` joins without subscribing
   to anything; it is on by default.
 - `POST /twirp/mediacore.RoomService/<Method>` — the server API, described under
   [Server API](#server-api). Also answered at `/twirp/livekit.RoomService/<Method>` unless
   `twirp.livekit_alias` is turned off.
+- `GET /api/rooms/<room>/sessions`, `GET /api/rooms/<room>/session`, `GET /api/sessions/<id>` — what
+  happened in a room, as opposed to what is happening in it. See [Sessions](#sessions).
 
 Tokens are standard LiveKit access tokens: HS256, `iss` is the API key, `sub` is the participant
 identity, and the `video` claim carries the grants. Any LiveKit token generator works, including
@@ -753,12 +1142,26 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/auth` | access tokens and grants |
 | `crates/config` | YAML configuration |
 | `crates/room` | rooms and their lifecycle, participants, tracks, subscription intent, signalling fan-out |
+| `crates/session` | the record of what happened in a room: one meeting per file on disk, and the store that keeps them |
+| `crates/events` | announcing what happened: the in-process emitter, the outbox, the webhook and Kafka deliveries |
 | `crates/transport` | ICE, DTLS-SRTP, RTP intake and egress, one task per peer connection |
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
 | `crates/server` | HTTP and WebSocket endpoints, the `mediacore.RoomService` server API and its `/swagger` page, binary |
 | `crates/front` | the browser front end: one page, an audio room, a token endpoint, and an optional OpenID Connect sign-in |
 
+`crates/session` knows nothing about rooms — it is handed a roster and works out what that means for
+a meeting — which is why the dependency runs from `crates/room` to it and never back. It is also
+where *when a meeting begins and ends* is decided, once: a room that armed a second countdown on a
+second condition disagreed with it, and the shape of that disagreement was a record closed under
+people still sitting in the room, so `Room::session_ends_at_ms` reads the store's deadline rather
+than keeping one. Every change to a room's membership or its policy is handed over under the registry
+lock, which is what stops an older view of a room landing on top of a newer one and what stops a
+grace period expiring in the instant somebody walked back into it. `crates/events`
+is the same shape: it is handed a room, a participant or a meeting and knows nothing about a
+registry, so `crates/room` depends on it and it depends on neither. It knows nothing about
+configuration either — the server maps the `events` block onto its own settings types, as it already
+does for `RoomDefaults`.
 `crates/room` owns all shared state and knows nothing about transport; `crates/transport` speaks
 str0m types and knows nothing about the LiveKit protocol; `crates/sfu` is pure packet arithmetic
 with no IO and no async; `crates/server` owns the sockets, the reconcile pass and the protocol
@@ -775,3 +1178,14 @@ cargo fmt --all
 ```
 
 The protobuf definitions are compiled by `protox`, so no system `protoc` is needed.
+
+The Kafka producer is behind a feature and is therefore not in any of those:
+
+```
+cargo test -p mediacore-events --features kafka
+cargo clippy -p mediacore-server --features kafka --all-targets
+```
+
+That build wants a C toolchain, because `rdkafka-sys` compiles librdkafka. Everything else about
+events — the emitter, the outbox, the webhooks — is in the default build and covered by the commands
+above.

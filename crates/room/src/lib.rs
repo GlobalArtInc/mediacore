@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mediacore_events::{Bus, Event};
 use mediacore_proto::mediacore;
+use mediacore_session::{Member, SessionStore};
 use tokio::sync::mpsc;
 
 mod subscription;
@@ -62,6 +64,19 @@ impl ParticipantKind {
             Self::Standard => mediacore::participant_info::Kind::Standard,
             Self::Egress => mediacore::participant_info::Kind::Egress,
             Self::Agent => mediacore::participant_info::Kind::Agent,
+        }
+    }
+
+    /// The same three kinds as they are spelled in a session record.
+    ///
+    /// The record has an enum of its own because the crate that writes records
+    /// knows nothing about rooms -- the dependency runs one way -- so the two
+    /// are matched up here, once.
+    pub fn to_record(self) -> mediacore_session::Kind {
+        match self {
+            Self::Standard => mediacore_session::Kind::Standard,
+            Self::Egress => mediacore_session::Kind::Egress,
+            Self::Agent => mediacore_session::Kind::Agent,
         }
     }
 
@@ -653,14 +668,34 @@ pub struct Room {
     persistent: AtomicBool,
     settings: Mutex<RoomSettings>,
     participants: Mutex<HashMap<String, Arc<Participant>>>,
-    ends_at_ms: Mutex<Option<i64>>,
     emptied_at_ms: Mutex<Option<i64>>,
-    quorum_reached: AtomicBool,
     occupied_before: AtomicBool,
+    /// Where what happens in this room is written down.
+    ///
+    /// The room holds it rather than the registry alone because every path
+    /// that changes who is in a room already ends at [`Room::reassess`] --
+    /// joining, leaving, being removed, being displaced, and a policy that
+    /// arrives after the room did. Recording from there means a new path
+    /// cannot be added that moves people about and forgets to say so.
+    sessions: Arc<SessionStore>,
+    /// Where what happens in this room is announced, for anybody outside this
+    /// process who wants to hear about it as it happens.
+    ///
+    /// Beside the record and never instead of it. Emitting cannot fail, cannot
+    /// block and cannot be waited on, so it is safe to do from the middle of
+    /// somebody joining -- and it is allowed to be that cheap precisely
+    /// because the record above is the copy that answers questions afterwards.
+    events: Arc<Bus>,
 }
 
 impl Room {
-    fn new(name: String, settings: RoomSettings, persistent: bool) -> Self {
+    fn new(
+        name: String,
+        settings: RoomSettings,
+        persistent: bool,
+        sessions: Arc<SessionStore>,
+        events: Arc<Bus>,
+    ) -> Self {
         let created_at_ms = now_ms();
 
         Self {
@@ -670,10 +705,10 @@ impl Room {
             persistent: AtomicBool::new(persistent),
             settings: Mutex::new(settings),
             participants: Mutex::new(HashMap::new()),
-            ends_at_ms: Mutex::new(None),
             emptied_at_ms: Mutex::new(Some(created_at_ms)),
-            quorum_reached: AtomicBool::new(false),
             occupied_before: AtomicBool::new(false),
+            sessions,
+            events,
         }
     }
 
@@ -721,7 +756,10 @@ impl Room {
     /// a room people are sitting in.
     ///
     /// Who may do this is the registry's decision, not the room's: see
-    /// [`Adoption`].
+    /// [`Adoption`]. So is calling [`Room::reassess`] afterwards, which this
+    /// deliberately does not do: settling a room can change how many people it
+    /// needs, which can start a meeting, which writes a record to a disk --
+    /// and the registry holds its own lock across this call.
     fn adopt(&self, settings: RoomSettings) {
         self.persistent.store(true, Ordering::Relaxed);
 
@@ -745,8 +783,6 @@ impl Room {
                 None,
             );
         }
-
-        self.reassess(now_ms());
     }
 
     /// Moves the session policy without saying anything on the wire.
@@ -755,18 +791,20 @@ impl Room {
     /// so there is nothing a `RoomUpdate` could carry: the policy travels in
     /// the room metadata, and it is the metadata broadcast that tells the room
     /// it changed. Each `None` leaves that half of the policy where it is.
-    pub fn set_session_policy(&self, min_humans: Option<u32>, end_grace: Option<u32>) {
-        {
-            let mut settings = self.settings.lock().expect("settings lock");
-            if let Some(min_humans) = min_humans {
-                settings.min_humans = min_humans;
-            }
-            if let Some(end_grace) = end_grace {
-                settings.end_grace = end_grace;
-            }
+    ///
+    /// Private, and settling the room afterwards is deliberately not done
+    /// here: raising the floor over an occupied room can end the meeting in
+    /// it, and every decision about a meeting is taken under the registry
+    /// lock so that it cannot be taken against a roster that has moved on.
+    /// [`Registry::set_session_policy`] is the way in.
+    fn store_session_policy(&self, min_humans: Option<u32>, end_grace: Option<u32>) {
+        let mut settings = self.settings.lock().expect("settings lock");
+        if let Some(min_humans) = min_humans {
+            settings.min_humans = min_humans;
         }
-
-        self.reassess(now_ms());
+        if let Some(end_grace) = end_grace {
+            settings.end_grace = end_grace;
+        }
     }
 
     pub fn to_proto(&self) -> mediacore::Room {
@@ -807,8 +845,16 @@ impl Room {
             .count()
     }
 
+    /// When the meeting in this room ends if nobody comes back.
+    ///
+    /// Read out of the record store rather than kept here. The store is where
+    /// a meeting begins and ends -- it is the thing that knows whether there
+    /// is one -- and a room that armed a second deadline on a second condition
+    /// disagreed with it: the store's fired on a room whose own countdown had
+    /// never started, and closed the record under people who were still
+    /// talking. One deadline, decided once, read here.
     pub fn session_ends_at_ms(&self) -> Option<i64> {
-        *self.ends_at_ms.lock().expect("session lock")
+        self.sessions.ends_at(&self.name)
     }
 
     /// When the room last became empty, or `None` while somebody is in it.
@@ -816,15 +862,66 @@ impl Room {
         *self.emptied_at_ms.lock().expect("occupancy lock")
     }
 
-    /// Re-reads both of the room's clocks after its membership or its policy
-    /// changed.
+    /// Tells the room's clocks that its membership or its policy changed.
     ///
     /// Every path that adds or removes a participant ends here, and so does
     /// every path that moves the policy, because a room that is counting down
     /// to its own end has to notice both kinds of change.
-    fn reassess(&self, now_ms: i64) {
+    ///
+    /// Called with the registry lock held, always. The roster it reads and the
+    /// record it writes have to be one step: two threads letting two people
+    /// into the same room used to snapshot a roster each and then race to hand
+    /// them over, and the older snapshot landing second wrote a record saying
+    /// people had left and come back at moments they sat still.
+    ///
+    /// Returns the meeting if this change started one, so the caller can
+    /// announce it once it has let the lock go. Nothing is announced from
+    /// under the lock.
+    #[must_use = "a meeting that started here has to be announced"]
+    fn reassess(&self, now_ms: i64) -> Option<mediacore_session::Session> {
         self.note_occupancy(now_ms);
-        self.reassess_session(now_ms);
+        self.note_session(now_ms)
+    }
+
+    /// Tells the session store who is in the room now.
+    ///
+    /// The floor the store is given is the room's own `min_humans`, and the
+    /// store raises a zero to one: a room whose operator asked for no policy
+    /// at all still holds meetings, and a meeting begins when the first person
+    /// arrives. Reporting the policy verbatim and letting the store decide
+    /// what a zero means keeps the two halves of "when is there a meeting" in
+    /// one place instead of splitting them across two crates.
+    ///
+    /// The whole roster goes every time rather than the one person who moved,
+    /// because this is called from paths that move more than one -- a
+    /// displaced session leaves in the same breath its replacement arrives --
+    /// and because a diff cannot be forgotten the way an event can.
+    fn note_session(&self, now_ms: i64) -> Option<mediacore_session::Session> {
+        let settings = self.settings();
+        let roster: Vec<Member> = self
+            .participants()
+            .into_iter()
+            .map(|participant| Member {
+                sid: participant.sid.clone(),
+                identity: participant.identity.clone(),
+                name: participant.name(),
+                kind: participant.kind.to_record(),
+                joined_at_ms: participant.joined_at_ms,
+            })
+            .collect();
+
+        // The store decides whether this roster is the start of a meeting.
+        // Announcing it is this layer's job and the caller's moment: it
+        // happens once the registry lock is let go, and after the record is
+        // in the store, so nothing is announced that could not then be looked
+        // up.
+        self.sessions.note(
+            &self.name,
+            &roster,
+            settings.min_humans,
+            settings.end_grace_ms(),
+            now_ms,
+        )
     }
 
     /// Remembers when the room emptied, which is what the timeouts count from.
@@ -840,61 +937,6 @@ impl Room {
         }
     }
 
-    fn reassess_session(&self, now_ms: i64) {
-        let settings = self.settings();
-        if settings.min_humans == 0 {
-            if self
-                .ends_at_ms
-                .lock()
-                .expect("session lock")
-                .take()
-                .is_some()
-            {
-                tracing::info!(
-                    room = %self.name,
-                    "the session policy was switched off, the countdown with it"
-                );
-            }
-            return;
-        }
-
-        let humans = self.human_count();
-
-        if humans >= settings.min_humans as usize {
-            self.quorum_reached.store(true, Ordering::Relaxed);
-            if self
-                .ends_at_ms
-                .lock()
-                .expect("session lock")
-                .take()
-                .is_some()
-            {
-                tracing::info!(
-                    room = %self.name,
-                    humans,
-                    "the room filled up again, the session is no longer ending"
-                );
-            }
-            return;
-        }
-
-        if !self.quorum_reached.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let mut ends_at = self.ends_at_ms.lock().expect("session lock");
-        if ends_at.is_none() {
-            *ends_at = Some(now_ms + settings.end_grace_ms());
-            tracing::info!(
-                room = %self.name,
-                humans,
-                min_humans = settings.min_humans,
-                grace_seconds = settings.end_grace,
-                "too few humans left in the room, the session ends when the grace period runs out"
-            );
-        }
-    }
-
     /// Whether the session policy has run out on this room.
     ///
     /// The deadline alone is not the answer. It is armed on the way down and
@@ -903,16 +945,22 @@ impl Room {
     /// that expired in the same instant as somebody walked back in ends
     /// nothing. Reading the policy again also means a deadline that outlived
     /// the policy that armed it cannot fire.
+    ///
+    /// The deadline is the meeting's, and the policy is what turns it into the
+    /// room's as well. Every room has a meeting deadline -- a room with no
+    /// policy at all still holds meetings and they still end -- and only a
+    /// room that asked for a floor is taken away when one runs out.
     fn session_expired(&self, now_ms: i64) -> bool {
-        let Some(ends_at) = self.session_ends_at_ms() else {
-            return false;
-        };
-        if now_ms < ends_at {
+        let settings = self.settings();
+        if settings.min_humans == 0 {
             return false;
         }
 
-        let settings = self.settings();
-        settings.min_humans > 0 && self.human_count() < settings.min_humans as usize
+        let Some(ends_at) = self.session_ends_at_ms() else {
+            return false;
+        };
+
+        now_ms >= ends_at && self.human_count() < settings.min_humans as usize
     }
 
     /// Whether the room has been empty for longer than it is allowed to be.
@@ -935,7 +983,11 @@ impl Room {
         if !self.is_persistent() || self.participant_count() > 0 {
             return false;
         }
-        if self.session_ends_at_ms().is_some() {
+        // The policy's deadline and not the meeting's. Every room has a
+        // meeting counting down in it after the last person leaves; only a
+        // room whose policy would take it away has a reason to outstay its
+        // departure timeout for one.
+        if self.settings().min_humans > 0 && self.session_ends_at_ms().is_some() {
             return false;
         }
 
@@ -1325,11 +1377,20 @@ pub struct Swept {
     pub ended: Vec<String>,
     /// Rooms that stood empty for longer than their own timeout allows.
     pub closed: Vec<String>,
+    /// Meetings whose grace period ran out, by session id.
+    ///
+    /// Not the same list as `ended`, and that is the point. A room with a
+    /// session policy ends and its meeting ends with it, so it appears in
+    /// both. A room without one -- which is every room in a deployment that
+    /// never configured a policy -- keeps existing while its meeting closes,
+    /// or has already been thrown away because the last person left, and only
+    /// appears here.
+    pub sessions: Vec<String>,
 }
 
 impl Swept {
     pub fn is_empty(&self) -> bool {
-        self.ended.is_empty() && self.closed.is_empty()
+        self.ended.is_empty() && self.closed.is_empty() && self.sessions.is_empty()
     }
 }
 
@@ -1350,18 +1411,40 @@ pub enum Adoption {
     Always,
 }
 
-#[derive(Default)]
 pub struct Registry {
     defaults: RoomDefaults,
     rooms: Mutex<HashMap<String, Arc<Room>>>,
+    sessions: Arc<SessionStore>,
+    events: Arc<Bus>,
 }
 
 impl Registry {
-    pub fn new(defaults: RoomDefaults) -> Self {
+    pub fn new(defaults: RoomDefaults, sessions: Arc<SessionStore>, events: Arc<Bus>) -> Self {
         Self {
             defaults,
             rooms: Mutex::new(HashMap::new()),
+            sessions,
+            events,
         }
+    }
+
+    /// Where what happens in these rooms is announced.
+    ///
+    /// A room's own events go out through the room; the two that belong to no
+    /// room in particular -- a meeting ending after the room it was in has
+    /// been thrown away -- go out through here.
+    pub fn events(&self) -> &Arc<Bus> {
+        &self.events
+    }
+
+    /// Every meeting this server has held, including the ones running now.
+    ///
+    /// A meeting outlives the room it happened in -- a room nobody created is
+    /// gone the moment the last person leaves, and the record of what they did
+    /// there is not -- so this is reached through the registry rather than
+    /// through a room.
+    pub fn sessions(&self) -> &Arc<SessionStore> {
+        &self.sessions
     }
 
     pub fn rooms(&self) -> Vec<Arc<Room>> {
@@ -1385,58 +1468,149 @@ impl Registry {
     /// empty. Nothing here blocks while the lock is held -- signalling a
     /// participant is a `try_send`.
     pub fn create(&self, name: &str, options: RoomOptions, adoption: Adoption) -> Arc<Room> {
-        let mut rooms = self.rooms.lock().expect("registry lock");
+        let (room, opened, started) = {
+            let mut rooms = self.rooms.lock().expect("registry lock");
 
-        let Some(room) = rooms.get(name).cloned() else {
-            let room = Arc::new(Room::new(
-                name.to_owned(),
-                RoomSettings::resolve(&self.defaults, options),
-                true,
-            ));
-            rooms.insert(name.to_owned(), Arc::clone(&room));
-            tracing::info!(room = %name, sid = %room.sid, "room created");
-            return room;
+            let (room, adopted, opened) = match rooms.get(name).cloned() {
+                None => {
+                    let room = Arc::new(Room::new(
+                        name.to_owned(),
+                        RoomSettings::resolve(&self.defaults, options),
+                        true,
+                        Arc::clone(&self.sessions),
+                        Arc::clone(&self.events),
+                    ));
+                    rooms.insert(name.to_owned(), Arc::clone(&room));
+                    tracing::info!(room = %name, sid = %room.sid, "room created");
+                    (room, false, true)
+                }
+                Some(room) if room.is_persistent() => {
+                    tracing::debug!(
+                        room = %name,
+                        sid = %room.sid,
+                        "room already exists, keeping it as it is"
+                    );
+                    (room, false, false)
+                }
+                Some(room) if adoption == Adoption::WhenEmpty && room.participant_count() > 0 => {
+                    tracing::warn!(
+                        room = %name,
+                        sid = %room.sid,
+                        participants = room.participant_count(),
+                        "leaving an occupied room as it was: the caller named no room, and the \
+                         settings it asked for were not applied"
+                    );
+                    (room, false, false)
+                }
+                Some(room) => {
+                    room.adopt(RoomSettings::resolve(&self.defaults, options));
+                    (room, true, false)
+                }
+            };
+
+            // Under the same lock as the adoption. Settling a room can change
+            // how many people it needs, which can start or end a meeting, and
+            // that decision has to be taken against the roster this lock is
+            // holding still -- not against one that has moved on by the time
+            // it lands. Nothing here blocks: the record is written by a thread
+            // of its own.
+            let started = adopted.then(|| room.reassess(now_ms())).flatten();
+
+            (room, opened, started)
         };
 
-        if room.is_persistent() {
-            tracing::debug!(room = %name, sid = %room.sid, "room already exists, keeping it as it is");
-            return room;
+        // Announcements are outside the lock, in the order the things
+        // happened. `room_started` only for a room that did not exist a moment
+        // ago: a `CreateRoom` is a retry as often as it is a first attempt, and
+        // a consumer counting rooms must not count one twice because a
+        // caller's socket timed out.
+        if opened {
+            self.events.emit(Event::room_started(room.to_proto()));
+        }
+        if let Some(started) = started {
+            self.events.emit(Event::session_started(started));
         }
 
-        if adoption == Adoption::WhenEmpty && room.participant_count() > 0 {
-            tracing::warn!(
-                room = %name,
-                sid = %room.sid,
-                participants = room.participant_count(),
-                "leaving an occupied room as it was: the caller named no room, and the \
-                 settings it asked for were not applied"
-            );
-            return room;
-        }
-
-        room.adopt(RoomSettings::resolve(&self.defaults, options));
         room
     }
 
+    /// Moves a room's session policy, and settles what that means for the
+    /// meeting in it.
+    ///
+    /// On the registry rather than on the room because raising the floor over
+    /// an occupied room can end the meeting being held in it, and every
+    /// decision about a meeting is taken under this lock so that it is taken
+    /// against a roster nobody is halfway through changing.
+    pub fn set_session_policy(
+        &self,
+        room: &Arc<Room>,
+        min_humans: Option<u32>,
+        end_grace: Option<u32>,
+    ) {
+        let started = {
+            let _rooms = self.rooms.lock().expect("registry lock");
+            room.store_session_policy(min_humans, end_grace);
+            room.reassess(now_ms())
+        };
+
+        if let Some(started) = started {
+            self.events.emit(Event::session_started(started));
+        }
+    }
+
+    /// Takes a room away, and the meeting in it with it.
+    ///
+    /// The meeting is closed on the spot rather than left to serve out its
+    /// grace period: the grace is a promise that whoever comes back inside it
+    /// finds the same meeting, and a deleted room is the one case where there
+    /// is nothing to come back to. The record stays, because the meeting still
+    /// happened.
     pub fn delete(&self, name: &str) -> Option<Arc<Room>> {
-        let room = self.rooms.lock().expect("registry lock").remove(name)?;
+        // Taking the room away and closing its meeting are one step. Between
+        // the two, an arrival would find no room, build another under the same
+        // name and open a second meeting in it -- which the close would then
+        // end, leaving somebody sitting in a room whose record says the
+        // meeting is over.
+        let (room, ended) = {
+            let mut rooms = self.rooms.lock().expect("registry lock");
+            let room = rooms.remove(name)?;
+            let ended = self.sessions.close(name, now_ms());
+            (room, ended)
+        };
+
         end_session(&room, mediacore::DisconnectReason::RoomDeleted);
+
+        // In the order it happened: everybody left, then the meeting they were
+        // at ended, then the place it was in stopped existing. A consumer
+        // building a timeline out of these reads that order and would have to
+        // undo it if `room_finished` came first.
+        if let Some(session) = ended {
+            self.events.emit(Event::session_finished(session));
+        }
+        self.events.emit(Event::room_finished(room.to_proto()));
 
         Some(room)
     }
 
     pub fn remove_participant(&self, room_name: &str, identity: &str) -> Option<Arc<Participant>> {
-        let (room, removed) = {
+        let (room, removed, closed, started) = {
             let mut rooms = self.rooms.lock().expect("registry lock");
             let room = rooms.get(room_name).cloned()?;
             let removed = room.take_participant(identity);
+            let mut closed = false;
 
             if removed.is_some() && room.participant_count() == 0 && !room.is_persistent() {
                 rooms.remove(room_name);
+                closed = true;
                 tracing::info!(room = %room_name, "room closed, no participants left");
             }
 
-            (room, removed)
+            // Under the same lock as the removal, so the record is written
+            // against the room this call left behind and not one that has
+            // moved on since.
+            let started = removed.is_some().then(|| room.reassess(now_ms())).flatten();
+
+            (room, removed, closed, started)
         };
 
         let removed = removed?;
@@ -1454,23 +1628,45 @@ impl Registry {
             mediacore::DisconnectReason::ParticipantRemoved,
             None,
         );
-        room.reassess(now_ms());
+        if let Some(started) = started {
+            self.events.emit(Event::session_started(started));
+        }
+        if closed {
+            self.events.emit(Event::room_finished(room.to_proto()));
+        }
 
         Some(removed)
     }
 
-    /// One pass over every room, ending the sessions that are over and closing
+    /// One pass over every room, ending the meetings that are over and closing
     /// the rooms that nobody is coming back to.
     ///
     /// This is the registry's only clock. Everything else about a room happens
-    /// because somebody did something to it, and the two things that have to
-    /// happen when nobody does anything -- a session policy running out and an
-    /// empty room being collected -- both hang off this one call. It takes the
-    /// time rather than reading it so that a test can be the clock.
+    /// because somebody did something to it, and the three things that have to
+    /// happen when nobody does anything -- a meeting's grace period running
+    /// out, a session policy running out, an empty room being collected -- all
+    /// hang off this one call. It takes the time rather than reading it so
+    /// that a test can be the clock.
+    ///
+    /// The meetings are ended first. A room with a session policy and the
+    /// meeting inside it are counting the same grace period down from the same
+    /// instant, so both expire on the same tick; ending the meeting before the
+    /// room is emptied means its record closes with everybody still in it
+    /// rather than after they have all been disconnected.
+    ///
+    /// All of it under the registry lock, which is the lock an arrival takes
+    /// and does not let go of until it has said so. Reading the deadlines
+    /// outside it left a window in which somebody who came back inside the
+    /// grace was overtaken: their meeting was ended a moment before they were
+    /// counted, and the arrival then opened a second one, so one interrupted
+    /// meeting was recorded as two.
     pub fn sweep(&self, now_ms: i64) -> Swept {
-        let (ended, closed) = {
+        let (sessions, ended, closed) = {
             let mut rooms = self.rooms.lock().expect("registry lock");
 
+            // The rooms first, while the deadlines that decide them are still
+            // armed: expiring the meetings clears those deadlines, and a room
+            // reads its own from the meeting.
             let ended: Vec<Arc<Room>> = rooms
                 .values()
                 .filter(|room| room.session_expired(now_ms))
@@ -1486,11 +1682,24 @@ impl Registry {
                 rooms.remove(&room.name);
             }
 
-            (ended, closed)
+            let sessions = self.sessions.expire(now_ms);
+
+            (sessions, ended, closed)
         };
+
+        // The meetings first, in the same order and for the same reason they
+        // were ended in: a meeting whose room is about to go closed with
+        // everybody still in it, so the announcement of its end belongs before
+        // the announcements of everybody being disconnected.
+        let mut ended_sessions = Vec::new();
+        for session in sessions {
+            ended_sessions.push(session.id.clone());
+            self.events.emit(Event::session_finished(session));
+        }
 
         for room in &ended {
             end_session(room, mediacore::DisconnectReason::RoomClosed);
+            self.events.emit(Event::room_finished(room.to_proto()));
         }
         for room in &closed {
             tracing::info!(
@@ -1498,14 +1707,17 @@ impl Registry {
                 sid = %room.sid,
                 "room closed, empty for longer than its timeout allows"
             );
+            self.events.emit(Event::room_finished(room.to_proto()));
         }
 
         let mut swept = Swept {
             ended: ended.into_iter().map(|room| room.name.clone()).collect(),
             closed: closed.into_iter().map(|room| room.name.clone()).collect(),
+            sessions: ended_sessions,
         };
         swept.ended.sort();
         swept.closed.sort();
+        swept.sessions.sort();
         swept
     }
 
@@ -1515,7 +1727,8 @@ impl Registry {
         spec: ParticipantSpec,
         tx: SignalTx,
     ) -> Result<Joined, JoinError> {
-        let (room, participant, displaced) = {
+        let mut opened = false;
+        let (room, participant, displaced, started) = {
             let mut rooms = self.rooms.lock().expect("registry lock");
 
             let room = match rooms.get(room_name) {
@@ -1525,6 +1738,8 @@ impl Registry {
                         room_name.to_owned(),
                         RoomSettings::resolve(&self.defaults, RoomOptions::default()),
                         false,
+                        Arc::clone(&self.sessions),
+                        Arc::clone(&self.events),
                     ));
                     rooms.insert(room_name.to_owned(), Arc::clone(&room));
                     tracing::info!(
@@ -1532,6 +1747,7 @@ impl Registry {
                         sid = %room.sid,
                         "room created by the first participant to arrive"
                     );
+                    opened = true;
                     room
                 }
                 None => return Err(JoinError::RoomNotFound(room_name.to_owned())),
@@ -1587,8 +1803,21 @@ impl Registry {
             let displaced = participants.insert(identity, Arc::clone(&participant));
             drop(participants);
 
-            (room, participant, displaced)
+            // Still under the registry lock, and that is the point. The
+            // arrival and the record of it are one step: a sweep that read the
+            // deadlines between the two would end the meeting this person was
+            // walking back into, and the record would then show one
+            // interrupted meeting as two.
+            let started = room.reassess(now_ms());
+
+            (room, participant, displaced, started)
         };
+
+        // Announced before the arrival that caused it, so a consumer never
+        // sees somebody join a room it has not been told about.
+        if opened {
+            self.events.emit(Event::room_started(room.to_proto()));
+        }
 
         if let Some(displaced) = displaced {
             tracing::info!(
@@ -1623,7 +1852,21 @@ impl Registry {
             );
         }
 
-        room.reassess(now_ms());
+        // Before the reassess, so the arrival is announced before the meeting
+        // it may have started: a `session_started` whose first attendee has
+        // not been announced yet reads as a meeting nobody came to.
+        //
+        // Hidden participants are announced too, unlike on the wire. A
+        // recorder is invisible to the people in the room on purpose; it is
+        // not invisible to whoever is billing for the recording.
+        self.events.emit(Event::participant_joined(
+            room.to_proto(),
+            participant.to_proto(mediacore::participant_info::State::Active),
+        ));
+
+        if let Some(started) = started {
+            self.events.emit(Event::session_started(started));
+        }
 
         Ok(Joined {
             room,
@@ -1633,20 +1876,32 @@ impl Registry {
     }
 
     pub fn leave(&self, room_name: &str, sid: &str) {
-        let (room, departed) = {
+        let (room, departed, closed) = {
             let mut rooms = self.rooms.lock().expect("registry lock");
             let Some(room) = rooms.get(room_name).cloned() else {
                 return;
             };
 
             let departed = room.take_participant_by_sid(sid);
+            let mut closed = false;
 
             if departed.is_some() && room.participant_count() == 0 && !room.is_persistent() {
                 rooms.remove(room_name);
+                closed = true;
                 tracing::info!(room = %room_name, "room closed, no participants left");
             }
 
-            (room, departed)
+            // Under the same lock as the departure, so the grace period this
+            // starts is armed against the room the departure left behind. A
+            // departure counted after somebody else's arrival had already been
+            // counted would arm a countdown over a room that had filled up
+            // again.
+            if departed.is_some() {
+                let started = room.reassess(now_ms());
+                debug_assert!(started.is_none(), "somebody leaving started a meeting");
+            }
+
+            (room, departed, closed)
         };
 
         let Some(departed) = departed else {
@@ -1664,7 +1919,15 @@ impl Registry {
             mediacore::DisconnectReason::ClientInitiated,
             None,
         );
-        room.reassess(now_ms());
+
+        // A room nobody created goes when its last participant does, and it is
+        // announced here rather than inside `depart` because `depart` runs for
+        // every departure and this happens only on the last one. The meeting
+        // is not over: it holds its grace period open in case they come back,
+        // and `session_finished` follows from the sweep if they do not.
+        if closed {
+            self.events.emit(Event::room_finished(room.to_proto()));
+        }
     }
 }
 
@@ -1708,8 +1971,17 @@ fn end_session(room: &Room, reason: mediacore::DisconnectReason) {
         "room ended"
     );
 
+    // One snapshot of the room for all of them, taken after the room was
+    // emptied. Asking the room again per participant would be quadratic in a
+    // room of five hundred, and every one of those answers would be the same.
+    let emptied = room.to_proto();
     for participant in &participants {
         participant.disconnect(reason);
+
+        let mut info = participant.to_proto(mediacore::participant_info::State::Disconnected);
+        info.disconnect_reason = reason as i32;
+        room.events
+            .emit(Event::participant_left(emptied.clone(), info));
     }
 }
 
@@ -1731,12 +2003,19 @@ fn depart(
         }
     }
 
+    let mut info = departed.to_proto(mediacore::participant_info::State::Disconnected);
+    info.disconnect_reason = reason as i32;
+    room.events
+        .emit(Event::participant_left(room.to_proto(), info.clone()));
+
+    // Hidden from the room, not from whoever is listening outside it: the
+    // people in the room were never told a recorder was there, and a service
+    // that has to know a recording stopped is not one of the people in the
+    // room.
     if departed.is_hidden() {
         return;
     }
 
-    let mut info = departed.to_proto(mediacore::participant_info::State::Disconnected);
-    info.disconnect_reason = reason as i32;
     room.broadcast(participant_update(vec![info]), except);
 }
 
@@ -1820,6 +2099,66 @@ pub(crate) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::ops::Deref;
+
+    /// A registry with a session store and an event bus of its own.
+    ///
+    /// Every registry writes down what happens in its rooms and announces it,
+    /// so a test that wants a registry wants a directory to write into and
+    /// somewhere for the announcements to go. The directory travels with the
+    /// registry and goes when it does: two tests sharing one would read each
+    /// other's meetings back as their own.
+    ///
+    /// The bus is the real one, with a listener attached: emitting is a
+    /// mutex and a queue push and needs no runtime, so a plain `#[test]` can
+    /// watch what a registry announced without an executor anywhere near it.
+    struct Harness {
+        registry: Registry,
+        events: mediacore_events::Listener,
+        _records: tempfile::TempDir,
+    }
+
+    impl Deref for Harness {
+        type Target = Registry;
+
+        fn deref(&self) -> &Registry {
+            &self.registry
+        }
+    }
+
+    impl Harness {
+        /// Everything announced since this was last asked, in order.
+        fn announced(&mut self) -> Vec<Arc<Event>> {
+            let mut seen = Vec::new();
+            while let Some(event) = self.events.try_recv() {
+                seen.push(event);
+            }
+
+            seen
+        }
+
+        /// The names of everything announced since this was last asked.
+        fn announced_kinds(&mut self) -> Vec<&'static str> {
+            self.announced()
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect()
+        }
+    }
+
+    fn registry(defaults: RoomDefaults) -> Harness {
+        let records = tempfile::TempDir::new().expect("a directory for session records");
+        let sessions = SessionStore::open(records.path()).expect("an empty session store opens");
+        let events = Arc::new(Bus::new());
+        let listener = events.listen();
+
+        Harness {
+            registry: Registry::new(defaults, Arc::new(sessions), events),
+            events: listener,
+            _records: records,
+        }
+    }
 
     fn displacing() -> RoomDefaults {
         RoomDefaults {
@@ -1929,7 +2268,7 @@ mod tests {
 
     #[test]
     fn second_participant_sees_the_first() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -1944,7 +2283,7 @@ mod tests {
 
     #[test]
     fn leaving_notifies_others_and_closes_empty_room() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -1966,7 +2305,7 @@ mod tests {
 
     #[test]
     fn rejoining_displaces_the_earlier_session() {
-        let registry = Registry::new(displacing());
+        let registry = registry(displacing());
         let (first_tx, mut first_rx) = signal_channel();
         let (second_tx, _second_rx) = signal_channel();
 
@@ -1989,7 +2328,7 @@ mod tests {
 
     #[test]
     fn displacing_a_session_never_tells_the_successor_it_disconnected() {
-        let registry = Registry::new(displacing());
+        let registry = registry(displacing());
         let (first_tx, _first_rx) = signal_channel();
         let (second_tx, mut second_rx) = signal_channel();
 
@@ -2018,7 +2357,7 @@ mod tests {
 
     #[test]
     fn displacing_a_session_tears_its_tracks_out_of_every_subscription() {
-        let registry = Registry::new(displacing());
+        let registry = registry(displacing());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
         let (again_tx, _again_rx) = signal_channel();
@@ -2064,7 +2403,7 @@ mod tests {
 
     #[test]
     fn a_displaced_session_leaving_late_changes_nothing() {
-        let registry = Registry::new(displacing());
+        let registry = registry(displacing());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
         let (again_tx, _again_rx) = signal_channel();
@@ -2103,7 +2442,7 @@ mod tests {
 
     #[test]
     fn a_displaced_session_cannot_evict_its_successor() {
-        let registry = Registry::new(displacing());
+        let registry = registry(displacing());
         let (first_tx, _first_rx) = signal_channel();
         let (second_tx, _second_rx) = signal_channel();
 
@@ -2122,7 +2461,7 @@ mod tests {
 
     #[test]
     fn honours_disabled_auto_create() {
-        let registry = Registry::new(RoomDefaults {
+        let registry = registry(RoomDefaults {
             auto_create: false,
             ..RoomDefaults::default()
         });
@@ -2141,7 +2480,7 @@ mod tests {
 
     #[test]
     fn publishing_surfaces_the_track_to_other_participants() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2179,7 +2518,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn the_layers_a_track_reports_follow_the_ones_that_are_arriving() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2260,7 +2599,7 @@ mod tests {
 
     #[test]
     fn the_publisher_does_not_hear_about_its_own_track() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
 
@@ -2277,7 +2616,7 @@ mod tests {
 
     #[test]
     fn unpublishing_removes_the_track() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2312,7 +2651,7 @@ mod tests {
 
     #[test]
     fn muting_updates_the_track() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2348,7 +2687,7 @@ mod tests {
 
     #[test]
     fn every_change_bumps_the_participant_version() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2383,7 +2722,7 @@ mod tests {
 
     #[test]
     fn the_negotiated_mid_lands_on_the_track() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
 
         let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
@@ -2412,7 +2751,7 @@ mod tests {
 
     #[test]
     fn republishing_the_same_client_id_keeps_the_track_sid() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
 
         let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
@@ -2426,7 +2765,7 @@ mod tests {
 
     #[test]
     fn a_participant_without_the_publish_grant_is_refused() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2481,7 +2820,7 @@ mod tests {
 
     #[test]
     fn desired_subscriptions_are_diffed_against_the_active_ones() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2550,7 +2889,7 @@ mod tests {
 
     #[test]
     fn a_departing_publisher_takes_its_tracks_out_of_the_intent() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2577,7 +2916,7 @@ mod tests {
 
     #[test]
     fn the_room_answers_who_may_subscribe_to_what() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2629,7 +2968,7 @@ mod tests {
 
     #[test]
     fn a_subscription_request_records_intent_for_allowed_tracks() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2685,7 +3024,7 @@ mod tests {
 
     #[test]
     fn a_droppable_message_is_dropped_when_the_client_cannot_keep_up() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (tx, mut rx) = signal_channel();
         let alice = registry.join("demo", spec("alice"), tx).unwrap();
 
@@ -2700,7 +3039,7 @@ mod tests {
 
     #[test]
     fn a_control_message_that_cannot_be_queued_ends_the_session() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (tx, mut rx) = signal_channel();
         let alice = registry.join("demo", spec("alice"), tx).unwrap();
 
@@ -2730,7 +3069,7 @@ mod tests {
 
     #[test]
     fn honours_the_participant_limit() {
-        let registry = Registry::new(RoomDefaults {
+        let registry = registry(RoomDefaults {
             max_participants: 1,
             ..RoomDefaults::default()
         });
@@ -2745,7 +3084,7 @@ mod tests {
 
     #[test]
     fn creating_a_room_that_exists_returns_the_one_that_exists() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
 
         let first = registry.create(
             "demo",
@@ -2775,7 +3114,7 @@ mod tests {
 
     #[test]
     fn a_created_room_carries_settings_of_its_own() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2829,7 +3168,7 @@ mod tests {
     /// walked in has nothing behind it once they walk out.
     #[test]
     fn a_room_that_was_created_outlives_its_participants() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -2856,7 +3195,7 @@ mod tests {
     /// as long as the process lives.
     #[test]
     fn a_created_room_nobody_ever_joined_is_collected() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let room = registry.create(
             "standup",
             RoomOptions {
@@ -2886,7 +3225,7 @@ mod tests {
     /// that were meant for one that has not started.
     #[test]
     fn a_created_room_is_collected_after_the_last_person_walks_out() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (tx, _rx) = signal_channel();
 
         let room = registry.create("standup", RoomOptions::default(), Adoption::Always);
@@ -2913,7 +3252,7 @@ mod tests {
     /// room, so the caller has to.
     #[test]
     fn a_create_that_names_no_room_leaves_an_occupied_one_alone() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let alice = registry.join("standup", spec("alice"), alice_tx).unwrap();
         drain(&mut alice_rx);
@@ -2947,7 +3286,7 @@ mod tests {
 
     #[test]
     fn deleting_a_room_disconnects_everybody_in_it() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
 
@@ -2984,7 +3323,7 @@ mod tests {
 
     #[test]
     fn removing_a_participant_tells_it_and_the_room() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
 
@@ -3038,7 +3377,7 @@ mod tests {
 
     #[test]
     fn the_session_ends_when_too_few_humans_remain() {
-        let registry = Registry::new(session_policy(2, 90));
+        let registry = registry(session_policy(2, 90));
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -3075,7 +3414,7 @@ mod tests {
 
     #[test]
     fn a_rejoin_inside_the_grace_period_calls_it_off() {
-        let registry = Registry::new(session_policy(2, 90));
+        let registry = registry(session_policy(2, 90));
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
         let (again_tx, _again_rx) = signal_channel();
@@ -3110,7 +3449,7 @@ mod tests {
     /// is the whole reason `ParticipantInfo.kind` is carried at all.
     #[test]
     fn a_recorder_is_not_one_of_the_humans_the_policy_counts() {
-        let registry = Registry::new(session_policy(2, 90));
+        let registry = registry(session_policy(2, 90));
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
         let (recorder_tx, mut recorder_rx) = signal_channel();
@@ -3163,7 +3502,7 @@ mod tests {
     /// seconds before the second person arrived.
     #[test]
     fn the_grace_period_does_not_start_before_the_room_has_filled() {
-        let registry = Registry::new(session_policy(2, 90));
+        let registry = registry(session_policy(2, 90));
         let (tx, mut rx) = signal_channel();
 
         let alice = registry.join("demo", spec("alice"), tx).unwrap();
@@ -3174,13 +3513,707 @@ mod tests {
         assert!(leaves(&mut rx).is_empty());
     }
 
+    /// Every session record the store holds for a room, in the order it
+    /// reports them.
+    fn recorded(registry: &Registry, room: &str) -> Vec<mediacore_session::Session> {
+        registry
+            .sessions()
+            .of_room(room, 0, mediacore_session::MAX_PAGE)
+            .sessions
+    }
+
+    fn attendees(session: &mediacore_session::Session) -> Vec<String> {
+        let mut identities: Vec<String> = session
+            .participants
+            .iter()
+            .map(|attendance| attendance.identity.clone())
+            .collect();
+        identities.sort();
+        identities
+    }
+
+    /// A room with a floor of two is waiting for people until the second one
+    /// arrives. Opening a meeting on the first would write down a meeting
+    /// every time somebody opened the page, saw they were alone and closed it
+    /// again -- which is the noise that makes a history worth nothing.
+    #[test]
+    fn a_meeting_starts_when_the_room_fills_and_not_before() {
+        let registry = registry(session_policy(2, 90));
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        assert!(
+            registry.sessions().live("demo").is_none(),
+            "one person waiting for a second is not a meeting"
+        );
+        assert!(recorded(&registry, "demo").is_empty());
+
+        registry.join("demo", spec("bob"), bob_tx).unwrap();
+
+        let session = registry
+            .sessions()
+            .live("demo")
+            .expect("the room reached its floor and no meeting was written down");
+        assert_eq!(session.room, "demo");
+        assert_eq!(attendees(&session), vec!["alice", "bob"]);
+        assert!(session.is_live());
+        assert!(
+            session
+                .participants
+                .iter()
+                .any(|attendance| attendance.identity == "alice"
+                    && attendance.joined_at_ms <= session.started_at_ms),
+            "alice arrived before the meeting did, and the record has to say so: how long the \
+             first person waited is a question somebody asks"
+        );
+        assert_eq!(alice.room.name, "demo");
+    }
+
+    /// The policy counts people. A recorder keeps a room from being empty and
+    /// must not make it a meeting -- but it was in the room, so a record that
+    /// leaves it out cannot answer whether the meeting was recorded.
+    #[test]
+    fn a_recorder_does_not_make_a_meeting_and_is_still_written_into_one() {
+        let registry = registry(session_policy(2, 90));
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (scribe_tx, _scribe_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        registry.join("demo", spec("alice"), alice_tx).unwrap();
+        registry
+            .join("demo", recorder("scribe"), scribe_tx)
+            .unwrap();
+
+        assert!(
+            registry.sessions().live("demo").is_none(),
+            "a recorder was counted as somebody who came to talk, and one person plus a bot was \
+             written down as a meeting of two"
+        );
+
+        registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let session = registry
+            .sessions()
+            .live("demo")
+            .expect("two people are in the room");
+
+        assert_eq!(attendees(&session), vec!["alice", "bob", "scribe"]);
+        assert!(
+            session.participants.iter().any(|attendance| {
+                attendance.identity == "scribe"
+                    && attendance.kind == mediacore_session::Kind::Egress
+            }),
+            "the recorder is in the record as a recorder, which is what answers `was this \
+             meeting recorded` a month later"
+        );
+    }
+
+    /// The end of a meeting is the end of the grace period, on the tick the
+    /// grace period named -- not on the tick the sweep happened to notice, and
+    /// not while somebody could still have come back.
+    #[test]
+    fn a_meeting_ends_when_the_grace_period_runs_out() {
+        let registry = registry(session_policy(2, 90));
+        let (alice_tx, mut alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let id = registry.sessions().live("demo").expect("a meeting").id;
+
+        registry.leave("demo", &bob.participant.sid);
+        drain(&mut alice_rx);
+        let ends_at = alice
+            .room
+            .session_ends_at_ms()
+            .expect("the grace period is running");
+
+        assert!(
+            registry.sweep(ends_at - 1).sessions.is_empty(),
+            "the meeting was written down as over before the grace period it promised was"
+        );
+        assert!(registry.sessions().live("demo").is_some());
+
+        assert_eq!(registry.sweep(ends_at).sessions, vec![id.clone()]);
+
+        let session = registry.sessions().get(&id).expect("the record is kept");
+        assert_eq!(
+            session.ended_at_ms,
+            Some(ends_at),
+            "a meeting ends when its grace period said it would, not when the sweep next ran: a \
+             record nobody can reconcile with the promise is a record nobody trusts"
+        );
+        assert_eq!(session.ended_by, Some(mediacore_session::Ending::Grace));
+        assert!(
+            session
+                .participants
+                .iter()
+                .all(|attendance| attendance.left_at_ms.is_some()),
+            "alice was in the room when it closed and her record says she is in it still"
+        );
+        assert!(registry.sessions().live("demo").is_none());
+    }
+
+    /// Somebody whose network blinked and who came back before the grace ran
+    /// out did not hold two meetings. The record is one meeting with a gap in
+    /// it, and the gap is theirs: two stretches of attendance, the first one
+    /// closed.
+    #[test]
+    fn coming_back_inside_the_grace_period_is_one_meeting_with_a_gap_in_it() {
+        let registry = registry(session_policy(2, 90));
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+        let (again_tx, _again_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let id = registry.sessions().live("demo").expect("a meeting").id;
+
+        registry.leave("demo", &bob.participant.sid);
+        let ends_at = alice
+            .room
+            .session_ends_at_ms()
+            .expect("the grace period is running");
+
+        registry.join("demo", spec("bob"), again_tx).unwrap();
+
+        assert!(registry.sweep(ends_at + 60_000).sessions.is_empty());
+        let session = registry
+            .sessions()
+            .live("demo")
+            .expect("the meeting is still running");
+        assert_eq!(
+            session.id, id,
+            "bob came back to the meeting he had just left and was given a second one; the room \
+             now reads as two short meetings instead of one interrupted one"
+        );
+        assert_eq!(recorded(&registry, "demo").len(), 1);
+
+        let stretches: Vec<&mediacore_session::Attendance> = session
+            .participants
+            .iter()
+            .filter(|attendance| attendance.identity == "bob")
+            .collect();
+        assert_eq!(
+            stretches.len(),
+            2,
+            "bob left and came back, and the record shows one unbroken attendance: the gap is the \
+             part somebody is asking about"
+        );
+        assert!(stretches[0].left_at_ms.is_some());
+        assert!(stretches[1].left_at_ms.is_none());
+    }
+
+    /// The deployment that is running has no session policy: `min_humans` is
+    /// zero and always has been. A record that only appears once somebody opts
+    /// into a policy they have never heard of is a record nobody has -- so a
+    /// meeting is one person arriving, and it ends when the room empties and
+    /// the grace period runs out.
+    ///
+    /// The room here is one nobody created, which is the ordinary case: it is
+    /// thrown away the moment the last person leaves, and what happened in it
+    /// is not.
+    #[test]
+    fn an_auto_created_rooms_record_outlives_the_room_itself() {
+        let registry = registry(RoomDefaults::default());
+        let (tx, _rx) = signal_channel();
+
+        assert_eq!(
+            RoomDefaults::default().min_humans,
+            0,
+            "this test is about the deployment that configured nothing, and it is testing \
+             something else"
+        );
+
+        let alice = registry.join("demo", spec("alice"), tx).unwrap();
+        let session = registry
+            .sessions()
+            .live("demo")
+            .expect("a room with no policy still holds meetings, or nobody has this feature");
+
+        registry.leave("demo", &alice.participant.sid);
+        assert!(
+            registry.room("demo").is_none(),
+            "a room nobody created goes when the last person does, as it always has"
+        );
+        assert_eq!(
+            registry
+                .sessions()
+                .live("demo")
+                .map(|live| live.id)
+                .as_deref(),
+            Some(session.id.as_str()),
+            "the meeting is serving out its grace period; the room it happened in is gone and \
+             that is not the same thing"
+        );
+
+        let swept = registry.sweep(now_ms() + i64::from(RoomDefaults::default().end_grace) * 1_000);
+        assert_eq!(swept.sessions, vec![session.id.clone()]);
+        assert!(
+            swept.ended.is_empty(),
+            "no room ended here -- there was no room left to end"
+        );
+
+        let record = registry
+            .sessions()
+            .get(&session.id)
+            .expect("the record of a room that no longer exists is still there to be asked about");
+        assert_eq!(record.room, "demo");
+        assert!(record.ended_at_ms.is_some());
+        assert_eq!(attendees(&record), vec!["alice"]);
+        assert_eq!(recorded(&registry, "demo").len(), 1);
+    }
+
+    /// Finding A, first path. A backoffice raises the floor over a room
+    /// somebody is sitting in. The store's countdown and the room's used to be
+    /// two decisions armed on two conditions: only the store's fired, so the
+    /// record closed with alice still in the room, the endpoint answered "no
+    /// meeting" while she was talking, and the rest of her time was written
+    /// down nowhere.
+    #[test]
+    fn raising_the_floor_over_an_occupied_room_ends_the_room_with_the_meeting() {
+        let registry = registry(RoomDefaults::default());
+        let (tx, mut rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), tx).unwrap();
+        let id = registry.sessions().live("demo").expect("a meeting").id;
+        assert_eq!(alice.room.settings().min_humans, 0);
+
+        registry.set_session_policy(&alice.room, Some(2), Some(90));
+        let ends_at = alice
+            .room
+            .session_ends_at_ms()
+            .expect("one person under a floor of two is a meeting on its way out");
+        drain(&mut rx);
+
+        let swept = registry.sweep(ends_at);
+        assert_eq!(swept.sessions, vec![id.clone()]);
+        assert_eq!(
+            swept.ended,
+            vec!["demo".to_owned()],
+            "the meeting was written down as over and the room it was held in carried on, so \
+             alice is in a room the record says nothing is happening in"
+        );
+        assert_eq!(
+            alice.room.participant_count(),
+            0,
+            "the record says the meeting ended and alice is still sitting in the room"
+        );
+        assert_eq!(
+            expect_leave(&mut rx).reason,
+            mediacore::DisconnectReason::RoomClosed as i32,
+            "alice's meeting was closed under her and nobody told her"
+        );
+
+        let record = registry.sessions().get(&id).expect("the record is kept");
+        assert!(
+            record
+                .participants
+                .iter()
+                .all(|attendance| attendance.left_at_ms == record.ended_at_ms),
+            "the record has to close everybody at the moment the room let them go"
+        );
+    }
+
+    /// Finding A, second path. The room alice comes back into is not the room
+    /// she left -- a room nobody created is thrown away with the last person
+    /// and built again for the first one back -- so a countdown kept on the
+    /// `Room` object was never armed on the new one, while the meeting's own
+    /// ran on and closed the record over her head.
+    #[test]
+    fn coming_back_alone_inside_the_grace_does_not_leave_a_meeting_running_over_you() {
+        let registry = registry(session_policy(2, 90));
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let id = registry.sessions().live("demo").expect("a meeting").id;
+
+        registry.leave("demo", &bob.participant.sid);
+        registry.leave("demo", &alice.participant.sid);
+        assert!(
+            registry.room("demo").is_none(),
+            "a room nobody created goes with the last person to leave it"
+        );
+
+        let (again_tx, mut again_rx) = signal_channel();
+        let back = registry.join("demo", spec("alice"), again_tx).unwrap();
+        assert_eq!(
+            registry.sessions().live("demo").map(|live| live.id),
+            Some(id.clone()),
+            "alice came back inside the grace and was given a second meeting"
+        );
+
+        let ends_at = back.room.session_ends_at_ms().expect(
+            "one person under a floor of two is still a meeting on its way out, whichever room \
+             object she came back into",
+        );
+        drain(&mut again_rx);
+
+        let swept = registry.sweep(ends_at);
+        assert_eq!(swept.sessions, vec![id]);
+        assert_eq!(
+            swept.ended,
+            vec!["demo".to_owned()],
+            "the meeting ended and the room alice was sitting in was left standing"
+        );
+        assert_eq!(
+            back.room.participant_count(),
+            0,
+            "the record says the meeting ended and alice is still in the room"
+        );
+    }
+
+    /// Finding D. Two threads moving people in and out of one room used to
+    /// snapshot a roster each and then race to hand it over, so an older
+    /// snapshot landed on a newer one: the record grew stretches nobody sat
+    /// through, saying people left and came back at moments they did not move.
+    #[test]
+    fn concurrent_arrivals_are_recorded_as_the_room_actually_was() {
+        let registry = registry(RoomDefaults::default());
+        let (anchor_tx, _anchor_rx) = signal_channel();
+        let rounds = 60;
+
+        // Somebody who never leaves, so the meeting is one meeting throughout
+        // and every stretch below belongs to the same record.
+        registry.join("demo", spec("anchor"), anchor_tx).unwrap();
+
+        std::thread::scope(|scope| {
+            for thread in 0..2 {
+                let registry = &registry;
+                scope.spawn(move || {
+                    for round in 0..rounds {
+                        let (tx, _rx) = signal_channel();
+                        let identity = format!("guest{thread}-{round}");
+                        let joined = registry.join("demo", spec(&identity), tx).unwrap();
+                        registry.leave("demo", &joined.participant.sid);
+                    }
+                });
+            }
+        });
+
+        let session = registry
+            .sessions()
+            .live("demo")
+            .expect("the anchor never left, so the meeting never ended");
+
+        let mut per_sid: HashMap<&str, usize> = HashMap::new();
+        for attendance in &session.participants {
+            *per_sid.entry(attendance.sid.as_str()).or_default() += 1;
+        }
+        let doubled: Vec<&str> = per_sid
+            .iter()
+            .filter(|(_, stretches)| **stretches > 1)
+            .map(|(sid, _)| *sid)
+            .collect();
+
+        assert!(
+            doubled.is_empty(),
+            "{} connections joined once and the record says they left and came back: {doubled:?}. \
+             Nobody moved at those moments; an older view of the room landed on top of a newer \
+             one",
+            doubled.len()
+        );
+        assert_eq!(
+            session.participants.len(),
+            1 + 2 * rounds,
+            "one stretch per arrival is {} and the record has {}",
+            1 + 2 * rounds,
+            session.participants.len()
+        );
+        assert_eq!(
+            session
+                .participants
+                .iter()
+                .filter(|attendance| attendance.left_at_ms.is_none())
+                .count(),
+            1,
+            "somebody who left is still open in the record, so their attendance runs to the end \
+             of the meeting"
+        );
+    }
+
+    /// A room somebody created outlives its meetings and holds them one after
+    /// another, which is why the endpoint that lists them is plural.
+    ///
+    /// `end_grace: 0` is the escape hatch for a deployment that wants a
+    /// meeting to end the instant its room empties rather than be held open
+    /// for anybody coming back.
+    #[test]
+    fn a_created_room_holds_one_meeting_after_another() {
+        let registry = registry(RoomDefaults {
+            end_grace: 0,
+            ..RoomDefaults::default()
+        });
+        registry.create("standup", RoomOptions::default(), Adoption::Always);
+
+        let mut held = Vec::new();
+        for identity in ["alice", "bob", "carol"] {
+            let (tx, _rx) = signal_channel();
+            let joined = registry.join("standup", spec(identity), tx).unwrap();
+            held.push(
+                registry
+                    .sessions()
+                    .live("standup")
+                    .expect("somebody is in the room")
+                    .id,
+            );
+
+            registry.leave("standup", &joined.participant.sid);
+            registry.sweep(now_ms());
+        }
+
+        assert!(
+            registry.room("standup").is_some(),
+            "a room somebody created outlives the people in it, which is the point of creating one"
+        );
+
+        let sessions = recorded(&registry, "standup");
+        assert_eq!(
+            sessions.len(),
+            3,
+            "three meetings were held in one room and the room has {} of them",
+            sessions.len()
+        );
+        assert!(
+            sessions.iter().all(|session| session.ended_at_ms.is_some()),
+            "a meeting nobody is at is still open in the record"
+        );
+
+        let mut ids: Vec<String> = sessions.iter().map(|session| session.id.clone()).collect();
+        ids.sort();
+        held.sort();
+        assert_eq!(
+            ids, held,
+            "the three meetings the room reports are not the three it held"
+        );
+        assert!(
+            sessions.iter().all(|session| attendees(session).len() == 1),
+            "somebody who was at one meeting is written into another"
+        );
+    }
+
+    /// Deleting a room ends the meeting in it now. The grace period is a
+    /// promise that whoever comes back inside it finds the same meeting, and a
+    /// deleted room is the one case where there is nothing to come back to.
+    #[test]
+    fn deleting_a_room_ends_its_meeting_and_keeps_the_record() {
+        let registry = registry(RoomDefaults::default());
+        let (tx, _rx) = signal_channel();
+
+        registry.join("demo", spec("alice"), tx).unwrap();
+        let id = registry.sessions().live("demo").expect("a meeting").id;
+
+        registry.delete("demo");
+
+        assert!(
+            registry.sessions().live("demo").is_none(),
+            "the room was deleted and its meeting is still being held open for somebody to come \
+             back to a room that is not there"
+        );
+        let record = registry.sessions().get(&id).expect("the record survives");
+        assert_eq!(record.ended_by, Some(mediacore_session::Ending::Closed));
+        assert!(
+            record
+                .participants
+                .iter()
+                .all(|attendance| attendance.left_at_ms.is_some())
+        );
+    }
+
     /// `livekit-client` keys its remote participants by identity, so two
     /// connections sharing one are invisible to every client in the room. The
     /// server hands the second one an identity of its own and keeps the
     /// display name, which is the half a person actually reads.
+    /// A hidden participant, which is what a recorder joins as: invisible to
+    /// the people in the room and not to whoever is listening outside it.
+    fn hidden(identity: &str) -> ParticipantSpec {
+        ParticipantSpec {
+            kind: ParticipantKind::Egress,
+            permission: mediacore::ParticipantPermission {
+                hidden: true,
+                ..spec(identity).permission
+            },
+            ..spec(identity)
+        }
+    }
+
+    /// The whole life of a room that one person walked into and out of, as it
+    /// was announced. The order is the point: a consumer builds a timeline out
+    /// of these and cannot reorder what it is given, so somebody must not
+    /// arrive in a room that has not been announced, and a meeting must not
+    /// start before its first attendee is in it.
+    #[test]
+    fn a_rooms_whole_life_is_announced_in_the_order_it_happened() {
+        let mut registry = registry(RoomDefaults::default());
+        let (tx, _rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), tx).unwrap();
+
+        let announced = registry.announced();
+        assert_eq!(
+            announced
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["room_started", "participant_joined", "session_started"],
+            "somebody joined a room nobody was told about, or a meeting started before anybody \
+             was announced as being at it"
+        );
+        assert_eq!(
+            announced[1]
+                .participant
+                .as_ref()
+                .expect("a participant_joined with nobody on it")
+                .identity,
+            "alice"
+        );
+        assert_eq!(
+            announced[1]
+                .room
+                .as_ref()
+                .expect("a participant_joined with no room on it")
+                .name,
+            "demo"
+        );
+        assert_eq!(
+            announced[2]
+                .session
+                .as_ref()
+                .expect("a session_started with no meeting on it")
+                .room,
+            "demo",
+            "a meeting outlives its room, so the room's name has to travel inside the meeting"
+        );
+
+        registry.leave("demo", &alice.participant.sid);
+        assert_eq!(
+            registry.announced_kinds(),
+            vec!["participant_left", "room_finished"],
+            "a room nobody created goes with the last person to leave it, and that has to be \
+             announced or a consumer counts a room that is not there any more"
+        );
+
+        // The meeting is not over: the grace period is holding it open for
+        // whoever comes back. Nothing else exists to notice when it runs out
+        // -- the room was thrown away two lines ago -- which is why the sweep
+        // is the one clock and why this event has to come from it.
+        let swept = registry.sweep(now_ms() + 91_000);
+        assert_eq!(swept.sessions.len(), 1);
+        assert_eq!(
+            registry.announced_kinds(),
+            vec!["session_finished"],
+            "a meeting ended after the room it was in had been thrown away, and nobody outside \
+             this process would ever have heard about it"
+        );
+    }
+
+    /// `CreateRoom` is a retry as often as it is a first attempt -- an SDK
+    /// whose socket timed out sends it again. A consumer counting rooms must
+    /// not count one twice for that.
+    #[test]
+    fn a_room_is_announced_once_however_many_times_it_is_created() {
+        let mut registry = registry(RoomDefaults::default());
+
+        registry.create("demo", RoomOptions::default(), Adoption::WhenEmpty);
+        registry.create("demo", RoomOptions::default(), Adoption::WhenEmpty);
+        registry.create("demo", RoomOptions::default(), Adoption::Always);
+
+        assert_eq!(
+            registry.announced_kinds(),
+            vec!["room_started"],
+            "a room that already existed was announced as new"
+        );
+    }
+
+    /// Deleting a room ends everything inside it at once, and the
+    /// announcements have to come out in the order those things happened:
+    /// everybody left, then the meeting they were at ended, then the place it
+    /// was in stopped existing.
+    #[test]
+    fn deleting_a_room_announces_the_departures_the_meeting_and_the_room() {
+        let mut registry = registry(RoomDefaults::default());
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        registry.create("demo", RoomOptions::default(), Adoption::WhenEmpty);
+        registry.join("demo", spec("alice"), alice_tx).unwrap();
+        registry.join("demo", spec("bob"), bob_tx).unwrap();
+        registry.announced();
+
+        registry
+            .delete("demo")
+            .expect("the room is there to delete");
+
+        assert_eq!(
+            registry.announced_kinds(),
+            vec![
+                "participant_left",
+                "participant_left",
+                "session_finished",
+                "room_finished"
+            ],
+            "a deleted room was announced in an order a consumer would have to undo to make a \
+             timeline out of"
+        );
+    }
+
+    /// A recorder is hidden from the people in the room on purpose. It is not
+    /// hidden from whoever is billing for the recording, and "was this meeting
+    /// recorded" is asked a month later by somebody who was not there.
+    #[test]
+    fn a_recorder_is_announced_although_nobody_in_the_room_was_told_about_it() {
+        let mut registry = registry(RoomDefaults::default());
+        let (scribe_tx, _scribe_rx) = signal_channel();
+        let (alice_tx, mut alice_rx) = signal_channel();
+
+        registry.join("demo", spec("alice"), alice_tx).unwrap();
+        registry.announced();
+        drain(&mut alice_rx);
+
+        let scribe = registry.join("demo", hidden("scribe"), scribe_tx).unwrap();
+        assert!(
+            scribe.participant.is_hidden(),
+            "the participant under test is not hidden, so this proves nothing"
+        );
+        assert!(
+            expect_update_or_none(&mut alice_rx).is_none(),
+            "the room was told a hidden participant arrived"
+        );
+
+        let announced = registry.announced();
+        assert_eq!(
+            announced
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["participant_joined"],
+            "the recorder arrived and nothing outside this process was told"
+        );
+
+        registry.leave("demo", &scribe.participant.sid);
+        assert_eq!(
+            registry.announced_kinds(),
+            vec!["participant_left"],
+            "the recording stopped and nothing outside this process was told"
+        );
+    }
+
+    /// The one message a participant would have got, or nothing.
+    fn expect_update_or_none(rx: &mut SignalRx) -> Option<mediacore::ParticipantUpdate> {
+        match rx.try_recv() {
+            Ok(response) => match response.message {
+                Some(mediacore::signal_response::Message::Update(update)) => Some(update),
+                other => panic!("expected a participant update or nothing, got {other:?}"),
+            },
+            Err(_) => None,
+        }
+    }
+
     #[test]
     fn a_second_connection_from_the_same_person_gets_an_identity_of_its_own() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (first_tx, mut first_rx) = signal_channel();
         let (second_tx, _second_rx) = signal_channel();
 
@@ -3219,7 +4252,7 @@ mod tests {
 
     #[test]
     fn a_suffixed_identity_never_lands_on_one_that_is_taken() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (first_tx, _first_rx) = signal_channel();
         let (taken_tx, _taken_rx) = signal_channel();
         let (third_tx, _third_rx) = signal_channel();
@@ -3241,7 +4274,7 @@ mod tests {
     /// signal timeout collected it.
     #[test]
     fn a_resuming_session_takes_back_the_identity_it_had() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (first_tx, mut first_rx) = signal_channel();
         let (second_tx, mut second_rx) = signal_channel();
         let (again_tx, _again_rx) = signal_channel();
@@ -3284,7 +4317,7 @@ mod tests {
 
     #[test]
     fn a_resume_claim_cannot_name_somebody_elses_session() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
         let (mallory_tx, _mallory_rx) = signal_channel();
@@ -3318,7 +4351,7 @@ mod tests {
 
     #[test]
     fn a_room_the_first_arrival_made_is_settled_by_a_create() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let alice = registry.join("standup", spec("alice"), alice_tx).unwrap();
 
@@ -3359,7 +4392,7 @@ mod tests {
 
     #[test]
     fn one_person_holding_two_connections_is_found_by_either_name() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (first_tx, _first_rx) = signal_channel();
         let (second_tx, _second_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
@@ -3396,7 +4429,7 @@ mod tests {
 
     #[test]
     fn revoking_the_right_to_publish_takes_the_tracks_with_it() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
 
@@ -3450,7 +4483,7 @@ mod tests {
 
     #[test]
     fn revoking_the_right_to_subscribe_drops_what_was_wanted() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -3482,7 +4515,7 @@ mod tests {
 
     #[test]
     fn an_update_that_changes_nothing_is_not_announced() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let (bob_tx, mut bob_rx) = signal_channel();
 
@@ -3507,7 +4540,7 @@ mod tests {
 
     #[test]
     fn an_attribute_set_to_nothing_is_deleted() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, _alice_rx) = signal_channel();
         let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
 
@@ -3545,7 +4578,7 @@ mod tests {
 
     #[test]
     fn a_hidden_participant_hears_about_themselves_and_nobody_else_does() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (ghost_tx, mut ghost_rx) = signal_channel();
 
@@ -3583,7 +4616,7 @@ mod tests {
 
     #[test]
     fn a_policy_that_arrives_after_the_room_did_still_ends_the_session() {
-        let registry = Registry::new(RoomDefaults::default());
+        let registry = registry(RoomDefaults::default());
         let (alice_tx, mut alice_rx) = signal_channel();
         let (bob_tx, _bob_rx) = signal_channel();
 
@@ -3592,7 +4625,7 @@ mod tests {
         let bob = registry.join("standup", spec("bob"), bob_tx).unwrap();
         assert_eq!(room.settings().min_humans, 0);
 
-        room.set_session_policy(Some(2), Some(0));
+        registry.set_session_policy(&room, Some(2), Some(0));
         assert!(
             room.session_ends_at_ms().is_none(),
             "the room is full enough, there is nothing to end"

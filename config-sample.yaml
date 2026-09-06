@@ -56,6 +56,97 @@ room:
   # what the policy and the timeouts are counted in, so a second is enough.
   sweep_interval_ms: 1000
 
+sessions:
+  # Where the record of every meeting is kept: one JSON file per meeting, named
+  # by its session id. A meeting is one stretch of a room being occupied, and a
+  # room holds many of them one after another, so the record outlives the room
+  # — including a room that only ever existed because somebody walked into it
+  # and went away with them. Read back at /api/rooms/<room>/sessions,
+  # /api/rooms/<room>/session and /api/sessions/<id>.
+  #
+  # There is no setting that turns this off. Records are written as the meeting
+  # goes on rather than emitted when it ends, because a consumer that was down
+  # at half past six has to be able to come back and ask what it missed.
+  #
+  # The directory is created at start and the server refuses to start if it
+  # cannot be. Relative paths are relative to the working directory, which is
+  # right for a checkout and wrong for a container: in a container name a path
+  # on a volume, or the records go with the next release. Nothing here deletes
+  # a record — one small file per meeting, pruned with `find -mtime +90
+  # -delete` by whoever wants them pruned.
+  directory: sessions
+
+events:
+  # Who is told what happens, as it happens. Nothing here is on by default: with
+  # no webhook endpoint and no broker there are no destinations, no outbox
+  # directory is made and no task is started.
+  #
+  # An event is a notification that something changed and never the only copy of
+  # it. Everything announced here is also written down -- the meeting under
+  # sessions.directory, the room in ListRooms -- so a consumer that was down at
+  # half past six can come back and ask what it missed, and a delivery that is
+  # given up on costs a log line and a number on /healthz rather than a fact.
+  #
+  # Six event names. room_started, room_finished, participant_joined and
+  # participant_left are LiveKit's, spelled as LiveKit spells them, with
+  # LiveKit's payloads and LiveKit's signing. session_started and
+  # session_finished are for the thing LiveKit has no concept of: a room is a
+  # place and a session is the meeting that happened in it, and a room is made
+  # long before its meeting starts.
+
+  # The outbox. An event is written here before the first attempt is made and
+  # struck off once every destination has taken it, so an endpoint that is away
+  # for two minutes costs latency rather than two minutes of events -- and a
+  # restart in the middle of that costs nothing. In a container this belongs on
+  # a volume; docker-compose.yml mounts one.
+  directory: events
+
+  # How many events one destination may fall behind before the next one is
+  # thrown away rather than queued. This bounds what an unreachable endpoint
+  # costs in memory and how large the outbox can grow, because a record exists
+  # exactly while an event is in a queue. Something thrown away is counted, said
+  # in a log line, and reported to whoever eventually does hear from us as
+  # numDropped, which is LiveKit's field for exactly this.
+  queue: 10000
+
+  # How many times one event is offered to one destination before this server
+  # stops asking, how long an attempt may take, and the waits in between --
+  # doubling from backoff_ms, capped at max_backoff_ms. Bounded on purpose: an
+  # endpoint that has refused five times over half a minute will not take the
+  # sixth, and a destination retrying for ever never reaches the event behind
+  # the one it is stuck on.
+  attempts: 5
+  timeout_ms: 5000
+  backoff_ms: 1000
+  max_backoff_ms: 30000
+
+  webhooks:
+    # Every url gets every event, each with a queue and a worker of its own, so
+    # a slow endpoint delays only itself. POSTed as
+    # Content-Type: application/webhook+json with an Authorization: Bearer
+    # holding a short-lived JWT whose sha256 claim is the digest of the body --
+    # LiveKit's scheme exactly, so an existing LiveKit receiver takes these
+    # unchanged.
+    urls: []
+
+    # Which of the keys above signs them. The receiver reads the key name out of
+    # the token to know which secret to check it with, so this has to be a key
+    # this server actually has -- and it refuses to start if it is not, rather
+    # than signing everything with nothing and having it all rejected.
+    api_key: ""
+
+  kafka:
+    # Needs a binary built with --features kafka; without it a broker named here
+    # is refused at startup rather than quietly ignored. The body is the same
+    # bytes the webhooks post, keyed by room name so one room's events share a
+    # partition and stay in order.
+    brokers: ""
+    topic: mediacore
+
+    # Passed to librdkafka unread: security.protocol, ssl.ca.location, sasl.*
+    # and whatever else a broker wants.
+    properties: {}
+
 twirp:
   # The room API is mediacore.RoomService, so its own path is
   # /twirp/mediacore.RoomService/<Method>. LiveKit's server SDKs and lk do not

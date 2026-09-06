@@ -29,6 +29,10 @@ async fn spawn_server_with(adjust: impl FnOnce(&mut Config)) -> SocketAddr {
     config.rtc.port_range_start = 0;
     config.rtc.port_range_end = 0;
     config.rtc.bind_address = "127.0.0.1".to_owned();
+    // A directory of this server's own for session records: a test must
+    // never write into the tree, and two servers sharing a store would
+    // read each other's meetings back.
+    config.sessions.directory = tempfile::TempDir::new().unwrap().keep();
     adjust(&mut config);
 
     let state = AppState::start(config).await.unwrap();
@@ -231,8 +235,24 @@ async fn call_at(
         socket.write_all(head.as_bytes()).await.expect("request");
         socket.write_all(body).await.expect("request body");
 
+        // Read until the far end goes away, and treat a reset as it going
+        // away. A route this server does not have is answered before the
+        // request body is read, so the connection is closed with bytes still
+        // sitting in its receive queue -- which is a TCP reset rather than a
+        // clean close, and a reset throws away whatever this end had not read
+        // yet. Everything the server sent is already here by then; a response
+        // that really was cut short still fails, further down, on not being a
+        // response.
         let mut raw = Vec::new();
-        socket.read_to_end(&mut raw).await.expect("response");
+        let mut buffer = [0u8; 4096];
+        loop {
+            match socket.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => raw.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("response: {error}"),
+            }
+        }
         raw
     };
 
