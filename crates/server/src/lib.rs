@@ -1,10 +1,15 @@
 pub mod bandwidth;
+pub mod caretaker;
 pub mod forward;
 pub mod http;
 pub mod media;
+pub mod openapi;
 pub mod peer;
 pub mod publisher;
+pub mod rooms;
 pub mod signal;
 pub mod simulcast;
 pub mod state;
 pub mod subscriber;
+pub mod swagger;
+pub mod twirp;

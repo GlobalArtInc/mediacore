@@ -6,13 +6,15 @@ somebody ticks the box in the lobby.
 
 ```
                               the host
-        ┌──────────────────────────────────────────────────┐
-        │  caddy   80/tcp, 443/tcp   terminates TLS        │
-        │    ├── /rtc*  ──► sfu   :7880   signalling       │
-        │    └── /      ──► front :8080   page, /api/token │
-        │                                                  │
-        │  sfu     7882/udp          media, not proxied    │
-        └──────────────────────────────────────────────────┘
+        ┌────────────────────────────────────────────────────┐
+        │  caddy   80/tcp, 443/tcp   terminates TLS          │
+        │    ├── /rtc*     ──► sfu   :7880  signalling       │
+        │    ├── /twirp*   ──► sfu   :7880  server API       │
+        │    ├── /swagger* ──► sfu   :7880  API docs         │
+        │    └── /         ──► front :8080  page, /api/token │
+        │                                                    │
+        │  sfu     7882/udp          media, not proxied      │
+        └────────────────────────────────────────────────────┘
               ▲                              ▲
               │ https page, wss signalling   │ microphone audio
               └───────────── browser ────────┘
@@ -95,6 +97,109 @@ internet still works, and the page's content security policy (`default-src
 'none'`, `script-src 'self'`) forbids third-party scripts outright. The only
 cross-origin thing the page is permitted to open is the signalling WebSocket at
 `MEDIACORE_FRONT_WS_URL`, which is this same origin anyway.
+
+## The API page at `/swagger`
+
+`https://<MEDIACORE_PUBLIC_HOST>/swagger` is `livekit.RoomService` written out
+with a button next to every method. It is generated from the protobuf
+descriptors the binary was built from, so it describes the wire this build
+speaks rather than the wire somebody once wrote down.
+
+Three things to know before sending anyone the link.
+
+**It is served by the SFU, not by the front end, and that is deliberate.** The
+Try-it-out button posts to `/twirp/livekit.RoomService/…` on whatever origin
+served the page. Serve the page from one service and the API from another and
+every button is a cross-origin call to a different port — preflighted, possibly
+on a certificate this host's does not cover, and failing in the browser with
+nothing for an operator to read. Both come from the SFU, so the page works
+through Caddy on the public origin, and works exactly the same over an SSH
+tunnel to `127.0.0.1:7880/swagger` with no proxy at all.
+
+**Try-it-out is not a sandbox, and the page says so at the top.** `DeleteRoom`
+really deletes the room and hangs up on everyone in it. Nothing on that page is
+a dry run.
+
+**Reading it costs nothing; using it needs a server token.** Every method wants
+`Authorization: Bearer <jwt>` signed with `MEDIACORE_API_SECRET` and carrying
+`roomCreate`, `roomList` or `roomAdmin` — a backoffice credential, not the join
+token the front end mints for a browser. The page explains which method wants
+which, and that `roomAdmin` is the only grant scoped to one room. There is no
+token in the page and nothing to leak by publishing it, but if you would rather
+it were not on the public origin, delete the `handle /swagger*` block from the
+`Caddyfile` and restart Caddy: the API is unaffected and the page stays
+readable from the host on `127.0.0.1:7880`.
+
+Nothing is fetched from a CDN. swagger-ui is vendored in
+`crates/server/assets/vendor/`, compiled into the `mediacore` binary and served
+from this origin under a version-stamped path, and the page carries
+`default-src 'none'; script-src 'self'` like the front end does. Its licence
+notice is served beside it at `/swagger/NOTICE.txt`.
+
+## Upgrading a deployment that already runs
+
+### Using the compose file in this repository
+
+```
+git pull
+docker compose up -d --build
+docker compose restart caddy
+```
+
+The restart is not optional and is easy to forget: the `Caddyfile` gained a
+route, and Caddy's admin API is turned off here, so a running container will not
+pick it up on its own. Without it the stack comes up with the page compiled into
+the SFU and no way to reach it from the outside — `/swagger` falls through to
+the front end and answers 404.
+
+### A deployment whose compose file is not in this repository
+
+The one running the front end on **5401** behind Caddy on **5400** needs three
+changes and no new infrastructure.
+
+1. **Rebuild the SFU image from this tree.** The page, the vendored swagger-ui
+   and the OpenAPI document are all compiled into the `mediacore` binary. There
+   is no new file to mount, no new volume, no new environment variable and no
+   new port: `/swagger` is served by the process that already serves `/twirp`
+   on 7880.
+
+2. **Add one route to the reverse proxy, pointing at the same upstream as
+   `/twirp`.** In a Caddyfile:
+
+   ```
+   handle /swagger* {
+   	reverse_proxy sfu:7880
+   }
+   ```
+
+   In nginx, beside the `/twirp/` location:
+
+   ```
+   location /swagger {
+       proxy_pass http://sfu:7880;
+   }
+   ```
+
+   If `/twirp` is not routed on 5400 yet, route it in the same change. A page
+   whose every button 404s is worse than no page: it reads as a broken server.
+
+3. **Leave the front end on 5401 alone.** It serves nothing new, and `/swagger`
+   must *not* be routed to it — the front end does not have the page, and
+   pointing at it would put the documentation on a different origin from the API
+   it documents, which is the one arrangement that cannot work.
+
+Then check it, from a machine that reaches 5400:
+
+```
+curl -sS -o /dev/null -w '%{http_code}\n' https://<host>:5400/swagger
+curl -sS https://<host>:5400/swagger/openapi.json | head -c 32
+```
+
+`200`, and a document that begins `{ "openapi": "3.0.3", …`. If the first is a
+404, the route went to the front end or was never added. If the page loads and
+every Try-it-out comes back 404 with an HTML body rather than a Twirp error,
+`/twirp` is not on 5400 either — the request reached the front end, which has no
+such path, and the two halves are not one origin after all.
 
 ## TLS without a domain
 
@@ -227,6 +332,8 @@ above it: for a public VPS, `<ip>.sslip.io` replaces all of it with nothing.
 ```
 curl -k https://$MEDIACORE_PUBLIC_HOST/healthz     # -> ok      (the front end)
 curl -s 127.0.0.1:7880/healthz                     # -> counters (the SFU, host only)
+curl -sk -o /dev/null -w '%{http_code}\n' \
+     https://$MEDIACORE_PUBLIC_HOST/swagger        # -> 200     (the API docs, on the SFU)
 docker compose ps                                  # three services, sfu and front healthy
 ```
 
@@ -434,9 +541,13 @@ decides.
   `crates/front/assets/vendor/`, is compiled into `mediacore-front` and is
   served from this origin under a version-stamped path, so there is no CDN in
   the runtime path and no third-party script for the content security policy to
-  allow. See that directory's README to move to another version.
-- **What this is not.** One node, no TURN, no recording, no room management API,
-  and a room that anyone with the URL can join under any name. The token
+  allow. See that directory's README to move to another version. swagger-ui,
+  under `crates/server/assets/vendor/`, is vendored into the SFU on the same
+  terms and for the same reasons.
+- **What this is not.** One node, no TURN, no recording, and a room that anyone
+  with the URL can join under any name. There *is* a room management API —
+  `livekit.RoomService`, documented at `/swagger` — but it needs a token signed
+  with `MEDIACORE_API_SECRET`, which the front end never hands out. The token
   endpoint is unauthenticated, which is why it is confined to
   `MEDIACORE_FRONT_ROOM` and the namespace below it: put the front end on an SFU
   that is also serving something real and it still cannot reach that something's

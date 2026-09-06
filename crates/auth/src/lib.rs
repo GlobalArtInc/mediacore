@@ -82,7 +82,7 @@ pub struct Claims {
     pub iss: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub nbf: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sub: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -116,6 +116,14 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// Checks that a token is ours and still valid, and nothing else.
+///
+/// `sub` is deliberately not required. A token for the room service carries no
+/// identity at all -- LiveKit's own server SDKs refuse to set one unless the
+/// grant is `roomJoin`, so their `CreateRoom` token has no `sub` field to
+/// find. Insisting on one here would reject every server SDK on the first
+/// call. The identity is required where it is actually needed, by
+/// [`verify_join`].
 pub fn verify(token: &str, keys: &HashMap<String, String>) -> Result<Claims, AuthError> {
     let issuer = peek_issuer(token)?;
     let secret = keys
@@ -125,7 +133,7 @@ pub fn verify(token: &str, keys: &HashMap<String, String>) -> Result<Claims, Aut
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_nbf = true;
     validation.leeway = 5;
-    validation.set_required_spec_claims(&["exp", "iss", "sub"]);
+    validation.set_required_spec_claims(&["exp", "iss"]);
 
     let data = decode::<Claims>(
         token,
@@ -236,6 +244,39 @@ mod tests {
             verify(&token, &keys()),
             Err(AuthError::Rejected(_))
         ));
+    }
+
+    #[test]
+    fn accepts_a_server_api_token_that_names_nobody() {
+        let claims = Claims {
+            exp: now() + 600,
+            iss: "key1".to_owned(),
+            video: VideoGrant {
+                room_create: Some(true),
+                ..VideoGrant::default()
+            },
+            ..Claims::default()
+        };
+        let token = issue("secret-with-enough-length", &claims).unwrap();
+
+        let payload = token.split('.').nth(1).unwrap();
+        let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(
+            !payload.contains("\"sub\""),
+            "the token under test has an identity after all, so it proves nothing: {payload}"
+        );
+
+        let verified = verify(&token, &keys()).expect(
+            "LiveKit's server SDKs mint a room service token with no identity on it, so requiring \
+             one here refuses every one of them",
+        );
+        assert!(verified.identity().is_empty());
+        assert_eq!(verified.video.room_create, Some(true));
+
+        assert!(
+            matches!(verify_join(&token, &keys()), Err(AuthError::NoRoomGrant)),
+            "a token with nobody on it must still not be allowed into a room"
+        );
     }
 
     #[test]

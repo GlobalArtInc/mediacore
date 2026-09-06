@@ -287,3 +287,77 @@ async fn room_state_is_visible_over_http() {
     assert!(body.contains("bwe=off allocated_subscribers=0"));
     assert!(body.contains("ice=127.0.0.1:"));
 }
+
+async fn connect_resuming(addr: SocketAddr, identity: &str, room: &str, sid: &str) -> Client {
+    let url = format!(
+        "ws://{addr}/rtc?access_token={}&protocol=17&sdk=test&reconnect=1&sid={sid}",
+        token(identity, room)
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    socket
+}
+
+async fn next_join(client: &mut Client) -> livekit::JoinResponse {
+    match next_signal(client).await {
+        signal_response::Message::Join(join) => join,
+        other => panic!("expected a join response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_second_connection_from_one_person_is_told_which_one_it_is() {
+    let addr = spawn_server().await;
+
+    let mut laptop = connect(addr, "alice", "demo").await;
+    let first = next_join(&mut laptop).await.participant.unwrap();
+
+    let mut phone = connect(addr, "alice", "demo").await;
+    let second = next_join(&mut phone).await.participant.unwrap();
+
+    assert_eq!(first.identity, "alice");
+    assert_eq!(
+        second.identity, "alice#2",
+        "the second connection was given an identity every client in the room would confuse \
+         with the first"
+    );
+    assert_eq!(
+        second.name, "alice",
+        "the person's display name was rewritten to match their connection"
+    );
+
+    match next_signal(&mut laptop).await {
+        signal_response::Message::Update(update) => {
+            assert_eq!(update.participants[0].identity, "alice#2");
+            assert_eq!(
+                update.participants[0].state,
+                livekit::participant_info::State::Joined as i32
+            );
+        }
+        other => panic!("the laptop was not told about the phone, it got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reconnecting_client_takes_back_the_session_it_names() {
+    let addr = spawn_server().await;
+
+    let mut first = connect(addr, "alice", "demo").await;
+    let joined = next_join(&mut first).await.participant.unwrap();
+
+    let mut again = connect_resuming(addr, "alice", "demo", &joined.sid).await;
+    let resumed = next_join(&mut again).await.participant.unwrap();
+
+    assert_eq!(
+        resumed.identity, "alice",
+        "a client that came back to the session it had was seated next to its own ghost"
+    );
+    assert_ne!(resumed.sid, joined.sid);
+
+    match next_signal(&mut first).await {
+        signal_response::Message::Leave(leave) => assert_eq!(
+            leave.reason,
+            livekit::DisconnectReason::DuplicateIdentity as i32
+        ),
+        other => panic!("the session that was taken over was left running, it got {other:?}"),
+    }
+}

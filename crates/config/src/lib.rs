@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::Deserialize;
 
+pub const DEFAULT_END_GRACE_SECONDS: u32 = 90;
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
 pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
 pub const DEFAULT_DYNACAST_PAUSE_DELAY_MS: u32 = 5_000;
@@ -17,6 +18,7 @@ pub const DEFAULT_BWE_AUDIO_RESERVE_KBPS: u32 = 48;
 pub const DEFAULT_BWE_OVERHEAD_BYTES: u32 = 40;
 pub const DEFAULT_BWE_ALLOCATION_INTERVAL_MS: u32 = 250;
 pub const DEFAULT_BWE_RECOVERY_HOLD_MS: u32 = 2_000;
+pub const DEFAULT_SWEEP_INTERVAL_MS: u32 = 1_000;
 pub const DEFAULT_BWE_RECOVERY_STEP_MS: u32 = 1_000;
 pub const DEFAULT_BWE_QUEUE_PRESSURE_MS: u32 = 150;
 pub const DEFAULT_BWE_MAX_OVERRUN_PERCENT: u32 = 150;
@@ -42,6 +44,32 @@ pub struct RoomConfig {
     pub empty_timeout: u32,
     pub departure_timeout: u32,
     pub max_participants: u32,
+    pub min_humans: u32,
+    pub end_grace: u32,
+    pub duplicate_identity: DuplicateIdentity,
+    pub sweep_interval_ms: u32,
+}
+
+impl RoomConfig {
+    /// How often the server looks at rooms nobody is doing anything to.
+    ///
+    /// Everything else about a room happens because somebody joined, left or
+    /// called the API. The two things that have to happen when nobody does
+    /// anything -- a session policy running out, an empty room being collected
+    /// -- need a clock of their own, and this is its tick. Both are counted in
+    /// whole seconds, so a second is close enough; it is a setting so that a
+    /// test can watch the sweep happen without waiting for one.
+    pub fn sweep_interval(&self) -> Duration {
+        Duration::from_millis(self.sweep_interval_ms.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateIdentity {
+    #[default]
+    Suffix,
+    Displace,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,6 +217,10 @@ impl Default for RoomConfig {
             empty_timeout: 300,
             departure_timeout: 20,
             max_participants: 0,
+            min_humans: 0,
+            end_grace: DEFAULT_END_GRACE_SECONDS,
+            duplicate_identity: DuplicateIdentity::default(),
+            sweep_interval_ms: DEFAULT_SWEEP_INTERVAL_MS,
         }
     }
 }
@@ -323,6 +355,54 @@ mod tests {
     }
 
     #[test]
+    fn the_session_policy_is_off_until_a_room_asks_for_one() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+
+        assert_eq!(
+            config.room.min_humans, 0,
+            "upgrading must not start ending rooms that nobody asked to be ended"
+        );
+        assert_eq!(config.room.end_grace, DEFAULT_END_GRACE_SECONDS);
+        assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
+    }
+
+    #[test]
+    fn the_sweep_has_a_tick_of_its_own() {
+        let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+        assert_eq!(
+            config.room.sweep_interval(),
+            Duration::from_secs(1),
+            "the session policy and both room timeouts are counted in whole seconds, and nothing \
+             else on the server enforces them"
+        );
+
+        let quick =
+            Config::parse("keys:\n  key1: secret1\nroom:\n  sweep_interval_ms: 50\n").unwrap();
+        assert_eq!(quick.room.sweep_interval(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_session_policy_and_the_duplicate_rule_are_configurable() {
+        let config = Config::parse(
+            "keys:\n  key1: secret1\nroom:\n  min_humans: 2\n  end_grace: 90\n  duplicate_identity: displace\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.room.min_humans, 2);
+        assert_eq!(config.room.end_grace, 90);
+        assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Displace);
+        assert!(
+            config.room.auto_create,
+            "the rest of the room block kept its defaults"
+        );
+
+        assert!(
+            Config::parse("keys:\n  key1: secret1\nroom:\n  duplicate_identity: rename\n").is_err(),
+            "a rule the server does not have must not be read as one it does"
+        );
+    }
+
+    #[test]
     fn rejects_config_without_keys() {
         assert!(Config::parse("port: 8080\n").is_err());
     }
@@ -432,6 +512,11 @@ mod tests {
             .expect("config-sample.yaml has drifted away from the config this server reads");
 
         assert_eq!(config.port, 7880);
+        assert_eq!(
+            config.room.min_humans, 0,
+            "the sample must not ship a policy that ends rooms nobody asked it to end"
+        );
+        assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
         assert!(
             !config.video.bwe.enabled,
             "the sample must not turn bandwidth estimation on before the bench has passed"

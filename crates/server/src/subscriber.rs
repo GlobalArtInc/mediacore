@@ -548,15 +548,45 @@ impl SubscriberSession {
         self.pending = None;
     }
 
+    /// Subscribes to everything this participant may see and has not been
+    /// offered before.
+    ///
+    /// Two things are remembered here and they are not the same thing. This
+    /// session's `auto_subscribed` is what it has already offered, so a track
+    /// is never auto-subscribed over the top of somebody's own decision; the
+    /// decision itself lives on the participant, in the room, because it is an
+    /// answer a person gave and it has to outlive whatever this session
+    /// happens to be holding in a `HashSet`.
+    ///
+    /// Which is why the memory is trimmed to what it can still explain: a
+    /// track this session offered is remembered while the participant either
+    /// wants it or has refused it, and forgotten otherwise. A moderator taking
+    /// `canSubscribe` away drops every subscription the participant wanted, so
+    /// without the trim those tracks would count as already offered for ever
+    /// -- and giving the permission back a moment later would leave them
+    /// looking at a blank screen until they reloaded the page, with no timer
+    /// anywhere that recovers from it. Trimming on what is left rather than on
+    /// the revocation itself means it does not matter whether this session ever
+    /// saw the permission go: both updates can arrive between two reconciles.
     fn refresh_auto_subscriptions(&mut self, joined: &Joined) {
         if !self.auto_subscribe {
             return;
         }
 
+        let desired: HashSet<String> = joined
+            .participant
+            .desired_subscriptions()
+            .into_iter()
+            .collect();
+        self.auto_subscribed.retain(|track_sid| {
+            desired.contains(track_sid) || joined.participant.declines_subscription(track_sid)
+        });
+
         let fresh: Vec<String> = joined
             .room
             .subscribable_track_sids(&joined.participant.sid)
             .into_iter()
+            .filter(|track_sid| !joined.participant.declines_subscription(track_sid))
             .filter(|track_sid| self.auto_subscribed.insert(track_sid.clone()))
             .collect();
 
@@ -986,7 +1016,7 @@ impl SubscriberSession {
     fn announce(&self, state: &AppState, joined: &Joined, track_sid: &str, publisher_sid: &str) {
         stream_state(joined, publisher_sid, track_sid, false);
 
-        if !joined.participant.permission.hidden && state.router.mark_subscribed(track_sid) {
+        if !joined.participant.is_hidden() && state.router.mark_subscribed(track_sid) {
             let Some(publisher) = joined.room.participant_by_sid(publisher_sid) else {
                 return;
             };

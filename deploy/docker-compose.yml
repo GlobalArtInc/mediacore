@@ -1,9 +1,11 @@
 name: mediacore
 
 # Three containers:
-#   caddy  terminates TLS, serves the front end at / and proxies /rtc to the SFU
+#   caddy  terminates TLS, serves the front end at / and proxies /rtc, /twirp
+#          and /swagger to the SFU
 #   front  the page and the token endpoint
-#   sfu    signalling on 7880 and, crucially, media on UDP straight from the host
+#   sfu    signalling on 7880, the room service API and its documentation page,
+#          and, crucially, media on UDP straight from the host
 #
 # Media never passes through Caddy. The UDP port is published on the host and the
 # SFU tells every client to send media to MEDIACORE_ADVERTISE_IP on that port.
@@ -41,7 +43,11 @@ services:
       - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
     ports:
       # Signalling reaches the SFU over the compose network; this mapping is for
-      # the operator on the host (curl 127.0.0.1:7880/healthz), not for clients.
+      # the operator on the host, not for clients. It is now also the way to
+      # read the API documentation without putting it on the public origin:
+      # http://127.0.0.1:7880/swagger works over an SSH tunnel, and its
+      # Try-it-out button posts to the same 127.0.0.1:7880, because the page
+      # and the API are one service.
       - "127.0.0.1:7880:7880"
       # Host port and container port must be the same number: ICE replies leave
       # the container from the port it bound, and a rewritten port breaks the

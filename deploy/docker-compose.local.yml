@@ -45,7 +45,9 @@ services:
       - ./start-sfu.sh:/etc/mediacore/start-sfu.sh:ro
     ports:
       # The browser talks to the SFU directly here: signalling on 7880 and
-      # media on 7882. Both are bound to loopback only.
+      # media on 7882. Both are bound to loopback only. With no Caddy in this
+      # file, the API documentation is simply where the API is:
+      # http://127.0.0.1:7880/swagger.
       - "127.0.0.1:7880:7880"
       - "127.0.0.1:7882:7882/udp"
     healthcheck:

@@ -8,10 +8,53 @@ keys:
   devkey: devsecretdevsecretdevsecretdevsecret
 
 room:
+  # With auto_create off, a room has to be created before anybody can join it,
+  # which is what makes it possible for only the rooms an operator knows about
+  # to exist. A room created that way carries its own settings and outlives the
+  # last person to leave it; a room that only exists because somebody walked in
+  # is closed as soon as they walk out.
   auto_create: true
+
+  # How long a created room is kept with nobody in it: empty_timeout before
+  # anybody has ever joined it, departure_timeout after the last person leaves.
+  # These only apply to rooms somebody created -- one that exists because an
+  # arrival opened it is gone the moment they walk out, which is a departure
+  # timeout of zero. Either at 0 means such a room is never collected and
+  # DeleteRoom is the only way to be rid of it, which for a service that makes
+  # a room per meeting means the room list grows for as long as the process
+  # lives. A room counting down to the end of its session is not idle and is
+  # left to end when it said it would.
   empty_timeout: 300
   departure_timeout: 20
   max_participants: 0
+
+  # The room ends when fewer than min_humans people are left in it, end_grace
+  # seconds after the one who left. Somebody arriving inside that window calls
+  # it off. A recorder or an agent is not a person: those are told apart by the
+  # recorder and agent grants in a token, or its kind claim, and a room of them
+  # ends on schedule. Off at min_humans: 0, which is what every room does today
+  # — emptiness is the only thing that ends one. These two are the default for
+  # every room; a room can carry a policy of its own in its metadata, under a
+  # sessionPolicy key, which is how one reaches CreateRoom through an
+  # unmodified LiveKit server SDK. See "Server API" in the README.
+  min_humans: 0
+  end_grace: 90
+
+  # What happens when an identity that is already in the room joins again.
+  # suffix gives the new connection an identity of its own -- alice, alice#2,
+  # alice#3 -- keeps the display name, and tells the client which one it got in
+  # the JoinResponse, so one person can be in a room from a laptop and a phone
+  # at once. displace throws the earlier session out, which is what LiveKit
+  # does. A client that reconnects naming the session it had takes that session
+  # back under either rule rather than becoming a second person.
+  duplicate_identity: suffix
+
+  # How often the server looks at rooms nobody is doing anything to. It is the
+  # only clock the room registry has: a session policy running out and an empty
+  # room being collected both happen here, and both would otherwise wait for
+  # somebody to open a signalling session and drive them. Whole seconds are
+  # what the policy and the timeouts are counted in, so a second is enough.
+  sweep_interval_ms: 1000
 
 rtc:
   udp_port: 7882

@@ -3,11 +3,13 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::{Method, StatusCode};
-use axum::routing::get;
-use tower_http::cors::{Any, CorsLayer};
+use axum::routing::{any, get};
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
+use crate::rooms;
 use crate::signal::{self, SignalQuery};
 use crate::state::AppState;
+use crate::swagger;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -15,14 +17,26 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/rtc", get(signal::handler))
         .route("/rtc/validate", get(validate))
+        .route(rooms::SERVICE_PATH, any(rooms::handler))
+        // Merged, not routed here, so the page carries a content security policy
+        // and the signalling routes do not.
+        .merge(swagger::router())
         .layer(cors())
         .with_state(state)
 }
 
+/// Wide open, because the demo page and any backoffice reach this from a
+/// browser on some other origin.
+///
+/// The request headers are mirrored rather than answered with `*`: the Fetch
+/// standard makes `Access-Control-Allow-Headers: *` a wildcard over every
+/// header name *except* `Authorization`, which has to be named. A browser
+/// calling the room service sends exactly that header, so the wildcard alone
+/// would fail its preflight and no call would ever be made.
 fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_headers(Any)
+        .allow_headers(AllowHeaders::mirror_request())
         .expose_headers(Any)
         .allow_methods([
             Method::OPTIONS,

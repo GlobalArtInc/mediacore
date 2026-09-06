@@ -547,7 +547,7 @@ fn sending_sections(sdp: &str) -> HashMap<String, bool> {
 }
 
 fn announce(joined: &Joined) {
-    if joined.participant.permission.hidden {
+    if joined.participant.is_hidden() {
         return;
     }
 

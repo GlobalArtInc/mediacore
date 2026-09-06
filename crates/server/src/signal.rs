@@ -9,7 +9,7 @@ use futures_util::stream::{SplitSink, StreamExt};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_proto::livekit::{self, signal_request, signal_response};
 use mediacore_proto::{PROTOCOL_VERSION, SERVER_VERSION};
-use mediacore_room::{Joined, ParticipantSpec};
+use mediacore_room::{Joined, ParticipantKind, ParticipantSpec};
 use prost::Message as _;
 use serde::Deserialize;
 use tokio::time::Instant;
@@ -37,10 +37,17 @@ pub struct SignalQuery {
     #[serde(default)]
     pub reconnect: Option<String>,
     #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
     pub auto_subscribe: Option<String>,
 }
 
 impl SignalQuery {
+    pub fn resumes(&self) -> Option<String> {
+        self.reconnect.as_ref()?;
+        self.sid.clone().filter(|sid| !sid.is_empty())
+    }
+
     pub fn auto_subscribe(&self) -> bool {
         match self.auto_subscribe.as_deref() {
             None => true,
@@ -70,25 +77,30 @@ pub async fn handler(
 
 async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: WebSocket) {
     let room_name = claims.video.room.clone();
-    let identity = claims.identity().to_owned();
+    let requested = claims.identity().to_owned();
     let (tx, mut rx) = mediacore_room::signal_channel();
 
     if query.reconnect.is_some() {
-        tracing::debug!(%identity, "resume is not implemented, joining as a new session");
+        tracing::debug!(
+            identity = %requested,
+            "resume is not implemented, rejoining as a new session in place of the one named"
+        );
     }
 
     let spec = ParticipantSpec {
-        identity: identity.clone(),
+        identity: requested.clone(),
         name: claims.display_name().to_owned(),
         metadata: claims.metadata.clone(),
         attributes: claims.attributes.clone(),
         permission: permission_from(&claims.video),
+        kind: kind_from(&claims),
+        replaces: query.resumes(),
     };
 
     let joined = match state.registry.join(&room_name, spec, tx) {
         Ok(joined) => joined,
         Err(error) => {
-            tracing::info!(%error, room = %room_name, %identity, "join rejected");
+            tracing::info!(%error, room = %room_name, identity = %requested, "join rejected");
             let mut socket = socket;
             let _ = write(
                 &mut socket,
@@ -101,9 +113,11 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
     };
 
     let sid = joined.participant.sid.clone();
+    let identity = joined.participant.identity.clone();
     tracing::info!(
         room = %room_name,
         %identity,
+        %requested,
         %sid,
         sdk = query.sdk.as_deref().unwrap_or("unknown"),
         sdk_version = query.version.as_deref().unwrap_or("unknown"),
@@ -455,6 +469,22 @@ fn permission_from(grant: &VideoGrant) -> livekit::ParticipantPermission {
     }
 }
 
+fn kind_from(claims: &Claims) -> ParticipantKind {
+    match claims.kind.trim().to_ascii_lowercase().as_str() {
+        "egress" | "recorder" => return ParticipantKind::Egress,
+        "agent" => return ParticipantKind::Agent,
+        _ => {}
+    }
+
+    if claims.video.recorder.unwrap_or(false) {
+        ParticipantKind::Egress
+    } else if claims.video.agent.unwrap_or(false) {
+        ParticipantKind::Agent
+    } else {
+        ParticipantKind::Standard
+    }
+}
+
 const UNRECOGNISED_SOURCE: i32 = -1;
 
 fn publish_sources(grant: &VideoGrant) -> Vec<i32> {
@@ -535,5 +565,70 @@ mod tests {
     #[test]
     fn a_token_that_names_no_sources_stays_unrestricted() {
         assert!(publish_sources(&VideoGrant::default()).is_empty());
+    }
+
+    fn claims(video: VideoGrant, kind: &str) -> Claims {
+        Claims {
+            video,
+            kind: kind.to_owned(),
+            ..Claims::default()
+        }
+    }
+
+    #[test]
+    fn a_recorder_and_an_agent_are_not_counted_as_people() {
+        let recorder = VideoGrant {
+            recorder: Some(true),
+            ..VideoGrant::default()
+        };
+        let agent = VideoGrant {
+            agent: Some(true),
+            ..VideoGrant::default()
+        };
+
+        assert_eq!(
+            kind_from(&claims(recorder, "")),
+            ParticipantKind::Egress,
+            "a recorder counted as a person keeps a room open after the last person left it"
+        );
+        assert_eq!(kind_from(&claims(agent, "")), ParticipantKind::Agent);
+        assert_eq!(
+            kind_from(&claims(VideoGrant::default(), "egress")),
+            ParticipantKind::Egress,
+            "a token that says what it is in the kind claim is telling us the same thing"
+        );
+        assert!(
+            kind_from(&claims(VideoGrant::default(), "")).is_human(),
+            "an ordinary token is somebody who came to talk"
+        );
+        assert!(
+            kind_from(&claims(VideoGrant::default(), "sip")).is_human(),
+            "a caller on a phone is still a person in the room"
+        );
+    }
+
+    #[test]
+    fn a_session_only_claims_a_resume_when_the_client_says_it_is_one() {
+        let query = |reconnect: Option<&str>, sid: Option<&str>| SignalQuery {
+            access_token: String::new(),
+            protocol: None,
+            sdk: None,
+            version: None,
+            reconnect: reconnect.map(str::to_owned),
+            sid: sid.map(str::to_owned),
+            auto_subscribe: None,
+        };
+
+        assert_eq!(
+            query(Some("1"), Some("PA_one")).resumes(),
+            Some("PA_one".to_owned())
+        );
+        assert_eq!(
+            query(None, Some("PA_one")).resumes(),
+            None,
+            "a fresh connection naming a session sid would evict whoever holds it"
+        );
+        assert_eq!(query(Some("1"), None).resumes(), None);
+        assert_eq!(query(Some("1"), Some("")).resumes(), None);
     }
 }

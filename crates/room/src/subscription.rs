@@ -16,6 +16,7 @@ impl SubscriptionDiff {
 pub struct Subscriptions {
     desired: BTreeSet<String>,
     active: BTreeSet<String>,
+    declined: BTreeSet<String>,
 }
 
 impl Subscriptions {
@@ -30,7 +31,10 @@ impl Subscriptions {
     where
         I: IntoIterator<Item = String>,
     {
-        self.desired.extend(track_sids);
+        for track_sid in track_sids {
+            self.declined.remove(&track_sid);
+            self.desired.insert(track_sid);
+        }
     }
 
     pub fn remove_desired<I>(&mut self, track_sids: I)
@@ -40,6 +44,37 @@ impl Subscriptions {
         for track_sid in track_sids {
             self.desired.remove(&track_sid);
         }
+    }
+
+    /// Drops the intent and remembers that it was the participant's own answer.
+    ///
+    /// The difference from `remove_desired` is who said so. A track removed
+    /// because it left the room can come back; a track somebody unsubscribed
+    /// from stays unsubscribed until they ask for it again, whatever an
+    /// auto-subscribe pass thinks it has not offered yet.
+    pub fn decline<I>(&mut self, track_sids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for track_sid in track_sids {
+            self.desired.remove(&track_sid);
+            self.declined.insert(track_sid);
+        }
+    }
+
+    /// Forgets a track entirely -- neither wanted nor refused.
+    pub fn forget<I>(&mut self, track_sids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for track_sid in track_sids {
+            self.desired.remove(&track_sid);
+            self.declined.remove(&track_sid);
+        }
+    }
+
+    pub fn is_declined(&self, track_sid: &str) -> bool {
+        self.declined.contains(track_sid)
     }
 
     pub fn mark_active(&mut self, track_sid: &str) {
@@ -116,6 +151,33 @@ mod tests {
         assert_eq!(subscriptions.diff().to_unsubscribe, sids(&["TR_a"]));
         assert!(!subscriptions.is_desired("TR_a"));
         assert!(subscriptions.is_active("TR_a"));
+    }
+
+    #[test]
+    fn a_refusal_outlives_the_intent_it_dropped() {
+        let mut subscriptions = Subscriptions::default();
+        subscriptions.add_desired(sids(&["TR_a"]));
+        subscriptions.decline(sids(&["TR_a"]));
+
+        assert!(
+            subscriptions.is_declined("TR_a"),
+            "an unsubscribe that is not remembered is undone by the next auto-subscribe pass"
+        );
+        assert!(!subscriptions.is_desired("TR_a"));
+
+        subscriptions.add_desired(sids(&["TR_a"]));
+        assert!(
+            !subscriptions.is_declined("TR_a"),
+            "asking for a track again is how somebody takes a refusal back"
+        );
+
+        subscriptions.decline(sids(&["TR_a"]));
+        subscriptions.forget(sids(&["TR_a"]));
+        assert!(
+            !subscriptions.is_declined("TR_a"),
+            "a track that left the room takes the refusal with it, or a publisher who \
+             republishes is never heard by whoever said no to the earlier track"
+        );
     }
 
     #[test]

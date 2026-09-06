@@ -10,6 +10,8 @@ use mediacore_proto::livekit;
 use mediacore_server::forward::SubscriptionSnapshot;
 use mediacore_server::http;
 use mediacore_server::state::AppState;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const API_KEY: &str = "devkey";
 const API_SECRET: &str = "devsecretdevsecretdevsecretdevsecret";
@@ -25,7 +27,12 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
-        let mut config = Config::parse(&format!("keys:\n  {API_KEY}: {API_SECRET}\n")).unwrap();
+        Self::start_with("").await
+    }
+
+    async fn start_with(extra: &str) -> Self {
+        let mut config =
+            Config::parse(&format!("keys:\n  {API_KEY}: {API_SECRET}\n{extra}")).unwrap();
         config.port = 0;
         config.rtc.udp_port = 0;
         config.rtc.port_range_start = 0;
@@ -87,6 +94,61 @@ fn token(identity: &str, grant: VideoGrant) -> String {
 
 async fn join(server: &Server, identity: &str) -> Client {
     join_with(server, identity, VideoGrant::default()).await
+}
+
+fn admin_token() -> String {
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+
+    mediacore_auth::issue(
+        API_SECRET,
+        &Claims {
+            exp,
+            iss: API_KEY.to_owned(),
+            video: VideoGrant {
+                room_admin: Some(true),
+                room: ROOM.to_owned(),
+                ..VideoGrant::default()
+            },
+            ..Claims::default()
+        },
+    )
+    .unwrap()
+}
+
+async fn room_service(server: &Server, method: &str, body: serde_json::Value) -> u16 {
+    let body = body.to_string();
+    let request = format!(
+        "POST /twirp/livekit.RoomService/{method} HTTP/1.1\r\nHost: {}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        server.addr,
+        admin_token(),
+        body.len()
+    );
+
+    let exchange = async {
+        let mut socket = TcpStream::connect(server.addr).await.expect("connect");
+        socket.write_all(request.as_bytes()).await.expect("request");
+
+        let mut raw = String::new();
+        socket.read_to_string(&mut raw).await.expect("response");
+        raw
+    };
+
+    let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the room service did not answer in time");
+
+    response
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no status line in {response}"))
+        .parse()
+        .expect("numeric http status")
 }
 
 async fn join_with(server: &Server, identity: &str, grant: VideoGrant) -> Client {
@@ -553,7 +615,7 @@ async fn unpublishing_a_track_tears_every_subscription_of_it_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_under_the_same_identity_takes_the_old_subscriptions_with_it() {
-    let server = Server::start().await;
+    let server = Server::start_with("room:\n  duplicate_identity: displace\n").await;
 
     let bob = join(&server, "bob").await;
     let alice = join(&server, "alice").await;
@@ -596,4 +658,53 @@ async fn a_reconnect_under_the_same_identity_takes_the_old_subscriptions_with_it
 
     alice_again.leave().await.expect("alice leaves");
     bob.leave().await.expect("bob leaves");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscription_dropped_from_outside_the_room_really_stops() {
+    let server = Server::start().await;
+
+    let bob = join(&server, "bob").await;
+    let alice = join(&server, "alice").await;
+    let mic = publish(&alice, TrackSpec::audio("mic")).await;
+
+    receive(&bob, mic.sid(), 20).await;
+    assert_eq!(server.subscriber_count(mic.sid()), 1);
+
+    let dropped = room_service(
+        &server,
+        "UpdateSubscriptions",
+        serde_json::json!({
+            "room": ROOM,
+            "identity": "bob",
+            "trackSids": [mic.sid()],
+            "subscribe": false,
+        }),
+    )
+    .await;
+    assert_eq!(dropped, 200);
+
+    until("bob's subscription to be torn down", || {
+        (server.subscriber_count(mic.sid()) == 0).then_some(())
+    })
+    .await;
+
+    let restored = room_service(
+        &server,
+        "UpdateSubscriptions",
+        serde_json::json!({
+            "room": ROOM,
+            "identity": "bob",
+            "trackSids": [mic.sid()],
+            "subscribe": true,
+        }),
+    )
+    .await;
+    assert_eq!(restored, 200);
+
+    until("bob's subscription to come back", || {
+        (server.subscriber_count(mic.sid()) == 1).then_some(())
+    })
+    .await;
+    receive(&bob, mic.sid(), 40).await;
 }

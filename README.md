@@ -25,10 +25,99 @@ subscriber gets is the one its own link can carry.
 | M8 | Metrics, load and interop testing | not started |
 
 A client that connects today receives a `JoinResponse`, sees other participants join and leave,
-answers pings, is displaced when the same identity joins again, and is disconnected with a stated
-reason after 60 seconds of silence. It can add a track, offer, complete ICE and DTLS against the
-server's ice-lite agent, and send SRTP that the server receives, decrypts and accounts for. Other
-participants see the published track appear, change and go away in their participant updates.
+answers pings, and is disconnected with a stated reason after 60 seconds of silence. It can add a
+track, offer, complete ICE and DTLS against the server's ice-lite agent, and send SRTP that the
+server receives, decrypts and accounts for. Other participants see the published track appear,
+change and go away in their participant updates.
+
+Rooms exist because somebody made them, not only because somebody walked in. A room can be created
+before anybody arrives and carries settings of its own — metadata, participant limit, empty and
+departure timeouts — which override the `room` block for that room alone. Creating a room that is
+already there returns the one that is there and changes nothing about it, so a caller retrying a
+request cannot rewrite a room people are already sitting in. Creating one that exists only because
+somebody walked into it is the other case: that room took the server defaults because nobody had
+asked for anything, so the request wins — the settings apply, the room stops closing itself when it
+empties, and whoever is already inside is told the new metadata in a `RoomUpdate`. That last one is
+asked of a token that names the room, because `roomCreate` names none and settling a meeting that is
+already running should not be something a server-wide token does by accident; see
+[Server API](#server-api). With `room.auto_create` off, joining a room nobody created is refused,
+which is what makes it possible for only the rooms an operator knows about to exist. A room somebody
+created outlives the last person to leave it; a room that exists only because somebody walked in is
+closed when they walk out, as before. Deleting a room is not dropping a
+map entry: everyone in it is sent a `Leave` naming `ROOM_DELETED` first, and removing one participant
+sends it `PARTICIPANT_REMOVED` and tells the rest of the room the same reason, on the same path a
+displaced session already used.
+
+A created room does not live for ever either. `empty_timeout` is how long it is kept before anybody
+has ever joined it and `departure_timeout` how long after the last person leaves — LiveKit's own
+division, and both are enforced rather than only reported. A room that exists because an arrival
+opened it still goes the moment they walk out, which is a departure timeout of zero; either timeout
+set to zero means such a room is never collected and `DeleteRoom` is the only way to be rid of it.
+
+A session can also end by policy rather than by emptiness. `room.min_humans` is how many **people** a
+room needs; when fewer than that are left, the room ends `room.end_grace` seconds later and whoever
+is still in it is disconnected with `ROOM_CLOSED`. Somebody arriving inside the grace period calls it
+off. A recorder or an agent is not a person — the `recorder` and `agent` grants, and a token's `kind`
+claim, become `ParticipantInfo.kind`, and a room holding nothing but those ends on schedule, which is
+the difference between this and waiting for the room to be empty. The grace only ever starts on the
+way down: a room that has not yet had `min_humans` people in it is waiting for them, not losing them.
+The policy is off at `min_humans: 0`, so upgrading changes nothing, and per-room settings can turn it
+on for one room without turning it on for the server. Switching a policy off — `minHumans: 0` through
+`UpdateRoomMetadata` — takes any countdown already running with it.
+
+Both timeouts and the policy hang off one clock. The registry sweeps itself every
+`room.sweep_interval_ms`, a second by default, whether or not anybody is connected, and that is the
+only thing in the server that ends a room nobody is touching. It has to be a clock of its own,
+because the grace is armed by the departure that drops a room below its floor and the room can empty
+completely before it runs out: driven from a participant's session, the sweep would then have nobody
+left to drive it, and the deadline would sit in the past until somebody opened the room the next
+morning — whose own first tick would end the meeting and disconnect *them* with `ROOM_CLOSED`. A
+grace period is a promise to the people who were in the room, so a room counting one down is not
+idle: the twenty-second departure timeout does not collect it out from under a ninety-second grace.
+It ends when it said it would, and with nobody in it there is nobody to disconnect.
+
+One person can be in a room twice. `livekit-client` keys its remote participants by identity
+throughout, so two participants sharing one identity are invisible to every client, ours included;
+the server therefore gives the second connection an identity of its own — `alice`, `alice#2`,
+`alice#3` — keeps the display name exactly as the token minted it, and tells the client which
+identity it got in the `JoinResponse`, which is where a client learns who it is anyway. The suffix
+is skipped past any identity already in the room, so a token that literally says `alice#2` keeps it.
+That is `room.duplicate_identity: suffix`, the default; `displace` throws the earlier session out
+with `DUPLICATE_IDENTITY`, which is LiveKit's own behaviour and still available. Under either rule a
+client that reconnects naming the session it had — `reconnect=1&sid=…`, which `livekit-client` sends
+on its own — takes that session's identity back rather than arriving as a second person and leaving
+its own ghost behind; a claim on a session belonging to another identity is ignored.
+
+The suffix is what a client is told, not what the server reasons with. Every connection remembers the
+identity its token asked for, and that — an exact comparison, never a parse — is what "the same
+person" means, both for a reconnect taking a session back and for a moderator naming somebody.
+`#` followed by digits is not a reserved namespace: `bob#7` is an identity a backoffice may
+legitimately mint, and participant sids are broadcast to the whole room in every roster, so reading
+the ordinal back out of the identity string would let anyone holding a plain `bob` token reconnect
+into the real `bob#7`'s session and evict them with `DUPLICATE_IDENTITY`. Names are matched, never
+taken apart.
+
+What suffixing costs is worth stating, because it is a limit rather than a bug. Displacement used to
+be how half-dead sessions were cleaned up. A client that loses its network and comes back without
+`reconnect=1&sid=` — a second device, a rejoin button, an SDK that gave up and started over — now
+leaves its old session sitting in the room until the 60-second signal timeout collects it, and
+returns as `alice#2`. `RemoveParticipant` covers this because it names the person and takes every
+connection they have; `GetParticipant`, `UpdateParticipant`, `MutePublishedTrack` and
+`UpdateSubscriptions` each name one connection, so for that minute a backoffice muting `alice` gets
+`not_found` while alice is the only person in the room. Shortening the timeout would disconnect
+people whose network is merely slow, so this is documented rather than closed;
+`room.duplicate_identity: displace` is there for a deployment that would rather have LiveKit's rule
+and its ghost-free rejoin.
+
+There is a server API as well as a signalling one. `livekit.RoomService` — the Twirp service LiveKit's
+own server SDKs and `lk` speak — answers at `POST /twirp/livekit.RoomService/<Method>` in JSON or
+protobuf, so a backoffice that already drives LiveKit drives this without a line changed. Rooms can
+be created, listed and deleted; participants can be listed, read, renamed, given or refused
+permission, muted, subscribed and unsubscribed on their behalf, and removed. The three methods that
+only make sense across several nodes — `ForwardParticipant`, `MoveParticipant`, `PerformRpc` — and
+`SendData`, which needs a data channel we do not have yet, answer `unimplemented` rather than
+pretending. The whole surface, the grants each method wants and the parts that behave differently
+from LiveKit are under [Server API](#server-api).
 
 Received RTP is forwarded. A participant gets a second peer connection — the subscriber transport —
 the first time it actually needs one; the server is the offering side there, sends the offer as
@@ -267,7 +356,8 @@ unsubscribe stops the flow and parks the media section rather than renegotiating
 resubscribe reuses it; and the subscriber never renegotiates on codec changes. Known gaps in M2: no
 ICE restart, no receive-side estimation towards publishers, and `rtc.use_external_ip` is accepted
 but not implemented.
-Known gaps: session resume (`reconnect=1`) falls back to a full join, the `/rtc/v1` signalling path a
+Known gaps: session resume (`reconnect=1`) falls back to a full join — the returning client takes
+back the identity of the session it names, but nothing else about it — the `/rtc/v1` signalling path a
 recent client tries first is not implemented so the client falls back to `/rtc`, and requests outside
 the implemented subset are logged and ignored.
 
@@ -284,6 +374,252 @@ client that sends them stays connected. The vendored `.proto` files under
 `crates/proto/protobufs` are copied from `livekit/protocol` and are the single source of truth for
 the wire format.
 
+Both wires are generated from them. The signalling socket carries the types as protobuf; the server
+API carries the same types as protobuf or as protobuf's JSON mapping, whose serialisers are generated
+beside the Rust ones from the same descriptors. Neither wire is written by hand, so neither can drift
+from the `.proto`.
+
+## Server API
+
+`livekit.RoomService` is where a backoffice, a bot or `lk` talks to the server rather than to a room.
+It is Twirp: `POST /twirp/livekit.RoomService/<Method>`, one body in, one body out, no streaming.
+All of it is also a page with buttons on it, at [`/swagger`](#the-page-at-swagger), generated from
+the same protobuf descriptors the wire is.
+
+A request carries `Content-Type: application/json` or `application/protobuf` and
+`Authorization: Bearer <token>`, and the answer comes back in whichever the request used. The JSON is
+protobuf's JSON mapping rather than a spelling of our own: field names in lowerCamelCase
+(`maxParticipants`, `trackSid`), 64-bit integers as strings (`"creationTime": "1757155200"`), and a
+field at its default value left out of the body altogether rather than sent as a zero. That is what
+every LiveKit SDK writes and expects to read. A `charset` parameter on the content type is accepted,
+which Twirp's own Go implementation does not do; anything else is refused.
+
+A failure is a Twirp error, and always JSON whatever the request was — a caller we could not
+understand cannot be assumed to read protobuf either:
+
+```
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"code":"permission_denied","msg":"this token is an admin of room `standup`, not of `payroll`"}
+```
+
+The status is the one the Twirp specification assigns the code, not one we chose: 400 for
+`invalid_argument` and `malformed`, 401 for `unauthenticated`, 403 for `permission_denied`, 404 for
+`not_found` and `bad_route`, 501 for `unimplemented`. An SDK turns the code back into a typed error
+and everything between it and us decides from the status whether the call is worth trying again, so a
+wrong one makes a permanent failure look retryable or the reverse. A method that does not exist, a
+content type we do not speak and a request that is not a `POST` are all `bad_route`: in Twirp the
+path and the content type together are what identify a call.
+
+### What a token has to carry
+
+An API token is signed with the same key as a join token and checked the same way, but the grant is a
+different one — and a join token is worth nothing here, which is the point, because everybody in the
+meeting holds one of those.
+
+| Grant | Methods |
+|---|---|
+| `roomCreate` | `CreateRoom`, `DeleteRoom` |
+| `roomList` | `ListRooms` |
+| `roomAdmin`, scoped by `room` | everything else |
+
+`roomAdmin` needs both halves. A token saying `{"roomAdmin": true, "room": "standup"}` is refused on
+every other room with `permission_denied`, whether or not that room exists; without the scope an
+admin token minted for one meeting would be a master key for the server. No grant stands in for
+another: `roomCreate` builds rooms and does not moderate the people inside them.
+
+A server API token has no identity on it. LiveKit's SDKs refuse to set one unless the grant is
+`roomJoin`, so `sub` is simply absent from the token — it is not required here, and it is still
+required at `/rtc`, where a participant without a name cannot join.
+
+**What `roomCreate` and `roomList` reach.** Both are LiveKit's own semantics, kept as they are
+because changing them would surprise every SDK written against LiveKit — but they are wider than
+they look, and whoever mints these tokens should know what they are handing out.
+
+- **`roomCreate` is not scoped by `room`, and it is also what `DeleteRoom` checks.** One token
+  carrying it can create any room on the server and delete any room on the server, including a
+  meeting in progress: everybody in it is disconnected with `ROOM_DELETED`. Whoever may bring a room
+  into being may take it away again, and neither half asks which room. The one thing it cannot do is
+  re-point a room somebody is already sitting in — see `CreateRoom` below.
+- **`roomList` sees every room and the whole of every room record.** There is no filtering by the
+  token's `room`, matching LiveKit's `EnsureListPermission`, and `Room.metadata` comes back with it.
+  For a caller that keeps its meeting record in the metadata — which is where the session policy
+  travels — that record is the metadata.
+
+So an API token is a server credential and not a per-meeting one: mint them for services, keep them
+away from anything a browser can reach, and give something that only needs one meeting a
+`roomAdmin` token, which is the only grant here that is scoped.
+
+### The methods
+
+| Method | Grant | What it does here |
+|---|---|---|
+| `CreateRoom` | `roomCreate`, plus `room` to settle an occupied room | Creates the room, or adopts one an arrival opened; returns the room. Retried on a room that was already created, it changes nothing. |
+| `ListRooms` | `roomList` | Every room, or the ones `names` asks for, sorted by name. |
+| `DeleteRoom` | `roomCreate` | Everyone in it gets a `Leave` naming `ROOM_DELETED`. Deleting a room that is already gone succeeds. |
+| `ListParticipants` | `roomAdmin` | Everyone in the room in the order they arrived, hidden participants included. |
+| `GetParticipant` | `roomAdmin` | One participant by exact identity. |
+| `RemoveParticipant` | `roomAdmin` | Removes the person, every connection of theirs; `PARTICIPANT_REMOVED` to them and to the room. |
+| `MutePublishedTrack` | `roomAdmin` | Mutes or unmutes one track, tells the publisher's own client, and returns the track. |
+| `UpdateParticipant` | `roomAdmin` | Renames, rewrites metadata and attributes, grants and revokes permission, hides and unhides. |
+| `UpdateSubscriptions` | `roomAdmin` | Subscribes or unsubscribes somebody else's session on their behalf. |
+| `UpdateRoomMetadata` | `roomAdmin` | Sets the room metadata and broadcasts a `RoomUpdate`. |
+| `SendData` | — | `unimplemented`: there is no data channel yet. |
+| `ForwardParticipant`, `MoveParticipant` | — | `unimplemented`: both move a participant between nodes, and this is one node. |
+| `PerformRpc` | — | `unimplemented`: it calls a method on an agent over a data channel, and we have neither. |
+
+A zero in a request is a field the caller left out. Proto3 cannot tell one from the other on a
+scalar, and LiveKit reads them the same way, so `emptyTimeout: 0` on `CreateRoom` means "whatever the
+server's default is" rather than "close this room the instant it empties". The consequence is that a
+zero timeout cannot be asked for over this API at all; it has to come from the configuration file.
+
+**`CreateRoom` on a room that is already there.** If it was created on purpose, it comes back
+untouched: that call is a retry as often as it is a first attempt, and a retry must not rewrite a
+room people are sitting in. `UpdateRoomMetadata` is how a live room's metadata and session policy
+move. If the room exists only because an arrival opened it, the request wins and the room is settled
+— it took the server defaults because nobody had asked for anything — but only for a token that also
+names the room in its `room` claim. `roomCreate` alone names no room, and re-pointing the settings
+and the session policy of a meeting that is already running is not something a server-wide token
+should do in passing. Without that scope the existing room comes back as it is, with a 200 and its
+own metadata in the answer, so a caller comparing what it sent against what it got can see that its
+request was not applied.
+
+**Fields we cannot honour are refused, not dropped.** `egress` asks for the meeting to be recorded,
+`agents` for an agent to be dispatched into it, `roomPreset` for a bundle of settings kept on the
+server, `replayEnabled` for a replay, `tags` for something to be stored and read back later. None of
+those exist here, and a 200 to a request for a recorded meeting is exactly how a caller comes to
+believe a meeting is being recorded when it is not — so `CreateRoom` answers `unimplemented` (501)
+and the message names the fields it could not do. Nothing is created. `nodeId`, `minPlayoutDelay`,
+`maxPlayoutDelay` and `syncStreams` are accepted and ignored on purpose: they are hints about node
+placement and playout timing on a server with one node, not promises about the meeting.
+
+**`RemoveParticipant` names a person, not a socket.** One person can hold two connections here —
+`155592` and `155592#2` — so removing one and leaving the other would answer a moderator's button by
+leaving the person in the room, still audible. Removing `155592` therefore removes every connection
+that identity opened. A caller who wants exactly one names the suffixed identity, and gets exactly
+that one. Every other participant method matches the identity exactly, because each of them reads or
+changes a single participant and quietly picking one of several would be worse than a `not_found` the
+caller can do something about — and `ListParticipants` reports the identity each connection actually
+has, so there is always an exact name to use. `revokeTokenTs` is accepted and ignored: we do not keep
+a revocation list, and a removed participant's token stays valid until it expires.
+
+**`UpdateParticipant` is a patch.** A field left empty is a field the caller did not mention, so
+renaming somebody does not blank their metadata. Attributes merge key by key and an empty value
+deletes the key, which is LiveKit's own rule. An update that changes nothing announces nothing, so a
+backoffice resending the same profile on every render does not flood the room.
+
+Permission is the half that does more than store a flag, and a moderator control that half works is
+worse than one that is missing:
+
+- Taking `canPublish` away unpublishes the tracks the participant may no longer send, tells their own
+  client with `TrackUnpublished`, **and drops the route from the forwarder** — the same call the
+  client-initiated unpublish makes. Without that last step the publisher is still connected, so their
+  RTP keeps arriving, keeps being forwarded to every subscriber the route already had, and keeps
+  being counted, for the rest of their session.
+- Taking `canSubscribe` away drops the intent behind their subscriptions, and clears their session's
+  memory of what it has already auto-subscribed to — so giving the permission back re-subscribes
+  them, instead of leaving them looking at a blank screen until they reload the page.
+- Making somebody hidden reaches the room, not only themselves. Everybody else is told the
+  participant disconnected, which is the only update that takes somebody out of a client's roster,
+  and their tracks are dropped from everybody's subscriptions. Otherwise they stay on every screen
+  for the rest of the meeting — including after they leave, because the room says nothing about a
+  hidden participant departing.
+
+**`UpdateSubscriptions` is checked whole before any of it is applied.** A track sid the room does not
+have is `not_found` and a track the participant may not receive — their own, or anything at all once
+`canSubscribe` is gone — is `invalid_argument`, and in both cases nothing is changed, so a caller is
+never left guessing which half landed. What it writes is intent; the participant's own session
+notices on its next reconcile, within a few seconds, and negotiates from there. Unsubscribing is not
+undone by auto-subscribe: the refusal is recorded on the participant rather than in their session's
+bookkeeping, so it holds whether the call arrives before that session first looked at the room or
+after. Asking for the track again is how somebody takes a refusal back.
+
+**The session policy travels in the room metadata.** `CreateRoomRequest` has no field for
+`min_humans` or `end_grace` — LiveKit has no such policy — so the only way one can reach us through
+an unmodified server SDK is inside the metadata the caller is already sending. A room record shaped
+
+```json
+{"sessionPolicy": {"minHumans": 2, "endGraceMs": 90000}, "recordingEnabled": true}
+```
+
+creates a room that ends ninety seconds after it drops below two people. `endGraceMs` is milliseconds
+and rounds up to whole seconds; either half may be left out and falls back to the `room` block.
+Metadata that is not JSON, or JSON with no `sessionPolicy` in it, is left completely alone — it is
+the caller's opaque blob and it round-trips unchanged either way. `UpdateRoomMetadata` reads it
+again, so a policy can arrive after the room did; metadata carrying no policy leaves the policy where
+it is rather than silently dropping it. Nothing here reads `recordingEnabled`: recording is egress,
+and there is none yet.
+
+### The page at `/swagger`
+
+Everything above is on the server itself, at `/swagger`, with a button next to every method.
+
+```
+cargo run -p mediacore-server -- --config config.yaml
+open http://127.0.0.1:7880/swagger
+```
+
+**It is generated from the protobuf descriptors, not written.** `crates/proto/build.rs` already
+compiles every `.proto` with protox to produce the wire types and their JSON codecs, and now keeps
+the resulting `FileDescriptorSet` as `mediacore_proto::FILE_DESCRIPTOR_SET`. `openapi.rs` reads that
+with `prost-reflect` and emits the OpenAPI document: the paths, the request and response schemas,
+every field name in the spelling JSON uses, every enum member, and the field documentation — which
+is the comments LiveKit wrote in the `.proto`, carried through because the descriptor set is kept
+with `source_code_info` in it. Change a `.proto` and the page changes in the same build. A
+hand-written specification is accurate for about a month, and the month ends without anyone noticing.
+
+What the descriptors cannot say is which of those methods this server answers, which grant each one
+insists on and which fields it refuses. That is `rooms::METHODS` and the three `CREATE_*` tables in
+`crates/server/src/rooms.rs`, and they are not documentation: `serve` reads the same table to tell a
+method it refuses from a method that does not exist, so a method cannot be documented as implemented
+and answer 501. `crates/server/tests/swagger.rs` holds the rest against reality — every method in the
+table is driven over a real socket and has to answer what the page claims, the three `CREATE_*` lists
+together have to name every field `CreateRoomRequest` has, and every schema in the document has to
+match the descriptor pool field for field, so a document that was edited by hand instead of generated
+fails there.
+
+**The page is served by the SFU, on the same origin as the API.** Try-it-out posts to
+`/twirp/livekit.RoomService/…` on whatever origin served the page, so the two have to be one origin
+or every button is a cross-origin call to another port. The front end deploys on its own schedule
+and does not have the descriptors; the SFU has both, which also means the page works unchanged over
+an SSH tunnel to `127.0.0.1:7880` with no proxy in front of it. `deploy/Caddyfile` routes `/swagger*`
+to the same upstream as `/twirp/*` for the same reason.
+
+**Try-it-out is not a sandbox, and the page says so above the fold.** `DeleteRoom` really deletes the
+room and hangs up on everybody in it.
+
+**Authorize sends `Authorization: Bearer <token>`.** The document declares one security scheme per
+grant — `roomCreate`, `roomList`, `roomAdmin` — and every operation names the one it needs, so the
+requirement is in the document rather than only in prose beside it, and the authorize dialog reads as
+the list of grants rather than as one anonymous "bearer". The cost of that is a reader who pastes a
+token into the row an operation does not name, which would send no header at all and read as a broken
+server; `swagger-init.js` fills the header from whichever row was filled in, so the answer is always
+this server's judgement of the token.
+
+**swagger-ui is vendored**, in `crates/server/assets/vendor/`, compiled into the binary and served
+under a version-stamped path — the rule the front end already follows for the LiveKit SDK and
+RNNoise. No CDN in the runtime path, a deployment with no route to the internet still gets the page,
+and the page's own content security policy is `default-src 'none'; script-src 'self'`. Its licences,
+and those of everything webpack built into that bundle, are in that directory's `NOTICE.txt` and
+served beside it at `/swagger/NOTICE.txt`.
+
+To move to another version:
+
+```
+V=<version>
+curl -fsSLO https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-$V.tgz
+tar xzf swagger-ui-dist-$V.tgz
+cp package/swagger-ui-bundle.js crates/server/assets/vendor/swagger-ui-bundle-$V.js
+sed 's|/\*# sourceMappingURL=swagger-ui.css.map\*/||' package/swagger-ui.css \
+  > crates/server/assets/vendor/swagger-ui-$V.css
+```
+
+Then bump the two paths and `UI_VERSION` in `crates/server/src/swagger.rs`, the two `<link>`/`<script>`
+paths in `crates/server/assets/swagger.html`, and the version and licence list in that directory's
+`NOTICE.txt`. `cargo test -p mediacore-server` fails if the version, the routes and the page disagree.
+
+
 ## Running
 
 ```
@@ -293,6 +629,19 @@ cargo run -p mediacore-server -- --config config.yaml
 
 The config path also comes from `MEDIACORE_CONFIG`. Two sockets are opened: TCP `port` for
 signalling and one UDP socket for all media.
+
+The `room` block is the room lifecycle. `auto_create` decides whether joining a room nobody created
+makes one. `min_humans` and `end_grace` are the session policy: how many people a room needs and how
+long it has after it loses them, off at `min_humans: 0` and overridable per room by whoever creates
+it — through the room's metadata, since `CreateRoomRequest` has no field for either. `duplicate_identity` is `suffix` — one person may be in a room twice, and the second connection
+is given `alice#2` — or `displace`, LiveKit's rule, where the second connection throws the first out.
+`empty_timeout` and `departure_timeout` are how long a room somebody created is kept with nobody in
+it, before anybody has ever joined and after the last person leaves; both at zero mean it is kept
+until `DeleteRoom`. `max_participants` is the limit on one room. All four are the defaults every room
+starts from and any of them can be overridden per room by whoever creates it.
+`sweep_interval_ms` is how often the server looks at rooms nobody is doing anything to: it is the
+only clock the registry has, and both timeouts and the session policy are enforced from it, so
+turning it up is turning off the only thing that ends a room by itself.
 
 `video.dynacast_pause_delay_ms` is how long a layer nobody wants is left running before the publisher
 is told to stop it, and `video.layer_upgrade_hold_ms` is how long a layer that re-appears must keep
@@ -326,10 +675,13 @@ Endpoints:
 - `GET /rtc/validate?access_token=…` — token check, returns the identity
 - `GET /rtc?access_token=…` — signalling WebSocket. `auto_subscribe=0` joins without subscribing
   to anything; it is on by default.
+- `POST /twirp/livekit.RoomService/<Method>` — the server API, described under
+  [Server API](#server-api)
 
 Tokens are standard LiveKit access tokens: HS256, `iss` is the API key, `sub` is the participant
 identity, and the `video` claim carries the grants. Any LiveKit token generator works, including
-`lk token create`.
+`lk token create`. A token for the server API is the same token with a different grant and no `sub`
+at all.
 
 ## Deployment
 
@@ -359,20 +711,22 @@ itself, and the root `Dockerfile` builds both binaries.
 
 | Crate | Contents |
 |---|---|
-| `crates/proto` | protobuf definitions and generated types |
+| `crates/proto` | protobuf definitions, generated types, and the descriptor set they came from |
 | `crates/auth` | access tokens and grants |
 | `crates/config` | YAML configuration |
-| `crates/room` | rooms, participants, tracks, subscription intent, signalling fan-out |
+| `crates/room` | rooms and their lifecycle, participants, tracks, subscription intent, signalling fan-out |
 | `crates/transport` | ICE, DTLS-SRTP, RTP intake and egress, one task per peer connection |
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
-| `crates/server` | HTTP and WebSocket endpoints, binary |
+| `crates/server` | HTTP and WebSocket endpoints, the `livekit.RoomService` server API and its `/swagger` page, binary |
 | `crates/front` | the browser front end: one page, an audio room, a token endpoint |
 
 `crates/room` owns all shared state and knows nothing about transport; `crates/transport` speaks
 str0m types and knows nothing about the LiveKit protocol; `crates/sfu` is pure packet arithmetic
 with no IO and no async; `crates/server` owns the sockets, the reconcile pass and the protocol
-mapping between them.
+mapping between them. It owns the clocks too: `crates/room` has no timers of its own — the sweep
+that ends sessions and collects empty rooms is handed the time, so a test can be the clock — and the
+server runs it on a task for as long as the process is up.
 
 ## Development
 

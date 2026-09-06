@@ -24,12 +24,21 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+pbjson = "0.9"
+pbjson-build = "0.9"
+pbjson-types = "0.9"
 prost = "0.14"
 prost-build = "0.14"
-prost-types = "0.14"
+prost-reflect = "0.16"
 protox = "0.9"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order, so a JSON object is written in the order it was built rather
+# than alphabetically. It is the OpenAPI document at /swagger that needs it:
+# `openapi`, `info` and `paths` belong at the top of a document somebody may
+# read with `curl | head`, and the methods belong in the order the `.proto`
+# declares them rather than sorted into a list where CreateRoom and DeleteRoom
+# sit next to each other and ListRooms is somewhere else.
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 thiserror = "2"
