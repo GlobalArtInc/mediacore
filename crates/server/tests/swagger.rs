@@ -594,10 +594,14 @@ async fn the_meeting_schemas_name_every_field_a_meeting_answers_with() {
             identity: "alice".to_owned(),
             name: "Alice".to_owned(),
             kind: mediacore_session::Kind::Standard,
-            account_id: Some("AC_9271".to_owned()),
+            attributes: std::collections::HashMap::from([(
+                "accountId".to_owned(),
+                "AC_9271".to_owned(),
+            )]),
             joined_at_ms: 1_757_155_188_000,
             left_at_ms: Some(1_757_156_650_000),
         }],
+        metadata: Some(r#"{"tenant":"acme"}"#.to_owned()),
     };
     let answered = serde_json::to_value(&session).expect("a meeting record encodes");
 
@@ -606,9 +610,8 @@ async fn the_meeting_schemas_name_every_field_a_meeting_answers_with() {
     // built the same way here.
     let mut recording = serde_json::to_value(mediacore_session::Recording {
         id: "RE_0123456789ab".to_owned(),
-        meeting: "SE_0123456789ab".to_owned(),
+        session: "SE_0123456789ab".to_owned(),
         participant: "PA_0123456789ab".to_owned(),
-        account_id: Some("AC_9271".to_owned()),
         segment: 0,
         local_path: std::path::PathBuf::from("/var/lib/mediacore/audio/x.ogg"),
         node: Some("ND_one".to_owned()),

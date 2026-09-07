@@ -441,7 +441,6 @@ fn spec() -> TrackSpec {
         room: "standup".to_owned(),
         participant: "PA_000000000001".to_owned(),
         identity: "alice".to_owned(),
-        account_id: Some("AC_alice".to_owned()),
         track: "TR_audio".to_owned(),
     }
 }
@@ -488,7 +487,7 @@ async fn a_finished_recording_reaches_the_object_store_and_is_then_announced() {
         finished,
     );
 
-    recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder_handle.track(spec());
     for index in 0..100u64 {
         tap.packet(index, index * 960, 48_000, payload(), Instant::now());
@@ -553,7 +552,7 @@ async fn an_upload_that_fails_is_tried_again_and_says_why_while_it_waits() {
         finished,
     );
 
-    recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder_handle.track(spec());
     for index in 0..50u64 {
         tap.packet(index, index * 960, 48_000, payload(), Instant::now());
@@ -658,7 +657,7 @@ async fn a_dead_object_store_never_reaches_the_path_a_packet_arrives_on() {
         finished,
     );
 
-    recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
 
     // One recording finishes, so that an upload is claimed and stuck before the
     // rest of the audio arrives.
@@ -787,7 +786,7 @@ async fn an_announcement_keeps_its_claim_alive_while_it_reads_the_store() {
         finished,
     );
 
-    recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder_handle.track(spec());
     for index in 0..50u64 {
         tap.packet(index, index * 960, 48_000, payload(), Instant::now());
@@ -832,7 +831,7 @@ async fn a_recording_already_in_the_object_store_is_taken_off_the_disk_when_it_i
     {
         let (recorder_handle, _finished) =
             Recorder::start(recorder(directory.path())).expect("a recorder");
-        recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+        recorder_handle.session_started("standup", "SE_000000000001", now_ms());
         let tap = recorder_handle.track(spec());
         for index in 0..50u64 {
             tap.packet(index, index * 960, 48_000, payload(), Instant::now());
@@ -925,7 +924,7 @@ async fn a_node_never_starts_a_second_copy_of_work_it_is_already_doing() {
         finished,
     );
 
-    recorder_handle.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder_handle.track(spec());
     for index in 0..50u64 {
         tap.packet(index, index * 960, 48_000, payload(), Instant::now());

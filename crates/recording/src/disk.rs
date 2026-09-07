@@ -94,16 +94,17 @@ pub struct Sidecar {
 
 /// Where one recording's two files go.
 ///
-/// Meeting first, because that is the directory a person deletes when a meeting
-/// turns out not to have been worth keeping, and because it keeps the number of
-/// entries in any one directory to the number of files one meeting produced.
+/// The session first, because that is the directory a person deletes when a
+/// meeting turns out not to have been worth keeping, and because it keeps the
+/// number of entries in any one directory to the number of files one meeting
+/// produced.
 pub fn paths(
     directory: &Path,
-    meeting: &str,
+    session: &str,
     participant: &str,
     segment: u32,
 ) -> (PathBuf, PathBuf) {
-    let folder = directory.join(safe(meeting));
+    let folder = directory.join(safe(session));
     let stem = format!("{}-{segment}", safe(participant));
 
     (
@@ -180,7 +181,7 @@ fn read_sidecar(path: &Path) -> io::Result<Sidecar> {
 pub fn scan(directory: &Path, node: &str) -> Vec<Recording> {
     let mut found = Vec::new();
 
-    let meetings = match fs::read_dir(directory) {
+    let sessions = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return found,
         Err(error) => {
@@ -194,12 +195,12 @@ pub fn scan(directory: &Path, node: &str) -> Vec<Recording> {
         }
     };
 
-    for meeting in meetings.flatten() {
-        if !meeting.path().is_dir() {
+    for session in sessions.flatten() {
+        if !session.path().is_dir() {
             continue;
         }
 
-        let Ok(files) = fs::read_dir(meeting.path()) else {
+        let Ok(files) = fs::read_dir(session.path()) else {
             continue;
         };
 
@@ -326,14 +327,55 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn recording(directory: &Path, meeting: &str, participant: &str) -> Recording {
-        let (audio, _) = paths(directory, meeting, participant, 0);
+    /// A node upgrading into this release finds sidecars its previous life
+    /// wrote, and those spell the session `meeting` and carry an `accountId`
+    /// this server no longer has.
+    ///
+    /// A node that could not read them would leave every recording it had not
+    /// uploaded yet as audio on a disk with nothing to say what it is -- which
+    /// is exactly the state the sidecar exists to prevent.
+    #[test]
+    fn a_sidecar_written_before_the_rename_is_still_read() {
+        let body = br#"{
+            "room": "standup",
+            "identity": "alice",
+            "complete": true,
+            "recording": {
+                "id": "RE_0123456789ab",
+                "meeting": "SE_0123456789ab",
+                "participant": "PA_0123456789ab",
+                "accountId": "AC_9271",
+                "segment": 0,
+                "localPath": "/var/lib/mediacore/audio/PA_0123456789ab-0.ogg",
+                "node": "ND_before",
+                "objectKey": null,
+                "bytes": 4096,
+                "sampleRate": 48000,
+                "channels": 1,
+                "startedAtMs": 1757155200000,
+                "endedAtMs": 1757156740000,
+                "offsetMs": 0,
+                "durationMs": 1540000
+            }
+        }"#;
+
+        let sidecar: Sidecar = serde_json::from_slice(body)
+            .expect("a sidecar this node wrote in a previous life is unreadable to it now");
+
+        assert_eq!(
+            sidecar.recording.session, "SE_0123456789ab",
+            "the old spelling of the session has to land on the field that replaced it"
+        );
+        assert_eq!(sidecar.recording.duration_ms, Some(1_540_000));
+    }
+
+    fn recording(directory: &Path, session: &str, participant: &str) -> Recording {
+        let (audio, _) = paths(directory, session, participant, 0);
 
         Recording {
             id: mediacore_session::recording_id(),
-            meeting: meeting.to_owned(),
+            session: session.to_owned(),
             participant: participant.to_owned(),
-            account_id: Some("AC_alice".to_owned()),
             segment: 0,
             local_path: audio,
             node: Some("ND_before".to_owned()),
@@ -367,7 +409,7 @@ mod tests {
 
     fn lay_out(directory: &Path, complete: bool, bytes: &[u8]) -> PathBuf {
         let recording = recording(directory, "SE_000000000001", "PA_000000000001");
-        let (audio_path, sidecar_path) = paths(directory, &recording.meeting, "PA_000000000001", 0);
+        let (audio_path, sidecar_path) = paths(directory, &recording.session, "PA_000000000001", 0);
         fs::create_dir_all(audio_path.parent().expect("a meeting directory")).expect("the folder");
         fs::write(&audio_path, bytes).expect("the audio");
         write_sidecar(

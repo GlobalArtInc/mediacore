@@ -218,15 +218,20 @@ pub struct Attendance {
     #[serde(default)]
     pub name: String,
     pub kind: Kind,
-    /// Who they are to the platform that let them in, out of their token.
+    /// Their attributes, as they stood when this stretch began.
     ///
-    /// `identity` is what this server calls them and is only unique inside one
-    /// room; this is the account the platform bills, shows a history to and
-    /// hangs a recording off, and it is the same string in every room. It is
-    /// `null` when the token carried none -- see [`Member::account_id`] for
-    /// what that means and why it is not a refusal.
+    /// **Opaque.** Nothing in this server reads a key of it or gives it a
+    /// shape: it is the place a platform embedding mediacore puts its own
+    /// identifiers -- who this is to it, which contract they are on, whatever
+    /// it needs on the record afterwards -- and what that means is the
+    /// platform's business and not ours. Empty when nothing set any.
+    ///
+    /// They arrive in the join token and can be changed while somebody is in a
+    /// room; a change after this stretch began does not reach back into it, for
+    /// the same reason a rename does not reach back into [`Attendance::name`].
+    /// A record is of what was true at the time.
     #[serde(default)]
-    pub account_id: Option<String>,
+    pub attributes: HashMap<String, String>,
     /// When they arrived, never earlier than the end of this room's previous
     /// meeting. This can still be earlier than the session started: the first
     /// person into a room with a floor of two waits for the second, and the
@@ -251,13 +256,13 @@ impl Attendance {
     /// says the recorder arrived when the second meeting became possible
     /// rather than when it plugged itself in, which is the honest answer to
     /// "how long was it at *this* meeting".
-    fn open(member: &Member, not_before_ms: i64) -> Self {
+    fn open(member: &Member, not_before_ms: i64, session: &str, opaque_bytes: usize) -> Self {
         Self {
             sid: member.sid.clone(),
             identity: member.identity.clone(),
             name: member.name.clone(),
             kind: member.kind,
-            account_id: member.account_id.clone(),
+            attributes: kept_attributes(&member.attributes, opaque_bytes, session, &member.sid),
             joined_at_ms: member.joined_at_ms.max(not_before_ms),
             left_at_ms: None,
         }
@@ -301,6 +306,25 @@ pub struct Session {
     /// Every stretch of attendance, oldest first.
     #[serde(default)]
     pub participants: Vec<Attendance>,
+    /// The room's metadata as it stood when this meeting began, or `null` when
+    /// the room had none.
+    ///
+    /// **Opaque, and the point of it.** mediacore is a core other platforms
+    /// build on, and a platform needs somewhere on the record of a meeting to
+    /// put what a meeting means to it -- which of its accounts held it, which
+    /// of its bookings it was, whatever it is. Without such a place, the first
+    /// customer's idea of that ends up as a column of ours and the second
+    /// customer has nowhere at all. So this is stored and handed back and never
+    /// read: the only thing in a room's metadata this server looks at is
+    /// `sessionPolicy`, which the room service reads long before a record
+    /// exists.
+    ///
+    /// As it stood when the meeting began, and not as it stands now. Metadata
+    /// changed halfway through belongs to the meeting after this one; a record
+    /// of what happened must not be rewritten by something that happened
+    /// afterwards.
+    #[serde(default)]
+    pub metadata: Option<String>,
 }
 
 impl Session {
@@ -308,35 +332,27 @@ impl Session {
         self.ended_at_ms.is_none()
     }
 
-    /// The accounts that were at this meeting, each once, in the order they
-    /// first arrived.
-    ///
-    /// The attendance list is per stretch, so an account that dropped out and
-    /// came back is in it twice and an account with two tabs open is in it
-    /// twice again. This is the answer to "whose meeting was this", which is
-    /// the question a platform asks of a meeting, and it is here rather than
-    /// in every caller so that the de-duplication is done once and the same
-    /// way.
-    pub fn account_ids(&self) -> Vec<&str> {
-        let mut seen = HashSet::new();
-        self.participants
-            .iter()
-            .filter_map(|attendance| attendance.account_id.as_deref())
-            .filter(|account| seen.insert(*account))
-            .collect()
-    }
+    fn open(
+        room: &str,
+        roster: &[Member],
+        now_ms: i64,
+        not_before_ms: i64,
+        metadata: &str,
+        opaque_bytes: usize,
+    ) -> Self {
+        let id = generate_id();
 
-    fn open(room: &str, roster: &[Member], now_ms: i64, not_before_ms: i64) -> Self {
         Self {
-            id: generate_id(),
             room: room.to_owned(),
             started_at_ms: now_ms,
             ended_at_ms: None,
             ended_by: None,
             participants: roster
                 .iter()
-                .map(|member| Attendance::open(member, not_before_ms))
+                .map(|member| Attendance::open(member, not_before_ms, &id, opaque_bytes))
                 .collect(),
+            metadata: kept_metadata(metadata, opaque_bytes, &id),
+            id,
         }
     }
 
@@ -345,7 +361,7 @@ impl Session {
     /// The floor is the later of the end of the room's previous meeting and
     /// the end of this connection's own previous stretch here, so that one
     /// `sid` never has two stretches that overlap.
-    fn admit(&mut self, member: &Member, not_before_ms: i64) {
+    fn admit(&mut self, member: &Member, not_before_ms: i64, opaque_bytes: usize) {
         let after_their_own = self
             .participants
             .iter()
@@ -354,8 +370,12 @@ impl Session {
             .max()
             .unwrap_or(i64::MIN);
 
-        self.participants
-            .push(Attendance::open(member, not_before_ms.max(after_their_own)));
+        self.participants.push(Attendance::open(
+            member,
+            not_before_ms.max(after_their_own),
+            &self.id,
+            opaque_bytes,
+        ));
     }
 
     fn close(&mut self, at_ms: i64, ending: Ending) {
@@ -392,18 +412,12 @@ pub struct Member {
     pub identity: String,
     pub name: String,
     pub kind: Kind,
-    /// The platform account in their token, when there was one.
+    /// Their attributes, as the room has them now.
     ///
-    /// **What happens when it is absent.** Nothing is refused. A recorder and
-    /// an agent have no account by their nature; a guest let in by a token that
-    /// names nobody has none either, and both are legitimate participants in a
-    /// meeting that legitimately happened. So the record says `null` and
-    /// everything downstream that groups by account leaves them out, which is
-    /// the honest answer -- refusing the join instead would mean a platform
-    /// that forgot one claim could not hold meetings at all, and defaulting it
-    /// to the identity would put a room-scoped name into a column that
-    /// everything else treats as an account and bills against.
-    pub account_id: Option<String>,
+    /// Handed through untouched. This crate neither reads a key of it nor
+    /// requires one to be there: it is the embedding platform's own data, and
+    /// somebody who has none is an ordinary participant.
+    pub attributes: HashMap<String, String>,
     pub joined_at_ms: i64,
 }
 
@@ -513,7 +527,7 @@ trait Sink: Send + Sync + 'static {
         Err(StoreError::Unsupported("keep recordings"))
     }
 
-    fn recordings(&self, _meeting: &str) -> Result<Vec<Recording>, StoreError> {
+    fn recordings(&self, _session: &str) -> Result<Vec<Recording>, StoreError> {
         Err(StoreError::Unsupported("keep recordings"))
     }
 
@@ -521,7 +535,7 @@ trait Sink: Send + Sync + 'static {
         Err(StoreError::Unsupported("keep recordings"))
     }
 
-    fn meeting_work(&self, _meeting: &str) -> Result<Vec<Work>, StoreError> {
+    fn session_work(&self, _session: &str) -> Result<Vec<Work>, StoreError> {
         Err(StoreError::Unsupported("keep recordings"))
     }
 
@@ -598,6 +612,9 @@ pub struct SessionStore {
 /// Everything the writer thread and the callers share.
 struct Inner {
     sink: Arc<dyn Sink>,
+    /// The most an embedding platform may put on one record's opaque fields.
+    /// See [`SessionStore::files`].
+    opaque_bytes: usize,
     records: Mutex<Records>,
     /// Woken when there is a record to write, or when the store is closing.
     work: Condvar,
@@ -650,7 +667,18 @@ impl SessionStore {
     /// than refuse to start, and a server that cannot make it should refuse to
     /// start rather than run for a month and be asked for records it never
     /// kept.
-    pub fn files(directory: impl Into<std::path::PathBuf>) -> io::Result<Self> {
+    ///
+    /// `opaque_bytes` is the most the platform above may put on one record: the
+    /// room metadata a meeting is opened with, and each participant's
+    /// attributes. It is a bound on a door into this server's storage from
+    /// somebody else's code, which is why it exists at all and why it is an
+    /// operator's number rather than a constant -- `sessions.max_opaque_bytes`
+    /// in the configuration file. A value over it is not truncated: nothing at
+    /// all is kept for that field, because half a document is worse than none.
+    pub fn files(
+        directory: impl Into<std::path::PathBuf>,
+        opaque_bytes: usize,
+    ) -> io::Result<Self> {
         let loaded = files::Files::open(directory)?;
         let mut records = Records {
             last_ended_ms: loaded.last_ended,
@@ -661,7 +689,7 @@ impl SessionStore {
             records.queue(session);
         }
 
-        Ok(Self::around(Arc::new(loaded.files), records))
+        Ok(Self::around(Arc::new(loaded.files), records, opaque_bytes))
     }
 
     /// Meetings, recordings and the work queue in Postgres, shared with every
@@ -681,14 +709,21 @@ impl SessionStore {
     /// typo in a config file rather than an outage, and a server that started
     /// anyway would be one that can never record anything and said so once, at
     /// boot, in a line nobody reads again.
-    pub fn postgres(settings: PostgresSettings) -> Result<Self, String> {
+    ///
+    /// `opaque_bytes` means what it means on [`SessionStore::files`].
+    pub fn postgres(settings: PostgresSettings, opaque_bytes: usize) -> Result<Self, String> {
         let database = database::Database::open(settings)?;
-        Ok(Self::around(Arc::new(database), Records::default()))
+        Ok(Self::around(
+            Arc::new(database),
+            Records::default(),
+            opaque_bytes,
+        ))
     }
 
-    fn around(sink: Arc<dyn Sink>, records: Records) -> Self {
+    fn around(sink: Arc<dyn Sink>, records: Records, opaque_bytes: usize) -> Self {
         let inner = Arc::new(Inner {
             sink,
+            opaque_bytes,
             records: Mutex::new(records),
             work: Condvar::new(),
             written: Condvar::new(),
@@ -813,6 +848,13 @@ impl SessionStore {
     /// tab. Called again with a roster that has not changed, this does nothing
     /// and writes nothing.
     ///
+    /// `metadata` is the room's, and it is written onto the record of a meeting
+    /// this roster starts and ignored otherwise. It is the platform above's
+    /// own data and nothing here reads it -- see [`Session::metadata`] -- and a
+    /// meeting already running keeps the metadata it opened with, because a
+    /// record of what happened is not rewritten by something that happened
+    /// after it.
+    ///
     /// `floor` is how many people the room needs, never less than one: a
     /// meeting with nobody at it is not a meeting, so a room whose operator
     /// asked for no policy at all still opens a session when the first person
@@ -840,6 +882,7 @@ impl SessionStore {
         roster: &[Member],
         floor: u32,
         grace_ms: i64,
+        metadata: &str,
         now_ms: i64,
     ) -> Option<Session> {
         let floor = floor.max(1) as usize;
@@ -857,7 +900,14 @@ impl SessionStore {
                 }
 
                 let not_before = records.floor_of(room);
-                let session = Session::open(room, roster, now_ms, not_before);
+                let session = Session::open(
+                    room,
+                    roster,
+                    now_ms,
+                    not_before,
+                    metadata,
+                    self.inner.opaque_bytes,
+                );
                 tracing::info!(
                     session = %session.id,
                     %room,
@@ -879,7 +929,7 @@ impl SessionStore {
                         .iter()
                         .any(|attendance| attendance.is_open() && attendance.sid == member.sid)
                     {
-                        session.admit(member, not_before);
+                        session.admit(member, not_before, self.inner.opaque_bytes);
                         changed = true;
                     }
                 }
@@ -1128,8 +1178,8 @@ impl SessionStore {
 
     /// Everything recorded during one meeting, by participant and then by
     /// segment.
-    pub fn recordings(&self, meeting: &str) -> Result<Vec<Recording>, StoreError> {
-        self.inner.sink.recordings(meeting)
+    pub fn recordings(&self, session: &str) -> Result<Vec<Recording>, StoreError> {
+        self.inner.sink.recordings(session)
     }
 
     /// What is happening to one recording: two rows, one per stage.
@@ -1140,8 +1190,8 @@ impl SessionStore {
     /// The same for every recording of one meeting, in one query rather than
     /// one per recording -- a ten-person meeting has at least ten recordings,
     /// and a backoffice opening it should cost two round trips and not eleven.
-    pub fn meeting_work(&self, meeting: &str) -> Result<Vec<Work>, StoreError> {
-        self.inner.sink.meeting_work(meeting)
+    pub fn session_work(&self, session: &str) -> Result<Vec<Work>, StoreError> {
+        self.inner.sink.session_work(session)
     }
 
     /// Takes work out of the queue for this node.
@@ -1433,6 +1483,62 @@ fn settle(inner: &Arc<Inner>, written: Vec<(u64, Session, Result<(), StoreError>
     }
 }
 
+/// The room metadata a record keeps, or nothing at all.
+///
+/// **Never truncated.** Half a document is worse than none: a reader cannot
+/// tell the half from the whole, so everything downstream would have to treat
+/// every value as possibly cut. An oversized one is dropped instead and said
+/// so, once, as the meeting opens -- which is the moment an operator can still
+/// connect the warning to the platform that sent it.
+fn kept_metadata(metadata: &str, opaque_bytes: usize, session: &str) -> Option<String> {
+    if metadata.is_empty() {
+        return None;
+    }
+
+    if metadata.len() > opaque_bytes {
+        tracing::warn!(
+            %session,
+            bytes = metadata.len(),
+            limit = opaque_bytes,
+            "the room's metadata is larger than sessions.max_opaque_bytes, so none of it is kept \
+             on this meeting's record; raise the limit or put less in it"
+        );
+        return None;
+    }
+
+    Some(metadata.to_owned())
+}
+
+/// The same rule for one participant's attributes.
+///
+/// Measured as the JSON the store will hold rather than as the map, so that the
+/// number an operator sets is the number of bytes that can reach a column.
+fn kept_attributes(
+    attributes: &HashMap<String, String>,
+    opaque_bytes: usize,
+    session: &str,
+    sid: &str,
+) -> HashMap<String, String> {
+    if attributes.is_empty() {
+        return HashMap::new();
+    }
+
+    let size = serde_json::to_string(attributes).map_or(usize::MAX, |json| json.len());
+    if size > opaque_bytes {
+        tracing::warn!(
+            %session,
+            participant = %sid,
+            bytes = size,
+            limit = opaque_bytes,
+            "this participant's attributes are larger than sessions.max_opaque_bytes, so none of \
+             them are kept on this meeting's record; raise the limit or put less in them"
+        );
+        return HashMap::new();
+    }
+
+    attributes.clone()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1474,15 +1580,51 @@ mod tests {
             identity: identity.to_owned(),
             name: identity.to_owned(),
             kind: Kind::Standard,
-            account_id: None,
+            attributes: HashMap::new(),
             joined_at_ms,
         }
     }
 
-    fn signed_in(sid: &str, identity: &str, account: &str, joined_at_ms: i64) -> Member {
+    fn carrying(
+        sid: &str,
+        identity: &str,
+        attributes: &[(&str, &str)],
+        joined_at_ms: i64,
+    ) -> Member {
         Member {
-            account_id: Some(account.to_owned()),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
             ..member(sid, identity, joined_at_ms)
+        }
+    }
+
+    /// Most of what is below is about where the boundary of a meeting is and
+    /// not about what the platform above hangs off one, so it goes through a
+    /// room with no metadata. The tests that are about the metadata call
+    /// [`SessionStore::note`] itself.
+    trait Noting {
+        fn noted(
+            &self,
+            room: &str,
+            roster: &[Member],
+            floor: u32,
+            grace_ms: i64,
+            now_ms: i64,
+        ) -> Option<Session>;
+    }
+
+    impl Noting for SessionStore {
+        fn noted(
+            &self,
+            room: &str,
+            roster: &[Member],
+            floor: u32,
+            grace_ms: i64,
+            now_ms: i64,
+        ) -> Option<Session> {
+            self.note(room, roster, floor, grace_ms, "", now_ms)
         }
     }
 
@@ -1497,8 +1639,10 @@ mod tests {
         tempfile::TempDir::new().expect("a directory for session records")
     }
 
+    /// A store whose opaque limit is far larger than any of these tests uses,
+    /// so that a test about the limit is the only one the limit can fail.
     fn store(directory: &tempfile::TempDir) -> SessionStore {
-        SessionStore::files(directory.path()).expect("the session records open")
+        SessionStore::files(directory.path(), 64 * 1024).expect("the session records open")
     }
 
     /// Everything a room has held, which is what `of_room` used to hand back
@@ -1523,10 +1667,10 @@ mod tests {
 
         let id = {
             let store = store(&directory);
-            store.note("demo", &[member("PA_1", "alice", 1_000)], 0, 90_000, 1_000);
+            store.noted("demo", &[member("PA_1", "alice", 1_000)], 0, 90_000, 1_000);
             let id = store.live("demo").expect("a meeting started").id;
 
-            store.note("demo", &[], 0, 90_000, 5_000);
+            store.noted("demo", &[], 0, 90_000, 5_000);
             assert_eq!(store.expire(95_000).len(), 1);
             id
         };
@@ -1555,8 +1699,8 @@ mod tests {
 
         let id = {
             let store = store(&directory);
-            store.note("demo", &[member("PA_1", "alice", 1_000)], 0, 90_000, 1_000);
-            store.note(
+            store.noted("demo", &[member("PA_1", "alice", 1_000)], 0, 90_000, 1_000);
+            store.noted(
                 "demo",
                 &[member("PA_1", "alice", 1_000), member("PA_2", "bob", 4_000)],
                 0,
@@ -1597,8 +1741,8 @@ mod tests {
             let store = store(&directory);
             for start in [1_000, 10_000, 20_000] {
                 let sid = format!("PA_{start}");
-                store.note("standup", &[member(&sid, "alice", start)], 0, 0, start);
-                store.note("standup", &[], 0, 0, start + 1_000);
+                store.noted("standup", &[member(&sid, "alice", start)], 0, 0, start);
+                store.noted("standup", &[], 0, 0, start + 1_000);
                 assert_eq!(store.expire(start + 1_000).len(), 1);
             }
         }
@@ -1626,7 +1770,7 @@ mod tests {
 
         let id = {
             let store = store(&directory);
-            store.note("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
+            store.noted("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
             let id = store.live("demo").expect("a meeting").id;
             store.close("demo", 2_000);
             id
@@ -1640,7 +1784,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = SessionStore::files(directory.path())
+        let store = SessionStore::files(directory.path(), 64 * 1024)
             .expect("one unreadable file took every other meeting on this server with it");
 
         assert_eq!(
@@ -1660,11 +1804,11 @@ mod tests {
         let store = store(&directory);
         let roster = [member("PA_1", "alice", 1_000)];
 
-        store.note("demo", &roster, 0, 90_000, 1_000);
+        store.noted("demo", &roster, 0, 90_000, 1_000);
         let first = store.live("demo").expect("a meeting");
 
-        store.note("demo", &roster, 0, 90_000, 2_000);
-        store.note("demo", &roster, 0, 90_000, 3_000);
+        store.noted("demo", &roster, 0, 90_000, 2_000);
+        store.noted("demo", &roster, 0, 90_000, 3_000);
 
         assert_eq!(
             store.live("demo").expect("the same meeting"),
@@ -1693,7 +1837,10 @@ mod tests {
                 participants: vec![Attendance::open(
                     &member("PA_1", "alice", started),
                     i64::MIN,
+                    id,
+                    64 * 1024,
                 )],
+                metadata: None,
             };
             files::write_record(directory.path(), &session).unwrap();
         }
@@ -1714,7 +1861,7 @@ mod tests {
             );
         }
 
-        store.note("demo", &[member("PA_2", "bob", 20_000)], 0, 0, 20_000);
+        store.noted("demo", &[member("PA_2", "bob", 20_000)], 0, 0, 20_000);
         assert!(
             store.live("demo").is_some(),
             "the room could not hold another meeting, because it is still pointing at one that \
@@ -1728,8 +1875,8 @@ mod tests {
         let directory = directory();
         let store = store(&directory);
 
-        store.note("standup", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
-        store.note("payroll", &[member("PA_2", "bob", 1_000)], 0, 0, 1_000);
+        store.noted("standup", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
+        store.noted("payroll", &[member("PA_2", "bob", 1_000)], 0, 0, 1_000);
 
         let standup = store.live("standup").expect("a meeting in standup");
         let payroll = store.live("payroll").expect("a meeting in payroll");
@@ -1760,12 +1907,12 @@ mod tests {
         let alice = member("PA_alice", "alice", 2_000);
         let bob = member("PA_bob", "bob", 200_000);
 
-        store.note("demo", std::slice::from_ref(&scribe), 0, 90_000, 1_000);
-        store.note("demo", &[scribe.clone(), alice], 0, 90_000, 2_000);
-        store.note("demo", std::slice::from_ref(&scribe), 0, 90_000, 10_000);
+        store.noted("demo", std::slice::from_ref(&scribe), 0, 90_000, 1_000);
+        store.noted("demo", &[scribe.clone(), alice], 0, 90_000, 2_000);
+        store.noted("demo", std::slice::from_ref(&scribe), 0, 90_000, 10_000);
         assert_eq!(store.expire(100_000).len(), 1, "the first meeting ended");
 
-        store.note("demo", &[scribe.clone(), bob], 0, 90_000, 200_000);
+        store.noted("demo", &[scribe.clone(), bob], 0, 90_000, 200_000);
         assert!(store.live("demo").is_some(), "the second meeting started");
 
         let mut stretches: Vec<(i64, i64)> = history(&store, "demo")
@@ -1803,11 +1950,11 @@ mod tests {
         let alice = member("PA_alice", "alice", 1_000);
         let bob = member("PA_bob", "bob", 1_000);
 
-        store.note("demo", &[alice.clone(), bob.clone()], 2, 90_000, 1_000);
-        store.note("demo", std::slice::from_ref(&alice), 2, 90_000, 5_000);
+        store.noted("demo", &[alice.clone(), bob.clone()], 2, 90_000, 1_000);
+        store.noted("demo", std::slice::from_ref(&alice), 2, 90_000, 5_000);
         // The same connection comes back: the room reports the sid it always
         // had, with the arrival time it always had.
-        store.note("demo", &[alice, bob.clone()], 2, 90_000, 9_000);
+        store.noted("demo", &[alice, bob.clone()], 2, 90_000, 9_000);
 
         let session = store.live("demo").expect("one meeting with a gap in it");
         let bobs: Vec<&Attendance> = session
@@ -1840,8 +1987,8 @@ mod tests {
             for index in 0..held {
                 let at = 1_000 + index as i64 * 10_000;
                 let sid = format!("PA_{index}");
-                store.note("standup", &[member(&sid, "alice", at)], 0, 0, at);
-                store.note("standup", &[], 0, 0, at + 1_000);
+                store.noted("standup", &[member(&sid, "alice", at)], 0, 0, at);
+                store.noted("standup", &[], 0, 0, at + 1_000);
                 store.expire(at + 1_000);
             }
             assert!(
@@ -1889,8 +2036,8 @@ mod tests {
         for index in 0..25i64 {
             let at = 1_000 + index * 10_000;
             let sid = format!("PA_{index}");
-            store.note("standup", &[member(&sid, "alice", at)], 0, 0, at);
-            store.note("standup", &[], 0, 0, at + 1_000);
+            store.noted("standup", &[member(&sid, "alice", at)], 0, 0, at);
+            store.noted("standup", &[], 0, 0, at + 1_000);
             store.expire(at + 1_000);
         }
         assert!(store.flush(Duration::from_secs(30)));
@@ -1940,7 +2087,7 @@ mod tests {
         let directory = directory();
         let store = store(&directory);
 
-        store.note("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
+        store.noted("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
         let id = store.live("demo").expect("a meeting").id;
         store.close("demo", 2_000);
 
@@ -1968,7 +2115,7 @@ mod tests {
         let directory = directory();
         let store = store(&directory);
 
-        store.note("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
+        store.noted("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000);
         let session = store.close("demo", 2_000).expect("the meeting ended");
 
         assert_eq!(
@@ -1994,42 +2141,93 @@ mod tests {
         }
     }
 
-    /// The account arrives in a token, is carried on the participant, and is
-    /// answerable from the meeting.
+    /// The whole point of the change that took the account out of this crate:
+    /// a platform embedding mediacore has somewhere of its own to put what a
+    /// meeting means to it, and this server keeps it and never reads it.
     #[test]
-    fn the_meeting_says_whose_it_was() {
+    fn a_record_keeps_the_room_metadata_and_everybody_s_attributes_untouched() {
         let directory = directory();
         let store = store(&directory);
 
         store.note(
             "demo",
             &[
-                signed_in("PA_1", "alice", "AC_alice", 1_000),
-                signed_in("PA_2", "alice#2", "AC_alice", 1_000),
+                carrying("PA_1", "alice", &[("accountId", "AC_alice")], 1_000),
+                carrying("PA_2", "bob", &[("seat", "3"), ("tier", "gold")], 1_000),
                 member("PA_3", "guest", 1_000),
-                recorder("PA_scribe", "scribe", 1_000),
             ],
             0,
             0,
+            r#"{"sessionPolicy":{"minHumans":1},"tenant":"acme"}"#,
             1_000,
         );
 
         let session = store.live("demo").expect("a meeting");
         assert_eq!(
-            session.account_ids(),
-            vec!["AC_alice"],
-            "one person with two tabs is two stretches and one account, and a guest and a \
-             recorder are neither"
+            session.metadata.as_deref(),
+            Some(r#"{"sessionPolicy":{"minHumans":1},"tenant":"acme"}"#),
+            "the room's metadata is the platform above's, and it has to come back byte for byte \
+             -- including the part this server does read, because reading a key of it is not a \
+             reason to rewrite it"
         );
         assert_eq!(
-            session
-                .participants
-                .iter()
-                .filter(|attendance| attendance.account_id.is_none())
-                .count(),
-            2,
-            "a token with no account has to be recorded as having none rather than being refused \
-             or given somebody else's"
+            session.participants[0].attributes.get("accountId"),
+            Some(&"AC_alice".to_owned()),
+            "an account is now one attribute among whatever else a platform sends, and this \
+             server has no opinion about which of them it is"
+        );
+        assert_eq!(session.participants[1].attributes.len(), 2);
+        assert!(
+            session.participants[2].attributes.is_empty(),
+            "a token that carried no attributes has to be recorded as carrying none rather than \
+             being refused"
+        );
+    }
+
+    /// The bound on a door into this server's storage from somebody else's
+    /// code. Nothing is truncated: half a JSON document is worse than none,
+    /// because nothing downstream can tell the half from the whole.
+    #[test]
+    fn an_oversized_blob_is_dropped_whole_and_the_one_just_under_the_limit_is_kept() {
+        let directory = directory();
+        let store = SessionStore::files(directory.path(), 64).expect("the session records open");
+
+        let exactly = "m".repeat(64);
+        store.note(
+            "fits",
+            &[carrying("PA_1", "alice", &[("k", "0123456789")], 1_000)],
+            0,
+            0,
+            &exactly,
+            1_000,
+        );
+
+        let session = store.live("fits").expect("a meeting");
+        assert_eq!(
+            session.metadata.as_deref(),
+            Some(exactly.as_str()),
+            "a value the size of the limit is inside it"
+        );
+        assert_eq!(session.participants[0].attributes.len(), 1);
+
+        store.note(
+            "over",
+            &[carrying("PA_1", "alice", &[("k", &"v".repeat(64))], 1_000)],
+            0,
+            0,
+            &"m".repeat(65),
+            1_000,
+        );
+
+        let session = store.live("over").expect("a meeting");
+        assert_eq!(
+            session.metadata, None,
+            "one byte over the limit and the record keeps nothing for that field, rather than \
+             keeping a prefix nobody could tell from the whole"
+        );
+        assert!(
+            session.participants[0].attributes.is_empty(),
+            "the same rule for attributes, measured as the json the store will hold"
         );
     }
 
@@ -2134,15 +2332,19 @@ mod tests {
     #[test]
     fn recording_a_membership_change_never_waits_for_the_store() {
         let gate = Arc::new(Gate::default());
-        let store = SessionStore::around(Arc::new(Stuck(Arc::clone(&gate))), Records::default());
+        let store = SessionStore::around(
+            Arc::new(Stuck(Arc::clone(&gate))),
+            Records::default(),
+            64 * 1024,
+        );
 
-        store.note("demo", &[member("PA_anchor", "anchor", 0)], 0, 90_000, 0);
+        store.noted("demo", &[member("PA_anchor", "anchor", 0)], 0, 90_000, 0);
         gate.wait_until_held();
 
         let began = Instant::now();
         for index in 0..200i64 {
             let sid = format!("PA_{index}");
-            store.note(
+            store.noted(
                 "demo",
                 &[member("PA_anchor", "anchor", 0), member(&sid, "alice", 0)],
                 0,
@@ -2203,10 +2405,10 @@ mod tests {
     /// alert.
     #[test]
     fn a_store_that_is_away_costs_records_and_not_calls() {
-        let store = SessionStore::around(Arc::new(Refuses), Records::default());
+        let store = SessionStore::around(Arc::new(Refuses), Records::default(), 64 * 1024);
 
         let started = store
-            .note("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000)
+            .noted("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000)
             .expect("the meeting started even though the store is away");
 
         let waited = Instant::now();

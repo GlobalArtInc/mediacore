@@ -238,7 +238,7 @@ pub fn start(
                         .map_or(default_record, |room| room.records());
 
                     if recorded {
-                        watching.meeting_started(&session.room, &session.id, session.started_at_ms);
+                        watching.session_started(&session.room, &session.id, session.started_at_ms);
                     }
                 }
                 // Said whether or not the meeting was being recorded. A
@@ -247,7 +247,7 @@ pub fn start(
                 // files of people who are still in the room and still talking,
                 // because what they say next is not part of the meeting that
                 // just ended.
-                Kind::SessionFinished => watching.meeting_ended(&session.room, &session.id),
+                Kind::SessionFinished => watching.session_ended(&session.room, &session.id),
                 _ => {}
             }
         }
@@ -300,12 +300,12 @@ impl Announce for Announcer {
 
         let session = self
             .sessions
-            .get(&recording.meeting)
+            .get(&recording.session)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
                 format!(
                     "the meeting `{}` this recording belongs to is not in the store",
-                    recording.meeting
+                    recording.session
                 )
             })?;
 
@@ -326,7 +326,6 @@ impl Announce for Announcer {
             room: session.room.clone(),
             participant: recording.participant.clone(),
             identity,
-            account_id: recording.account_id.clone(),
             segment: recording.segment,
             bucket: bucket.to_owned(),
             object_key,

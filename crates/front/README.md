@@ -296,6 +296,11 @@ The LiveKit identity every token carries is the provider's `sub`. Display name i
 worse than an ugly one. **Never the email as the identity**: an address changes hands and a `sub` does
 not, and an identity is what a room is keyed by.
 
+The `sub` also travels a second time, as a `subject` attribute on the join token. mediacore keeps a
+participant's attributes on the attendance row of the meeting record and reads none of them — that is
+where a platform built on it puts its own idea of who somebody is, and this front end is one such
+platform. A guest who typed a name into the box has no `sub` and sends no attribute.
+
 Whatever the directory returns goes through the same `clean_name` a typed name does and is cut to the
 same 40 characters. A provider is not a source of short printable strings, and that name goes into a
 token and onto everybody's screen.

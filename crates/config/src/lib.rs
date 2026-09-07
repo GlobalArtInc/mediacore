@@ -32,6 +32,7 @@ pub const DEFAULT_SESSION_CONNECTIONS: u32 = 4;
 pub const DEFAULT_SESSION_TIMEOUT_MS: u32 = 10_000;
 pub const DEFAULT_SESSION_LEASE_MS: u32 = 30_000;
 pub const DEFAULT_SESSION_ATTEMPTS: u32 = 5;
+pub const DEFAULT_SESSION_MAX_OPAQUE_BYTES: u32 = 16 * 1024;
 pub const DEFAULT_RECORDING_MAX_SEGMENT_MB: u32 = 256;
 pub const DEFAULT_RECORDING_REORDER_HOLD_MS: u32 = 100;
 pub const DEFAULT_RECORDING_QUEUE: u32 = 8_192;
@@ -181,6 +182,24 @@ pub struct SessionConfig {
     /// the container; a path inside the image is a path whose contents go with
     /// the next release.
     pub directory: PathBuf,
+
+    /// The most one meeting's record may carry of the embedding platform's own
+    /// data: the room's metadata, and each participant's attributes.
+    ///
+    /// **Why there is a limit at all.** Both of those arrive from outside --
+    /// metadata over the room service, attributes in a join token minted by
+    /// somebody we do not control -- and both are written into our database and
+    /// handed back on every read of that meeting. Without a number here, a
+    /// caller with a bug puts a megabyte on every attendance row of every
+    /// meeting it holds, and the first anyone hears of it is the disk.
+    ///
+    /// **What happens at the limit.** The value is dropped whole and a line in
+    /// the log names the meeting. It is never truncated: half a JSON document
+    /// is worse than none, because nothing downstream can tell the half from
+    /// the whole. Sixteen kilobytes by default, which is far more than an
+    /// identifier or two and far less than anything that would be a problem.
+    pub max_opaque_bytes: u32,
+
     pub postgres: PostgresConfig,
 }
 
@@ -241,6 +260,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             directory: PathBuf::from("sessions"),
+            max_opaque_bytes: DEFAULT_SESSION_MAX_OPAQUE_BYTES,
             postgres: PostgresConfig::default(),
         }
     }
@@ -265,7 +285,18 @@ impl SessionConfig {
         !self.postgres.url.trim().is_empty()
     }
 
+    /// The limit as the store wants it.
+    pub fn max_opaque_bytes(&self) -> usize {
+        self.max_opaque_bytes as usize
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_opaque_bytes > 0,
+            "sessions.max_opaque_bytes must not be zero; a limit of nothing is a limit that \
+             throws away every room's metadata and says so once a meeting"
+        );
+
         if !self.in_postgres() {
             anyhow::ensure!(
                 !self.directory.as_os_str().is_empty(),

@@ -42,7 +42,6 @@ fn spec(participant: &str) -> TrackSpec {
         room: "standup".to_owned(),
         participant: participant.to_owned(),
         identity: "alice".to_owned(),
-        account_id: Some("AC_alice".to_owned()),
         track: "TR_audio".to_owned(),
     }
 }
@@ -155,7 +154,7 @@ fn a_silence_makes_the_recording_longer_and_not_shorter() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
 
     // Ten packets, two minutes of nothing -- which is what discontinuous
@@ -214,7 +213,7 @@ fn a_timestamp_from_the_future_becomes_the_next_segment_and_never_hours_of_silen
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
 
     tap.packet(0, 0, 48_000, payload(), Instant::now());
@@ -272,7 +271,7 @@ fn one_publisher_cannot_spend_the_disk_and_the_writer_thread_on_silence() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
 
     // Twenty packets, each three hours and fifty minutes ahead of the last:
@@ -334,7 +333,7 @@ fn a_timestamp_that_wrapped_backwards_costs_one_recording_and_never_the_node() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
 
     let hostile = recorder.track(spec("PA_000000000001"));
     hostile.packet(0, 0, 48_000, payload(), Instant::now());
@@ -407,7 +406,7 @@ fn timestamps_that_go_backwards_never_reach_the_file() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
 
     for index in 0..500u64 {
@@ -439,7 +438,7 @@ fn a_packet_that_never_arrives_costs_its_own_twenty_milliseconds_and_nothing_els
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
 
     // Fifty packets with the twentieth lost on the way, and the thirtieth and
@@ -477,7 +476,7 @@ fn a_rejoin_is_two_recordings_and_the_gap_between_them_is_in_the_offsets() {
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
     let started = now_ms();
-    recorder.meeting_started("standup", "SE_000000000001", started);
+    recorder.session_started("standup", "SE_000000000001", started);
 
     let first = recorder.track(spec("PA_000000000001"));
     for index in 0..25u64 {
@@ -536,7 +535,7 @@ fn somebody_alone_in_a_room_is_not_a_meeting_and_is_not_recorded() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    // No `meeting_started`: this is the first person into a room with a floor
+    // No `session_started`: this is the first person into a room with a floor
     // of two, publishing while they wait for the second.
     let tap = recorder.track(spec("PA_000000000001"));
     for index in 0..50u64 {
@@ -562,7 +561,7 @@ fn a_meeting_ending_closes_the_recording_of_whoever_is_still_talking() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
     for index in 0..25u64 {
         tap.packet(index, index * TICK, 48_000, payload(), Instant::now());
@@ -570,10 +569,10 @@ fn a_meeting_ending_closes_the_recording_of_whoever_is_still_talking() {
 
     // The room drops below its floor and the grace period runs out. One person
     // is still there and still sending.
-    recorder.meeting_ended("standup", "SE_000000000001");
+    recorder.session_ended("standup", "SE_000000000001");
     let recording = finished(&mut taken);
 
-    assert_eq!(recording.meeting, "SE_000000000001");
+    assert_eq!(recording.session, "SE_000000000001");
     assert_eq!(recording.duration_ms, Some(500));
     well_formed(&recording);
 
@@ -596,7 +595,7 @@ fn a_recording_the_process_died_during_is_finished_by_the_next_start() {
     let directory = tempfile::TempDir::new().expect("a directory");
     let (recorder, mut taken) = Recorder::start(settings(directory.path())).expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
     for index in 0..100u64 {
         tap.packet(index, index * TICK, 48_000, payload(), Instant::now());
@@ -667,7 +666,7 @@ fn a_recording_that_grows_very_large_becomes_several_objects_in_order() {
     })
     .expect("a recorder");
 
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
     for index in 0..300u64 {
         tap.packet(index, index * TICK, 48_000, payload(), Instant::now());
@@ -754,7 +753,7 @@ fn a_recording_whose_sidecar_will_not_write_leaves_no_audio_behind() {
     std::fs::create_dir_all(sidecar.with_extension("json.part")).expect("the blocked name");
 
     let (recorder, taken) = Recorder::start(settings(directory.path())).expect("a recorder");
-    recorder.meeting_started("standup", "SE_000000000001", now_ms());
+    recorder.session_started("standup", "SE_000000000001", now_ms());
     let tap = recorder.track(spec("PA_000000000001"));
     for index in 0..50u64 {
         tap.packet(index, index * TICK, 48_000, payload(), Instant::now());

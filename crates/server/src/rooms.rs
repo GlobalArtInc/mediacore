@@ -258,7 +258,8 @@ pub const CREATE_HONOURED: &[(&str, &str)] = &[
     ),
     (
         "metadata",
-        "stored, broadcast to the room, and read for a `sessionPolicy`",
+        "stored, broadcast to the room, read for a `sessionPolicy`, and kept on the record of \
+         every meeting held here",
     ),
 ];
 

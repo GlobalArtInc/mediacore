@@ -150,22 +150,25 @@ fn open_sessions(config: &Config) -> anyhow::Result<SessionStore> {
     let settings = &config.sessions;
 
     if settings.in_postgres() {
-        return SessionStore::postgres(PostgresSettings {
-            url: settings.postgres.url.clone(),
-            // The node id is on every meeting this server holds and every piece
-            // of work it claims, which is what makes "who was holding this when
-            // it stopped" a question with an answer.
-            node: config.node_id.clone(),
-            connections: settings.postgres.connections as usize,
-            timeout: Duration::from_millis(settings.postgres.timeout_ms.into()),
-            lease: Duration::from_millis(settings.postgres.lease_ms.into()),
-            attempts: settings.postgres.attempts,
-        })
+        return SessionStore::postgres(
+            PostgresSettings {
+                url: settings.postgres.url.clone(),
+                // The node id is on every meeting this server holds and every piece
+                // of work it claims, which is what makes "who was holding this when
+                // it stopped" a question with an answer.
+                node: config.node_id.clone(),
+                connections: settings.postgres.connections as usize,
+                timeout: Duration::from_millis(settings.postgres.timeout_ms.into()),
+                lease: Duration::from_millis(settings.postgres.lease_ms.into()),
+                attempts: settings.postgres.attempts,
+            },
+            settings.max_opaque_bytes(),
+        )
         .map_err(anyhow::Error::msg)
         .context("the session database");
     }
 
-    SessionStore::files(&settings.directory).with_context(|| {
+    SessionStore::files(&settings.directory, settings.max_opaque_bytes()).with_context(|| {
         format!(
             "opening the session records in {}",
             settings.directory.display()

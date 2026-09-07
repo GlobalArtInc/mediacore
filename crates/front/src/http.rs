@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -441,6 +442,16 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Where this demo puts the identity its own sign-in decided.
+///
+/// mediacore has no field for it and should not: an account is a thing a
+/// platform built on this server has and the server itself does not. So it
+/// travels as an ordinary participant attribute, which is exactly what an
+/// embedding platform is expected to do with its own identifiers, and it ends
+/// up on the attendance row of the meeting record with nothing having read it
+/// on the way.
+const SUBJECT_ATTRIBUTE: &str = "subject";
+
 /// Mints the join token, from whoever this browser has turned out to be.
 ///
 /// With the switch off this is what it always was: an unauthenticated endpoint
@@ -490,14 +501,16 @@ async fn token(
         iss: config.api_key.clone(),
         sub: identity.clone(),
         name: name.clone(),
-        // Only for somebody who signed in. The provider's subject is the
-        // account this person has everywhere, as opposed to the identity, which
-        // is what one room calls them -- and a guest who typed a name into the
-        // box has no account at all, which is the ordinary case this field has
-        // to be able to say nothing about.
-        account_id: session
+        // What this demo has that mediacore does not: an opinion about who
+        // somebody is. The provider's subject is this person wherever they go,
+        // as opposed to the identity, which is only what one room calls them,
+        // and it goes into the attributes because that is where a platform
+        // built on mediacore puts its own identifiers -- the core keeps them on
+        // the meeting record and never reads them. A guest who typed a name
+        // into the box has no such subject and sends none.
+        attributes: session
             .as_ref()
-            .map(|session| session.subject.clone())
+            .map(|session| HashMap::from([(SUBJECT_ATTRIBUTE.to_owned(), session.subject.clone())]))
             .unwrap_or_default(),
         video: VideoGrant {
             room_join: Some(true),

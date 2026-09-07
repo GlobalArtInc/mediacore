@@ -109,6 +109,15 @@ fn creator() -> String {
 }
 
 fn joiner(identity: &str, room: &str) -> String {
+    joiner_carrying(identity, room, &[])
+}
+
+/// A join token with the platform above's own data on it.
+///
+/// Attributes are the only thing on a token this server does not read, which is
+/// exactly what makes them the place an embedding platform puts its own
+/// identifiers.
+fn joiner_carrying(identity: &str, room: &str, attributes: &[(&str, &str)]) -> String {
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -122,6 +131,10 @@ fn joiner(identity: &str, room: &str) -> String {
             iss: API_KEY.to_owned(),
             sub: identity.to_owned(),
             name: identity.to_owned(),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
             video: VideoGrant {
                 room_join: Some(true),
                 room: room.to_owned(),
@@ -215,10 +228,11 @@ async fn get(addr: SocketAddr, path: &str, authorization: Option<&str>) -> Answe
 }
 
 async fn join(addr: SocketAddr, identity: &str, room: &str) -> Client {
-    let url = format!(
-        "ws://{addr}/rtc?access_token={}&protocol=17&sdk=test",
-        joiner(identity, room)
-    );
+    join_with(addr, &joiner(identity, room)).await
+}
+
+async fn join_with(addr: SocketAddr, token: &str) -> Client {
+    let url = format!("ws://{addr}/rtc?access_token={token}&protocol=17&sdk=test");
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     loop {
@@ -335,6 +349,50 @@ async fn a_meeting_can_be_watched_while_it_runs_and_read_after_it_ends() {
         id.as_str(),
         "a meeting cannot be read by the id every other record will refer to it by"
     );
+}
+
+/// What replaced the account column: the platform above's own data reaching the
+/// record over a real socket and coming back out of a real endpoint.
+///
+/// The unit tests prove the store keeps it. This proves the whole path -- the
+/// token, the roster, the record, the JSON a backoffice parses -- because that
+/// is the path an embedding platform actually uses, and every step of it had a
+/// place where somebody could have decided to read the data or to drop it.
+#[tokio::test]
+async fn a_participants_own_attributes_come_back_on_the_attendance_list() {
+    let addr = spawn_server().await;
+    let alice = join_with(
+        addr,
+        &joiner_carrying(
+            "alice",
+            ROOM,
+            &[("accountId", "AC_9271"), ("booking", "BK_44")],
+        ),
+    )
+    .await;
+
+    let session = get(addr, &room_path("session"), Some(&lister()))
+        .await
+        .session();
+    let attendance = &session["participants"][0];
+
+    assert_eq!(attendance["identity"], "alice");
+    assert_eq!(
+        attendance["attributes"]["accountId"], "AC_9271",
+        "an identifier the platform above put on the token did not reach the record, so it has \
+         nowhere to hang its own meaning off this meeting"
+    );
+    assert_eq!(
+        attendance["attributes"]["booking"], "BK_44",
+        "only one of the attributes came back, so this server is choosing between them -- and it \
+         has no business knowing what any of them are"
+    );
+    assert!(
+        attendance.get("accountId").is_none(),
+        "the account column is gone and nothing may quietly answer with it again"
+    );
+
+    drop(alice);
 }
 
 /// Finding G, at the endpoint. A room a service has been meeting in for two

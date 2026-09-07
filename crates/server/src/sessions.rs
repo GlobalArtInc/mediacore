@@ -261,7 +261,7 @@ pub async fn recordings(
         Ok(Some((
             session,
             allowing_none(store.recordings(&wanted))?,
-            allowing_none(store.meeting_work(&wanted))?,
+            allowing_none(store.session_work(&wanted))?,
         )))
     })
     .await;

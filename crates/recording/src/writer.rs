@@ -98,8 +98,8 @@ use crate::{Message, Settings, TrackSpec};
 /// only case where nothing is arriving to drain them.
 const IDLE_TICK: Duration = Duration::from_millis(25);
 
-/// A meeting this node is recording, by room.
-struct Meeting {
+/// A session this node is recording, by room.
+struct Recorded {
     id: String,
     started_at_ms: i64,
 }
@@ -135,9 +135,9 @@ struct Track {
     /// turn.
     written_through: Option<u64>,
     open: Option<Open>,
-    /// The meeting the open file belongs to, so that a meeting ending closes it
+    /// The session the open file belongs to, so that a meeting ending closes it
     /// and a new one starts a new file.
-    meeting: Option<String>,
+    session: Option<String>,
     /// How much silence this track may still be charged for, in 48 kHz
     /// samples. See [`SILENCE_BUDGET`].
     silence_left: u64,
@@ -145,7 +145,7 @@ struct Track {
     /// whose audio was never part of any meeting can say so on the way out.
     made_a_file: bool,
     late: u64,
-    unmeeting: u64,
+    outside_a_session: u64,
     /// Packets whose timestamp went backwards inside an open file.
     backwards: u64,
     /// Packets dropped because this participant has used up the files one
@@ -160,7 +160,7 @@ pub(crate) struct Writing {
     settings: Settings,
     finished: tokio::sync::mpsc::UnboundedSender<Recording>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
-    meetings: HashMap<String, Meeting>,
+    sessions: HashMap<String, Recorded>,
     tracks: HashMap<u64, Track>,
     /// How many files each participant has produced in each meeting, so that
     /// `(meeting, participant, segment)` names one file exactly once even when
@@ -182,7 +182,7 @@ impl Writing {
             settings,
             finished,
             queued,
-            meetings: HashMap::new(),
+            sessions: HashMap::new(),
             tracks: HashMap::new(),
             segments: HashMap::new(),
             abandoned,
@@ -259,21 +259,21 @@ impl Writing {
 
     fn handle(&mut self, message: Message) {
         match message {
-            Message::Meeting {
+            Message::SessionStarted {
                 room,
-                meeting,
+                session,
                 started_at_ms,
             } => {
-                tracing::info!(%room, %meeting, "recording this meeting");
-                self.meetings.insert(
+                tracing::info!(%room, %session, "recording this meeting");
+                self.sessions.insert(
                     room,
-                    Meeting {
-                        id: meeting,
+                    Recorded {
+                        id: session,
                         started_at_ms,
                     },
                 );
             }
-            Message::MeetingOver { room, meeting } => {
+            Message::SessionEnded { room, session } => {
                 // Every track of that room, not only the ones with a file open:
                 // a track whose packets are all still in its reorder buffer has
                 // no file yet, and what is in that buffer was said during the
@@ -282,7 +282,7 @@ impl Writing {
                     .tracks
                     .iter()
                     .filter(|(_, track)| {
-                        track.spec.room == room || track.meeting.as_deref() == Some(&meeting)
+                        track.spec.room == room || track.session.as_deref() == Some(&session)
                     })
                     .map(|(key, _)| *key)
                     .collect();
@@ -294,11 +294,11 @@ impl Writing {
                 }
 
                 if self
-                    .meetings
+                    .sessions
                     .get(&room)
-                    .is_some_and(|held| held.id == meeting)
+                    .is_some_and(|held| held.id == session)
                 {
-                    self.meetings.remove(&room);
+                    self.sessions.remove(&room);
                 }
 
                 // Then every file of that meeting closes with it, whoever is
@@ -317,13 +317,13 @@ impl Writing {
                     if self
                         .tracks
                         .get(&key)
-                        .is_some_and(|track| track.meeting.as_deref() == Some(&meeting))
+                        .is_some_and(|track| track.session.as_deref() == Some(&session))
                     {
                         self.close(key);
                     }
                 }
 
-                self.segments.retain(|(held, _), _| held != &meeting);
+                self.segments.retain(|(held, _), _| held != &session);
             }
             Message::Open { key, spec } => {
                 self.tracks.insert(
@@ -333,11 +333,11 @@ impl Writing {
                         pending: BTreeMap::new(),
                         written_through: None,
                         open: None,
-                        meeting: None,
+                        session: None,
                         silence_left: SILENCE_BUDGET,
                         made_a_file: false,
                         late: 0,
-                        unmeeting: 0,
+                        outside_a_session: 0,
                         backwards: 0,
                         refused: 0,
                         unwritable: 0,
@@ -421,25 +421,25 @@ impl Writing {
             return;
         };
 
-        let Some(meeting) = self.meetings.get(&track.spec.room) else {
+        let Some(recorded) = self.sessions.get(&track.spec.room) else {
             // No meeting in this room: this is somebody alone in a room, or
             // somebody still publishing after a meeting ended. Neither is part
             // of a meeting and neither is recorded.
             if let Some(track) = self.tracks.get_mut(&key) {
-                track.unmeeting += 1;
+                track.outside_a_session += 1;
             }
             return;
         };
-        let meeting_id = meeting.id.clone();
-        let meeting_started = meeting.started_at_ms;
+        let session_id = recorded.id.clone();
+        let session_started = recorded.started_at_ms;
 
         // A file that belongs to a meeting that has been replaced -- which only
         // happens if a meeting ended and another began before this packet was
         // drained -- is closed rather than continued into the wrong record.
         if track
-            .meeting
+            .session
             .as_deref()
-            .is_some_and(|held| held != meeting_id)
+            .is_some_and(|held| held != session_id)
         {
             self.close(key);
         }
@@ -509,14 +509,14 @@ impl Writing {
             // file exactly once. It goes up below, once there is a file.
             let number = self
                 .segments
-                .get(&(meeting_id.clone(), track.spec.participant.clone()))
+                .get(&(session_id.clone(), track.spec.participant.clone()))
                 .copied()
                 .unwrap_or(0);
             if number >= MAX_SEGMENTS {
                 track.refused += 1;
                 if track.refused == 1 {
                     tracing::warn!(
-                        meeting = %meeting_id,
+                        session = %session_id,
                         identity = %track.spec.identity,
                         participant = %track.spec.participant,
                         segments = number,
@@ -531,16 +531,15 @@ impl Writing {
 
             let (audio, sidecar) = disk::paths(
                 &self.settings.directory,
-                &meeting_id,
+                &session_id,
                 &track.spec.participant,
                 number,
             );
 
             let recording = Recording {
                 id: recording_id(),
-                meeting: meeting_id.clone(),
+                session: session_id.clone(),
                 participant: track.spec.participant.clone(),
-                account_id: track.spec.account_id.clone(),
                 segment: number,
                 local_path: audio.clone(),
                 node: Some(self.settings.node.clone()),
@@ -553,7 +552,7 @@ impl Writing {
                 // Where this file starts inside the meeting. A file opened by
                 // the first packet after a rejoin starts where the rejoin did,
                 // which is what lines it up against everybody else's.
-                offset_ms: (started_at_ms - meeting_started).max(0),
+                offset_ms: (started_at_ms - session_started).max(0),
                 duration_ms: None,
             };
 
@@ -592,7 +591,7 @@ impl Writing {
                 Ok(writer) => {
                     tracing::info!(
                         recording = %recording.id,
-                        meeting = %meeting_id,
+                        session = %session_id,
                         identity = %track.spec.identity,
                         track = %track.spec.track,
                         segment = number,
@@ -601,10 +600,10 @@ impl Writing {
                     );
 
                     self.segments.insert(
-                        (meeting_id.clone(), track.spec.participant.clone()),
+                        (session_id.clone(), track.spec.participant.clone()),
                         number + 1,
                     );
-                    track.meeting = Some(meeting_id);
+                    track.session = Some(session_id);
                     track.made_a_file = true;
                     track.open = Some(Open {
                         sidecar,
@@ -701,10 +700,10 @@ impl Writing {
             return;
         };
         let Some(open) = track.open.take() else {
-            track.meeting = None;
+            track.session = None;
             return;
         };
-        track.meeting = None;
+        track.session = None;
 
         let Open {
             mut recording,
@@ -779,7 +778,7 @@ impl Writing {
 
         tracing::info!(
             recording = %recording.id,
-            meeting = %recording.meeting,
+            session = %recording.session,
             %identity,
             duration_ms,
             bytes = recording.bytes,
@@ -819,12 +818,12 @@ impl Writing {
         // its floor, which is ordinary, and a room switched to recorded while a
         // meeting was already running, which looks like recording being on and
         // is not. Neither has anywhere else to show up.
-        if !track.made_a_file && track.unmeeting > 0 {
+        if !track.made_a_file && track.outside_a_session > 0 {
             tracing::info!(
                 room = %track.spec.room,
                 identity = %track.spec.identity,
                 track = %track.spec.track,
-                packets = track.unmeeting,
+                packets = track.outside_a_session,
                 "this track's audio was never part of a meeting, so none of it was recorded: \
                  either no meeting was running in the room, or the room was asked to be recorded \
                  while one already was -- recording follows the meeting, and begins with the next \
@@ -833,7 +832,7 @@ impl Writing {
         }
 
         if track.late > 0
-            || track.unmeeting > 0
+            || track.outside_a_session > 0
             || track.backwards > 0
             || track.refused > 0
             || track.unwritable > 0
@@ -842,7 +841,7 @@ impl Writing {
                 identity = %track.spec.identity,
                 track = %track.spec.track,
                 late = track.late,
-                outside_a_meeting = track.unmeeting,
+                outside_a_session = track.outside_a_session,
                 backwards = track.backwards,
                 past_the_segment_limit = track.refused,
                 sidecar_would_not_write = track.unwritable,
@@ -1030,7 +1029,6 @@ mod tests {
                     room: "standup".to_owned(),
                     participant: format!("PA_0000000000{key}"),
                     identity: "alice".to_owned(),
-                    account_id: None,
                     track: "TR_audio".to_owned(),
                 }),
             });
@@ -1063,7 +1061,6 @@ mod tests {
                 room: "standup".to_owned(),
                 participant: "PA_0000000000003".to_owned(),
                 identity: "carol".to_owned(),
-                account_id: None,
                 track: "TR_audio".to_owned(),
             }),
         });

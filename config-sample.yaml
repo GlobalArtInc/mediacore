@@ -89,6 +89,25 @@ sessions:
   # whoever wants them pruned.
   directory: sessions
 
+  # THE MOST OF SOMEBODY ELSE'S DATA one meeting's record may carry, in bytes.
+  #
+  # Two things on a record belong to whoever is building on this server rather
+  # than to this server: the room's metadata, as it stood when the meeting
+  # began, and each participant's attributes, as they stood when that person
+  # arrived. mediacore stores both and hands both back and reads neither — that
+  # is where a platform puts its own idea of whose meeting this was, which
+  # contract it is against, or whatever else it needs on the record afterwards.
+  # The one thing this server does read out of room metadata is sessionPolicy,
+  # and it reads it in the room service, long before a record exists.
+  #
+  # There is a limit because both arrive from outside: metadata over the room
+  # service, attributes in a join token minted by somebody you do not control.
+  # A value over the limit is dropped WHOLE — never truncated, because half a
+  # JSON document is worse than none — and one warning names the meeting it
+  # happened to. Sixteen kilobytes is far more than an identifier or two and
+  # far less than anything that becomes a problem on a disk.
+  max_opaque_bytes: 16384
+
   postgres:
     # A libpq connection string, or empty for no database at all. It carries a
     # password in every deployment that has one and is never logged: what the

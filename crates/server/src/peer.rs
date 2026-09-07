@@ -579,7 +579,6 @@ fn open_tap(
         room: joined.room.name.clone(),
         participant: joined.participant.sid.clone(),
         identity: joined.participant.identity.clone(),
-        account_id: joined.participant.account_id.clone(),
         track: track.sid.clone(),
     }))
 }

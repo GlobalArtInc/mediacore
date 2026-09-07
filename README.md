@@ -81,9 +81,9 @@ It ends when it said it would, and with nobody in it there is nobody to disconne
 held in it. A room created over the API outlives its meetings and holds one after another, and a room
 that exists only because somebody walked in goes when they leave — while what happened in it does
 not. A session starts when a room reaches the number of people it needs and ends when it falls below
-and the grace period runs out, and its record carries an id, the room, a start, an end and everybody
-who was there with the times they arrived and left and the platform account each of them signed in
-with. `GET /api/rooms/<room>/sessions`,
+and the grace period runs out, and its record carries an id, the room, a start, an end, everybody who
+was there with the times they arrived and left, and whatever the platform above put on the room and
+on each of them. `GET /api/rooms/<room>/sessions`,
 `GET /api/rooms/<room>/session`, `GET /api/sessions/<id>` and
 `GET /api/sessions/<id>/recordings` answer for it; see [Sessions](#sessions).
 
@@ -640,6 +640,11 @@ again, so a policy can arrive after the room did; metadata carrying no policy le
 it is rather than silently dropping it. Nothing here reads `recordingEnabled`: recording is egress,
 and there is none yet.
 
+The rest of the metadata is the caller's, and from the moment a meeting begins it is also on that
+meeting's record — see [Sessions](#sessions), where the same is true of each participant's
+attributes. That is where a platform embedding this server keeps its own idea of whose meeting this
+was.
+
 ### Sessions
 
 A **session** is one meeting; a **room** is the place it happened in, which outlives it and holds the
@@ -689,10 +694,12 @@ $ curl -s -H "Authorization: Bearer $TOKEN" \
   "endedBy": "grace",
   "participants": [
     {"sid": "PA_a1b2c3d4e5f6", "identity": "alice", "name": "Alice", "kind": "standard",
-     "accountId": "AC_9271", "joinedAtMs": 1757155188000, "leftAtMs": 1757156650000},
+     "attributes": {"accountId": "AC_9271"},
+     "joinedAtMs": 1757155188000, "leftAtMs": 1757156650000},
     {"sid": "PA_9f8e7d6c5b4a", "identity": "bob", "name": "Bob", "kind": "standard",
-     "accountId": null, "joinedAtMs": 1757155200000, "leftAtMs": 1757156650000}
-  ]
+     "attributes": {}, "joinedAtMs": 1757155200000, "leftAtMs": 1757156650000}
+  ],
+  "metadata": "{\"sessionPolicy\":{\"minHumans\":2},\"accountId\":\"AC_9271\"}"
 }]}
 ```
 
@@ -704,23 +711,32 @@ under `alice` and `alice#2`. `kind` is `standard`, `egress` or `agent`, and only
 towards the number of people a room needs — a recorder in the room does not make a meeting, and it is
 in the record anyway, because "was this meeting recorded" is a question somebody asks a month later.
 
-`accountId` is who the platform that issued the token says this is, as opposed to `identity`, which
-is what one room calls them: two people can both be `alice` in two rooms, and one person's second tab
-becomes `alice#2`, while the account is the same string wherever they go and is what a recording, a
-bill or a history hangs off. It comes out of the join token — the `accountId` claim, or an attribute
-of that name for an issuer whose SDK will not mint a custom claim, read once where the token is
-already parsed. It is **not** on the wire to other participants: everybody in the room learns an
-identity, a name and whatever metadata the room chose to publish, and who the platform bills is none
-of their business.
+`metadata` on the session and `attributes` on each stretch are **the platform above's, and mediacore
+never reads them**. This is a core other projects build on, and a project needs somewhere on the
+record of a meeting to put what a meeting means to it — whose it was, which booking it was against,
+whatever it needs when it comes back a month later and asks. So the room's metadata as it stood when
+the meeting began is kept on the session, each participant's attributes as they stood when that
+person arrived are kept on their stretch, and both come back byte for byte with nothing here having
+had an opinion about either.
 
-It is `null` when the token carried none, and nothing is refused over that. A recorder and an agent
-have no account by their nature; a guest let in by a token that names nobody has none either, and
-both are legitimate participants in a meeting that legitimately happened. Refusing the join instead
-would mean a platform that forgot one claim could not hold meetings at all, and defaulting it to the
-identity would put a room-scoped name into a field everything downstream treats as an account and
-bills against. So it is `null`, everything that groups by account leaves them out, and the demo front
-end shows the shape of it: sign in and the token carries the provider's subject, type a name into the
-box and it carries nothing.
+Nothing about either is interpreted, with one exception that predates them: `sessionPolicy` inside
+room metadata, which the room service reads when a room is created or its metadata updated, long
+before there is a record. Reading one key of a document is not a reason to rewrite the rest of it, so
+the metadata on the record is the whole blob, `sessionPolicy` included.
+
+An earlier version of this server had a column called `accountId` instead, lifted off the join token.
+It was wrong twice over: an account there was one customer's notion of who somebody is — shared by
+everyone in the meeting rather than identifying a person — and every other platform embedding this
+server had no such concept and nowhere to put the one it did have. A token that still carries an
+`accountId`, as a claim or as an attribute, is accepted exactly as before; the claim is ignored, and
+the attribute is kept the way every other attribute is. The demo front end shows the shape of it:
+sign in and the token carries the provider's subject in an attribute, type a name into the box and it
+carries nothing.
+
+Both are bounded by `sessions.max_opaque_bytes`, sixteen kilobytes by default, because both arrive
+from outside — metadata over the room service, attributes in a token minted by somebody this server
+does not control. A value over the limit is dropped **whole** rather than truncated, because half a
+JSON document is worse than none, and one warning names the meeting it happened to.
 
 `joinedAtMs` can be earlier than `startedAtMs`: the first person into a room with a floor of two was
 waiting for the second, and how long they waited is worth knowing. It is never earlier than the
@@ -783,6 +799,13 @@ transaction. There is no down migration and no way to ask for one: going back a 
 back to a database from before the upgrade, which is the honest answer for a schema nobody is going
 to reverse correctly under pressure. Every table is prefixed `mediacore_`, so this can be a database
 something else also uses.
+
+Migration 4 is the one exception to "a migration is written so the previous release can still run
+against it". It renames `mediacore_meeting` to `mediacore_session` and drops the account column,
+because the schema was the last place in this server still calling a session a meeting, and it was
+taken while the only two databases in existence were ours and upgraded together. It is idempotent
+like every other step — a second run against a migrated database is a no-op — but it is forward-only
+in a way the others are not.
 
 **A database that is down does not stop this server.** Not at startup and not mid-call. Nothing on
 the media path goes anywhere near the session store, so refusing to carry calls over a database
@@ -1166,7 +1189,7 @@ never hears about.
  "id":"EV_7b2c9f10ad33","createdAt":"1757156802",
  "recording":{
    "id":"RE_4c1de9f0aa21","session":"SE_3f9a1c04b7de","room":"standup",
-   "participant":"PA_a1b2c3d4e5f6","identity":"alice","accountId":"AC_9271","segment":0,
+   "participant":"PA_a1b2c3d4e5f6","identity":"alice","segment":0,
    "bucket":"meetings","objectKey":"SE_3f9a1c04b7de/PA_a1b2c3d4e5f6-0.ogg",
    "bytes":6291456,"contentType":"audio/ogg","sampleRate":48000,"channels":1,
    "startedAtMs":1757155200000,"endedAtMs":1757156740000,

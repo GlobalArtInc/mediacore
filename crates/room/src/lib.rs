@@ -169,14 +169,6 @@ impl RoomSettings {
 pub struct ParticipantSpec {
     pub identity: String,
     pub name: String,
-    /// Who the platform that issued the token says this is, when it said.
-    ///
-    /// Read where the token is parsed and carried from there; nothing in this
-    /// crate looks at it or gives it a shape. It is not part of the profile
-    /// because a profile is what a participant may update about themselves and
-    /// this is not: it is what their token said, and it does not change while
-    /// they are in the room.
-    pub account_id: Option<String>,
     pub metadata: String,
     pub attributes: HashMap<String, String>,
     pub permission: mediacore::ParticipantPermission,
@@ -221,13 +213,6 @@ pub struct Participant {
     /// comparison of what two tokens asked to be called.
     pub requested_identity: String,
     pub kind: ParticipantKind,
-    /// The account behind them, out of their token. `None` when the token
-    /// named none -- a recorder, an agent, or a guest.
-    ///
-    /// Not on the wire. Every other participant learns an identity, a name and
-    /// whatever metadata the room chose to publish; who the platform bills is
-    /// none of their business. It goes into the meeting record and no further.
-    pub account_id: Option<String>,
     pub joined_at_ms: i64,
     profile: Mutex<Profile>,
     version: AtomicU32,
@@ -971,7 +956,10 @@ impl Room {
                 identity: participant.identity.clone(),
                 name: participant.name(),
                 kind: participant.kind.to_record(),
-                account_id: participant.account_id.clone(),
+                // Whatever the platform above put on this participant, on its
+                // way to the record of the meeting and read nowhere else. See
+                // `mediacore_session::Attendance::attributes`.
+                attributes: participant.attributes(),
                 joined_at_ms: participant.joined_at_ms,
             })
             .collect();
@@ -986,6 +974,7 @@ impl Room {
             &roster,
             settings.min_humans,
             settings.end_grace_ms(),
+            &settings.metadata,
             now_ms,
         )
     }
@@ -1854,7 +1843,6 @@ impl Registry {
                 identity: identity.clone(),
                 requested_identity: spec.identity.clone(),
                 kind: spec.kind,
-                account_id: spec.account_id.clone(),
                 joined_at_ms: now_ms(),
                 profile: Mutex::new(Profile {
                     name: spec.name,
@@ -2217,7 +2205,8 @@ mod tests {
 
     fn registry(defaults: RoomDefaults) -> Harness {
         let records = tempfile::TempDir::new().expect("a directory for session records");
-        let sessions = SessionStore::files(records.path()).expect("an empty session store opens");
+        let sessions =
+            SessionStore::files(records.path(), 64 * 1024).expect("an empty session store opens");
         let events = Arc::new(Bus::new());
         let listener = events.listen();
 

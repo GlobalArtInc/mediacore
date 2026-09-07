@@ -29,7 +29,8 @@ impl Deref for Harness {
 
 fn registry(defaults: RoomDefaults) -> Harness {
     let records = tempfile::TempDir::new().expect("a directory for session records");
-    let sessions = SessionStore::files(records.path()).expect("an empty session store opens");
+    let sessions =
+        SessionStore::files(records.path(), 64 * 1024).expect("an empty session store opens");
 
     Harness {
         registry: Registry::new(defaults, Arc::new(sessions), Arc::new(Bus::new())),

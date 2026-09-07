@@ -148,7 +148,7 @@ impl S3 {
         let prefix = self.settings.prefix.trim_matches('/');
         let name = format!(
             "{}/{}-{}.ogg",
-            recording.meeting, recording.participant, recording.segment
+            recording.session, recording.participant, recording.segment
         );
 
         if prefix.is_empty() {
@@ -481,9 +481,8 @@ mod tests {
     fn recording() -> Recording {
         Recording {
             id: "RE_0123456789ab".to_owned(),
-            meeting: "SE_0123456789ab".to_owned(),
+            session: "SE_0123456789ab".to_owned(),
             participant: "PA_0123456789ab".to_owned(),
-            account_id: None,
             segment: 2,
             local_path: PathBuf::from("/var/lib/mediacore/audio/x.ogg"),
             node: Some("ND_one".to_owned()),

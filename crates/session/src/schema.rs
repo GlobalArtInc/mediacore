@@ -26,9 +26,18 @@
 //! rename them -- and the release after it removes what nothing reads any
 //! more.
 //!
+//! **Where migration 4 breaks that rule, on purpose.** It renames the meeting
+//! table to `mediacore_session` and drops the account column, so the release
+//! before it cannot run against a database that has had it. That is a
+//! deliberate exception taken while the only two databases in existence are
+//! ours and are upgraded together: the word the schema used was the one word
+//! in this server that disagreed with every other, and carrying the
+//! disagreement forward for ever to protect a rollback nobody would take is a
+//! worse trade than saying plainly that this one is a forward-only step.
+//!
 //! **Why every table is prefixed.** A deployment this size very often points
-//! several services at one database. `meeting` and `recording` are names
-//! somebody else will want; `mediacore_meeting` is not.
+//! several services at one database. `session` and `recording` are names
+//! somebody else will want; `mediacore_session` is not.
 
 /// One step, and what it does.
 pub(crate) struct Migration {
@@ -185,6 +194,109 @@ ALTER TABLE mediacore_recording ADD COLUMN IF NOT EXISTS node text;
 CREATE INDEX IF NOT EXISTS mediacore_recording_work_failed
     ON mediacore_recording_work (stage)
     WHERE state = 'failed';
+",
+    },
+    Migration {
+        version: 4,
+        name: "the meeting table becomes the session table",
+        sql: "
+-- Renamed in place rather than copied into a new table beside the old one.
+-- These rows are meetings people were really at, and a copy is a chance to end
+-- up with some of them in one table and the rest in the other.
+--
+-- Every statement is written to do nothing when it has already been done, so
+-- that the second node to start finds the work finished rather than an error.
+-- Postgres has no IF NOT EXISTS on a rename, which is why this is a block that
+-- looks before it moves rather than a list of ALTERs.
+DO $$
+BEGIN
+    IF to_regclass('mediacore_meeting') IS NOT NULL
+       AND to_regclass('mediacore_session') IS NULL THEN
+        ALTER TABLE mediacore_meeting RENAME TO mediacore_session;
+    END IF;
+
+    IF EXISTS (SELECT FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'mediacore_attendance'
+                  AND column_name = 'meeting') THEN
+        ALTER TABLE mediacore_attendance RENAME COLUMN meeting TO session;
+    END IF;
+
+    IF EXISTS (SELECT FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'mediacore_recording'
+                  AND column_name = 'meeting') THEN
+        ALTER TABLE mediacore_recording RENAME COLUMN meeting TO session;
+    END IF;
+
+    -- The constraints Postgres named after the table and the column when
+    -- migration 1 created them. Renaming a table does not touch them, so
+    -- `\\d mediacore_session` would otherwise still say `meeting` in four
+    -- places nobody thought to look.
+    IF EXISTS (SELECT FROM pg_constraint WHERE conname = 'mediacore_meeting_pkey') THEN
+        ALTER TABLE mediacore_session
+            RENAME CONSTRAINT mediacore_meeting_pkey TO mediacore_session_pkey;
+    END IF;
+
+    IF EXISTS (SELECT FROM pg_constraint
+                WHERE conname = 'mediacore_attendance_meeting_fkey') THEN
+        ALTER TABLE mediacore_attendance
+            RENAME CONSTRAINT mediacore_attendance_meeting_fkey
+                           TO mediacore_attendance_session_fkey;
+    END IF;
+
+    IF EXISTS (SELECT FROM pg_constraint
+                WHERE conname = 'mediacore_recording_meeting_fkey') THEN
+        ALTER TABLE mediacore_recording
+            RENAME CONSTRAINT mediacore_recording_meeting_fkey
+                           TO mediacore_recording_session_fkey;
+    END IF;
+
+    IF EXISTS (SELECT FROM pg_constraint
+                WHERE conname = 'mediacore_recording_meeting_participant_segment_key') THEN
+        ALTER TABLE mediacore_recording
+            RENAME CONSTRAINT mediacore_recording_meeting_participant_segment_key
+                           TO mediacore_recording_session_participant_segment_key;
+    END IF;
+END
+$$;
+
+ALTER INDEX IF EXISTS mediacore_meeting_by_room RENAME TO mediacore_session_by_room;
+ALTER INDEX IF EXISTS mediacore_meeting_unfinished RENAME TO mediacore_session_unfinished;
+ALTER INDEX IF EXISTS mediacore_recording_by_meeting RENAME TO mediacore_recording_by_session;
+",
+    },
+    Migration {
+        version: 5,
+        name: "somewhere for the platform above to keep its own data",
+        sql: "
+-- The room's metadata as it stood when the session opened, and each
+-- participant's attributes as they stood when that person arrived. Opaque:
+-- nothing in this server reads either of them, and nothing here has any
+-- business knowing what an embedding platform decided to put in them.
+--
+-- text and not jsonb. Room metadata is a string that may or may not be JSON --
+-- this server round-trips it either way -- and handing it to jsonb would mean
+-- a platform whose metadata is not JSON could not have a record at all.
+-- Attributes are a map this server serialises, and keeping them in the same
+-- kind of column keeps one rule for both: what came in comes back out.
+ALTER TABLE mediacore_session ADD COLUMN IF NOT EXISTS metadata text;
+ALTER TABLE mediacore_attendance ADD COLUMN IF NOT EXISTS attributes text;
+",
+    },
+    Migration {
+        version: 6,
+        name: "the account that was never ours to hold",
+        sql: "
+-- An account was one customer's idea of who a participant is, welded into a
+-- schema every other platform embedding this server also has to live in. What
+-- replaces it is the two columns migration 5 added: whoever wants to hang
+-- their own identifier off a session now has a place to put it that this
+-- server does not pretend to understand.
+DROP INDEX IF EXISTS mediacore_attendance_by_account;
+
+ALTER TABLE mediacore_attendance DROP COLUMN IF EXISTS account_id;
+ALTER TABLE mediacore_recording DROP COLUMN IF EXISTS account_id;
 ",
     },
 ];

@@ -37,6 +37,10 @@ use postgres::NoTls;
 
 const URL: &str = "MEDIACORE_TEST_POSTGRES";
 
+/// Far more than anything these tests put on a record, so that the one test
+/// about the limit is the only one the limit can decide anything in.
+const OPAQUE_BYTES: usize = 64 * 1024;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -85,17 +89,20 @@ impl Scratch {
     }
 
     fn store(&self, node: &str) -> SessionStore {
-        SessionStore::postgres(self.settings(node)).expect("the store opens")
+        SessionStore::postgres(self.settings(node), OPAQUE_BYTES).expect("the store opens")
     }
 
     /// A node in a cluster whose lease is short enough to watch run out and
     /// whose patience is short enough to watch run out too.
     fn impatient(&self, node: &str, attempts: u32) -> SessionStore {
-        SessionStore::postgres(PostgresSettings {
-            lease: Duration::from_millis(200),
-            attempts,
-            ..self.settings(node)
-        })
+        SessionStore::postgres(
+            PostgresSettings {
+                lease: Duration::from_millis(200),
+                attempts,
+                ..self.settings(node)
+            },
+            OPAQUE_BYTES,
+        )
         .expect("the store opens")
     }
 
@@ -160,25 +167,55 @@ macro_rules! database {
     };
 }
 
-fn member(sid: &str, identity: &str, account: Option<&str>, joined_at_ms: i64) -> Member {
+/// These tests are about what a database does with a record, not about what the
+/// platform above hangs off one, so they open their meetings in a room with no
+/// metadata. The test that is about the opaque columns calls
+/// [`SessionStore::note`] itself.
+trait Noting {
+    fn noted(
+        &self,
+        room: &str,
+        roster: &[Member],
+        floor: u32,
+        grace_ms: i64,
+        now_ms: i64,
+    ) -> Option<mediacore_session::Session>;
+}
+
+impl Noting for SessionStore {
+    fn noted(
+        &self,
+        room: &str,
+        roster: &[Member],
+        floor: u32,
+        grace_ms: i64,
+        now_ms: i64,
+    ) -> Option<mediacore_session::Session> {
+        self.note(room, roster, floor, grace_ms, "", now_ms)
+    }
+}
+
+fn member(sid: &str, identity: &str, attributes: &[(&str, &str)], joined_at_ms: i64) -> Member {
     Member {
         sid: sid.to_owned(),
         identity: identity.to_owned(),
         name: identity.to_owned(),
         kind: Kind::Standard,
-        account_id: account.map(str::to_owned),
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
         joined_at_ms,
     }
 }
 
-fn recording(meeting: &str, participant: &str, segment: u32, complete: bool) -> Recording {
+fn recording(session: &str, participant: &str, segment: u32, complete: bool) -> Recording {
     let started = now_ms();
 
     Recording {
         id: recording_id(),
-        meeting: meeting.to_owned(),
+        session: session.to_owned(),
         participant: participant.to_owned(),
-        account_id: Some("AC_alice".to_owned()),
         segment,
         local_path: PathBuf::from(format!(
             "/var/lib/mediacore/audio/{participant}-{segment}.ogg"
@@ -214,19 +251,19 @@ fn an_upload_goes_to_the_node_with_the_file_and_an_announcement_goes_to_anybody(
     let at = now_ms();
 
     let holder = scratch.store("ND_holder");
-    holder.note(
+    holder.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = holder.live("demo").expect("a meeting").id;
+    let session = holder.live("demo").expect("a meeting").id;
     assert!(holder.flush(Duration::from_secs(30)));
 
     let mine = Recording {
         node: Some("ND_holder".to_owned()),
-        ..recording(&meeting, "PA_1", 0, true)
+        ..recording(&session, "PA_1", 0, true)
     };
     let id = holder
         .note_recording(&mine, at)
@@ -279,17 +316,17 @@ fn a_recording_that_names_no_node_is_offered_to_whoever_asks() {
     let at = now_ms();
 
     let seeding = scratch.store("ND_seed");
-    seeding.note(
+    seeding.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = seeding.live("demo").expect("a meeting").id;
+    let session = seeding.live("demo").expect("a meeting").id;
     assert!(seeding.flush(Duration::from_secs(30)));
     seeding
-        .note_recording(&recording(&meeting, "PA_1", 0, true), at)
+        .note_recording(&recording(&session, "PA_1", 0, true), at)
         .expect("the recording is written down");
 
     let anybody = scratch.store("ND_anybody");
@@ -316,19 +353,19 @@ fn a_node_that_comes_back_under_a_new_name_adopts_its_own_recordings() {
     let at = now_ms();
 
     let before = scratch.store("ND_before");
-    before.note(
+    before.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = before.live("demo").expect("a meeting").id;
+    let session = before.live("demo").expect("a meeting").id;
     assert!(before.flush(Duration::from_secs(30)));
 
     let made = Recording {
         node: Some("ND_before".to_owned()),
-        ..recording(&meeting, "PA_1", 0, true)
+        ..recording(&session, "PA_1", 0, true)
     };
     before
         .note_recording(&made, at)
@@ -417,7 +454,7 @@ fn the_schema_arrives_on_an_empty_database() {
     );
 
     for table in [
-        "mediacore_meeting",
+        "mediacore_session",
         "mediacore_attendance",
         "mediacore_recording",
         "mediacore_recording_work",
@@ -462,6 +499,266 @@ fn the_schema_arrives_on_an_empty_database() {
     );
 }
 
+/// The schema as migrations 1 to 3 left it, frozen.
+///
+/// A verbatim copy rather than a call into the migration list, and that is the
+/// point: the list is what the test is checking, so reading the old shape out
+/// of it would mean a rename that also edited the past still passed. This is
+/// what the two databases that already exist really look like.
+const SCHEMA_BEFORE_THE_RENAME: &str = "
+CREATE TABLE mediacore_meeting (
+    id               text PRIMARY KEY,
+    room             text NOT NULL,
+    started_at_ms    bigint NOT NULL,
+    ended_at_ms      bigint,
+    ended_by         text,
+    node             text NOT NULL,
+    kept_alive_at_ms bigint NOT NULL
+);
+CREATE INDEX mediacore_meeting_by_room
+    ON mediacore_meeting (room, started_at_ms DESC, id DESC);
+CREATE INDEX mediacore_meeting_unfinished
+    ON mediacore_meeting (kept_alive_at_ms) WHERE ended_at_ms IS NULL;
+
+CREATE TABLE mediacore_attendance (
+    meeting      text NOT NULL REFERENCES mediacore_meeting (id) ON DELETE CASCADE,
+    ordinal      integer NOT NULL,
+    sid          text NOT NULL,
+    identity     text NOT NULL,
+    display_name text NOT NULL,
+    kind         text NOT NULL,
+    account_id   text,
+    joined_at_ms bigint NOT NULL,
+    left_at_ms   bigint,
+    PRIMARY KEY (meeting, ordinal)
+);
+CREATE INDEX mediacore_attendance_by_account
+    ON mediacore_attendance (account_id, meeting) WHERE account_id IS NOT NULL;
+
+CREATE TABLE mediacore_recording (
+    id            text PRIMARY KEY,
+    meeting       text NOT NULL REFERENCES mediacore_meeting (id) ON DELETE CASCADE,
+    participant   text NOT NULL,
+    account_id    text,
+    segment       integer NOT NULL,
+    local_path    text NOT NULL,
+    object_key    text,
+    bytes         bigint,
+    sample_rate   integer NOT NULL,
+    channels      smallint NOT NULL,
+    started_at_ms bigint NOT NULL,
+    ended_at_ms   bigint,
+    offset_ms     bigint NOT NULL,
+    duration_ms   bigint,
+    node          text,
+    UNIQUE (meeting, participant, segment)
+);
+CREATE INDEX mediacore_recording_by_meeting ON mediacore_recording (meeting);
+
+CREATE TABLE mediacore_recording_work (
+    recording        text NOT NULL REFERENCES mediacore_recording (id) ON DELETE CASCADE,
+    stage            text NOT NULL,
+    state            text NOT NULL,
+    attempts         integer NOT NULL DEFAULT 0,
+    due_at_ms        bigint NOT NULL,
+    claimed_by       text,
+    claim_ends_at_ms bigint,
+    done_at_ms       bigint,
+    last_error       text,
+    PRIMARY KEY (recording, stage)
+);
+CREATE INDEX mediacore_recording_work_waiting
+    ON mediacore_recording_work (stage, due_at_ms) WHERE state = 'waiting';
+CREATE INDEX mediacore_recording_work_claimed
+    ON mediacore_recording_work (stage, claim_ends_at_ms) WHERE state = 'claimed';
+CREATE INDEX mediacore_recording_work_failed
+    ON mediacore_recording_work (stage) WHERE state = 'failed';
+
+CREATE TABLE mediacore_schema (
+    version    integer PRIMARY KEY,
+    name       text NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO mediacore_schema (version, name) VALUES
+    (1, 'meetings, attendance, recordings and the work that follows them'),
+    (2, 'which node''s disk a recording is on'),
+    (3, 'finding the work nobody is going to move');
+
+INSERT INTO mediacore_meeting
+    (id, room, started_at_ms, ended_at_ms, ended_by, node, kept_alive_at_ms)
+VALUES ('SE_before000001', 'standup', 1000, 61000, 'grace', 'ND_old', 61000);
+
+INSERT INTO mediacore_attendance
+    (meeting, ordinal, sid, identity, display_name, kind, account_id, joined_at_ms, left_at_ms)
+VALUES ('SE_before000001', 0, 'PA_before00001', 'alice', 'Alice', 'standard', 'AC_9271',
+        1000, 61000);
+
+INSERT INTO mediacore_recording
+    (id, meeting, participant, account_id, segment, local_path, object_key, bytes, sample_rate,
+     channels, started_at_ms, ended_at_ms, offset_ms, duration_ms, node)
+VALUES ('RE_before000001', 'SE_before000001', 'PA_before00001', 'AC_9271', 0,
+        '/var/lib/mediacore/audio/PA_before00001-0.ogg', NULL, NULL, 48000, 1,
+        1000, 61000, 0, 60000, 'ND_old');
+
+INSERT INTO mediacore_recording_work (recording, stage, state, attempts, due_at_ms)
+VALUES ('RE_before000001', 'upload', 'waiting', 0, 1000),
+       ('RE_before000001', 'announce', 'blocked', 0, 1000);
+";
+
+/// The upgrade the two databases that already exist will actually take.
+///
+/// Reading the migration and believing it is not the same thing as running it:
+/// a rename that leaves an index behind, a constraint still named after the old
+/// word, or a row that does not survive is invisible in the source and obvious
+/// here. So this lays down the old schema with a row in every table, starts the
+/// new code on it, and looks at what is there afterwards -- and then starts a
+/// second node, which is what an upgrade of a three-node deployment really is,
+/// and checks that it found nothing to do.
+#[test]
+fn the_schema_from_before_the_rename_is_carried_forward_with_every_row() {
+    let scratch = database!("upgrade");
+    let mut client = scratch.client();
+    client
+        .batch_execute(SCHEMA_BEFORE_THE_RENAME)
+        .expect("the old schema and a row in every table");
+
+    let first = scratch.store("ND_new");
+    first.tick(now_ms());
+
+    let table = |client: &mut postgres::Client, name: &str| -> bool {
+        client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&name])
+            .expect("the catalogue answers")
+            .get(0)
+    };
+    assert!(
+        table(&mut client, "mediacore_session"),
+        "the meeting table was not renamed, so this server is writing into a table nothing reads"
+    );
+    assert!(
+        !table(&mut client, "mediacore_meeting"),
+        "the old table is still there beside the new one, so half the rows would go to each"
+    );
+
+    let names: Vec<String> = client
+        .query(
+            "SELECT indexname::text FROM pg_indexes
+              WHERE schemaname = current_schema() ORDER BY indexname",
+            &[],
+        )
+        .expect("the catalogue answers")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("meeting")),
+        "an index is still named after the word this release stopped using: {names:?}"
+    );
+    assert!(
+        !names.contains(&"mediacore_attendance_by_account".to_owned()),
+        "the index over the account column outlived the column it was over"
+    );
+    for wanted in [
+        "mediacore_session_by_room",
+        "mediacore_session_unfinished",
+        "mediacore_recording_by_session",
+    ] {
+        assert!(
+            names.contains(&wanted.to_owned()),
+            "`{wanted}` is missing, so the query it was built for walks the table: {names:?}"
+        );
+    }
+
+    let columns: Vec<String> = client
+        .query(
+            "SELECT table_name::text || '.' || column_name::text
+               FROM information_schema.columns
+              WHERE table_schema = current_schema()
+                AND (column_name IN ('account_id', 'session', 'meeting', 'metadata', 'attributes'))
+              ORDER BY 1",
+            &[],
+        )
+        .expect("the catalogue answers")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        columns,
+        vec![
+            "mediacore_attendance.attributes",
+            "mediacore_attendance.session",
+            "mediacore_recording.session",
+            "mediacore_session.metadata",
+        ],
+        "the columns after the upgrade are not the ones this release reads and writes"
+    );
+
+    // The rows, through the store rather than through SQL: what matters is that
+    // the meeting somebody really held is still answerable afterwards.
+    let session = first
+        .get("SE_before000001")
+        .expect("the database answers")
+        .expect("a meeting recorded before the upgrade is gone after it");
+    assert_eq!(session.room, "standup");
+    assert_eq!(session.ended_at_ms, Some(61_000));
+    assert_eq!(session.participants.len(), 1);
+    assert_eq!(session.participants[0].identity, "alice");
+    assert!(
+        session.participants[0].attributes.is_empty(),
+        "a row written before the attributes column existed reads back as carrying none"
+    );
+    assert_eq!(
+        session.metadata, None,
+        "a meeting held before the metadata column existed has no metadata, rather than failing \
+         to read"
+    );
+
+    let recordings = first
+        .recordings("SE_before000001")
+        .expect("the database answers");
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0].session, "SE_before000001");
+    assert_eq!(recordings[0].duration_ms, Some(60_000));
+    assert_eq!(
+        first
+            .session_work("SE_before000001")
+            .expect("the database answers")
+            .len(),
+        2,
+        "the queue rows behind a recording did not survive the rename of the table they hang off"
+    );
+
+    // The second node is the rest of the upgrade: it starts a moment later and
+    // has to find the work done.
+    let stamps: Vec<(i32, String)> = client
+        .query(
+            "SELECT version, applied_at::text FROM mediacore_schema",
+            &[],
+        )
+        .expect("the schema table is there")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+
+    let second = scratch.store("ND_second");
+    second.tick(now_ms());
+
+    let after: Vec<(i32, String)> = client
+        .query(
+            "SELECT version, applied_at::text FROM mediacore_schema",
+            &[],
+        )
+        .expect("the schema table is there")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        stamps, after,
+        "the second node applied something, so a rename that is not a no-op the second time would \
+         fail whichever node started last"
+    );
+}
+
 /// A meeting written by one node is a meeting another node can read. This is
 /// the whole reason the store moved: with a directory each, neither of these
 /// would ever see the other's.
@@ -471,11 +768,11 @@ fn a_meeting_one_node_recorded_is_read_by_another() {
     let at = now_ms();
 
     let writer = scratch.store("ND_writer");
-    writer.note(
+    writer.noted(
         "standup",
         &[
-            member("PA_1", "alice", Some("AC_alice"), at),
-            member("PA_2", "bob", None, at),
+            member("PA_1", "alice", &[("accountId", "AC_alice")], at),
+            member("PA_2", "bob", &[], at),
         ],
         0,
         0,
@@ -498,14 +795,15 @@ fn a_meeting_one_node_recorded_is_read_by_another() {
     assert_eq!(session.ended_at_ms, Some(at + 60_000));
     assert_eq!(session.participants.len(), 2);
     assert_eq!(
-        session.account_ids(),
-        vec!["AC_alice"],
-        "the account came off the token, went into the record, and did not come back out of the \
-         database"
+        session.participants[0].attributes.get("accountId"),
+        Some(&"AC_alice".to_owned()),
+        "the platform above's own data came off the token, went into the record, and did not come \
+         back out of the database"
     );
-    assert_eq!(
-        session.participants[1].account_id, None,
-        "a participant whose token carried no account has to read back as having none"
+    assert!(
+        session.participants[1].attributes.is_empty(),
+        "a participant whose token carried no attributes has to read back as carrying none, and \
+         not as carrying an empty something"
     );
 
     let page = reader
@@ -514,6 +812,112 @@ fn a_meeting_one_node_recorded_is_read_by_another() {
     assert_eq!(page.total, 1);
     assert_eq!(page.sessions.len(), 1);
     assert_eq!(page.sessions[0].id, id);
+}
+
+/// The columns that replaced the account: a place for the platform above to
+/// keep its own data, kept and handed back and never read.
+///
+/// Through the database rather than in memory, because the interesting failure
+/// is the round trip -- a map serialised one way and read back another, or a
+/// metadata blob that a column quietly normalised.
+#[test]
+fn the_platform_above_s_own_data_survives_the_database_unchanged() {
+    let scratch = database!("opaque");
+    let at = now_ms();
+    let metadata = r#"{"sessionPolicy":{"minHumans":1},"tenant":"acme","ref":"ø \" \n"}"#;
+
+    let writer = scratch.store("ND_writer");
+    writer.note(
+        "standup",
+        &[
+            member(
+                "PA_1",
+                "alice",
+                &[("accountId", "AC_9271"), ("seat", "3")],
+                at,
+            ),
+            member("PA_2", "bob", &[], at),
+        ],
+        0,
+        0,
+        metadata,
+        at,
+    );
+    let id = writer.live("standup").expect("a meeting").id;
+    writer.close("standup", at + 60_000);
+    assert!(writer.flush(Duration::from_secs(30)));
+
+    let reader = scratch.store("ND_reader");
+    let session = reader
+        .get(&id)
+        .expect("the database answers")
+        .expect("the meeting is there");
+
+    assert_eq!(
+        session.metadata.as_deref(),
+        Some(metadata),
+        "the room's metadata came back as something other than what was put in, so a platform \
+         cannot trust this column with anything it has to parse afterwards"
+    );
+    assert_eq!(
+        session.participants[0].attributes.get("seat"),
+        Some(&"3".to_owned())
+    );
+    assert_eq!(
+        session.participants[0].attributes.len(),
+        2,
+        "an attribute went missing between the roster and the database"
+    );
+    assert!(
+        session.participants[1].attributes.is_empty(),
+        "a participant with no attributes reads back with none"
+    );
+}
+
+/// The bound on the door, against a real column.
+///
+/// Nothing over the limit is stored at all -- not a prefix of it -- so a reader
+/// never has to wonder whether what it got is the whole of what was sent.
+#[test]
+fn a_blob_over_the_limit_reaches_the_database_as_nothing() {
+    let scratch = database!("opaque_limit");
+    let at = now_ms();
+
+    let store = SessionStore::postgres(scratch.settings("ND_small"), 64).expect("the store opens");
+    store.note(
+        "standup",
+        &[member("PA_1", "alice", &[("k", &"v".repeat(64))], at)],
+        0,
+        0,
+        &"m".repeat(65),
+        at,
+    );
+    let id = store.live("standup").expect("a meeting").id;
+    store.close("standup", at + 1_000);
+    assert!(store.flush(Duration::from_secs(30)));
+
+    let mut client = scratch.client();
+    let metadata: Option<String> = client
+        .query_one(
+            "SELECT metadata FROM mediacore_session WHERE id = $1",
+            &[&id],
+        )
+        .expect("the meeting row is there")
+        .get(0);
+    let attributes: Option<String> = client
+        .query_one(
+            "SELECT attributes FROM mediacore_attendance WHERE session = $1",
+            &[&id],
+        )
+        .expect("the attendance row is there")
+        .get(0);
+
+    assert_eq!(
+        metadata, None,
+        "an oversized blob reached the column; a limit that stores a truncated value is a limit \
+         that hands every reader half a document it cannot tell from a whole one"
+    );
+    assert_eq!(attributes, None, "and the same for attributes");
 }
 
 /// Somebody who drops out and comes back is two stretches, and the second
@@ -526,12 +930,12 @@ fn a_participant_who_joins_twice_is_two_stretches_in_the_database() {
     let at = now_ms();
 
     let writer = scratch.store("ND_writer");
-    let alice = member("PA_alice", "alice", Some("AC_alice"), at);
-    let bob = member("PA_bob", "bob", Some("AC_bob"), at);
+    let alice = member("PA_alice", "alice", &[("accountId", "AC_alice")], at);
+    let bob = member("PA_bob", "bob", &[("accountId", "AC_bob")], at);
 
-    writer.note("demo", &[alice.clone(), bob.clone()], 2, 90_000, at);
-    writer.note("demo", std::slice::from_ref(&alice), 2, 90_000, at + 5_000);
-    writer.note("demo", &[alice, bob], 2, 90_000, at + 9_000);
+    writer.noted("demo", &[alice.clone(), bob.clone()], 2, 90_000, at);
+    writer.noted("demo", std::slice::from_ref(&alice), 2, 90_000, at + 5_000);
+    writer.noted("demo", &[alice, bob], 2, 90_000, at + 9_000);
 
     let id = writer.live("demo").expect("a meeting").id;
     writer.close("demo", at + 20_000);
@@ -561,9 +965,9 @@ fn a_participant_who_joins_twice_is_two_stretches_in_the_database() {
          twice"
     );
     assert_eq!(
-        session.account_ids(),
-        vec!["AC_alice", "AC_bob"],
-        "one account per person however many stretches they have"
+        bobs[0].attributes, bobs[1].attributes,
+        "both of bob's stretches were opened from the same roster, so both carry what his token \
+         said"
     );
 }
 
@@ -579,11 +983,11 @@ fn a_meeting_spanning_a_restart_is_closed_by_the_node_that_is_still_up() {
     let departed = {
         let dying = scratch.impatient("ND_dying", 5);
 
-        dying.note(
+        dying.noted(
             "demo",
             &[
-                member("PA_1", "alice", Some("AC_alice"), at),
-                member("PA_2", "bob", None, at),
+                member("PA_1", "alice", &[("accountId", "AC_alice")], at),
+                member("PA_2", "bob", &[], at),
             ],
             0,
             90_000,
@@ -591,9 +995,9 @@ fn a_meeting_spanning_a_restart_is_closed_by_the_node_that_is_still_up() {
         );
         // Somebody leaves, so the record knows about a moment later than the
         // meeting's start and the close has something to land on.
-        dying.note(
+        dying.noted(
             "demo",
-            &[member("PA_1", "alice", Some("AC_alice"), at)],
+            &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
             0,
             90_000,
             at + 30_000,
@@ -617,7 +1021,7 @@ fn a_meeting_spanning_a_restart_is_closed_by_the_node_that_is_still_up() {
     let mut client = scratch.client();
     let open: Option<i64> = client
         .query_one(
-            "SELECT ended_at_ms FROM mediacore_meeting WHERE id = $1",
+            "SELECT ended_at_ms FROM mediacore_session WHERE id = $1",
             &[&departed],
         )
         .expect("the meeting is in the database")
@@ -666,20 +1070,20 @@ fn two_claimants_never_take_the_same_work() {
     let at = now_ms();
 
     let seeding = scratch.store("ND_seed");
-    seeding.note(
+    seeding.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = seeding.live("demo").expect("a meeting").id;
+    let session = seeding.live("demo").expect("a meeting").id;
     assert!(seeding.flush(Duration::from_secs(30)));
 
     let wanted: HashSet<String> = (0..20)
         .map(|segment| {
             seeding
-                .note_recording(&recording(&meeting, "PA_1", segment, true), at)
+                .note_recording(&recording(&session, "PA_1", segment, true), at)
                 .expect("the recording is written down")
         })
         .collect();
@@ -758,18 +1162,18 @@ fn a_claim_whose_holder_disappeared_comes_back_and_then_is_left_alone() {
 
     let seeding = scratch.impatient("ND_seed", 2);
 
-    seeding.note(
+    seeding.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = seeding.live("demo").expect("a meeting").id;
+    let session = seeding.live("demo").expect("a meeting").id;
     assert!(seeding.flush(Duration::from_secs(30)));
 
     let id = seeding
-        .note_recording(&recording(&meeting, "PA_1", 0, true), at)
+        .note_recording(&recording(&session, "PA_1", 0, true), at)
         .expect("the recording is written down");
 
     let taken = seeding
@@ -841,17 +1245,17 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     let at = now_ms();
 
     let store = scratch.store("ND_only");
-    store.note(
+    store.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = store.live("demo").expect("a meeting").id;
+    let session = store.live("demo").expect("a meeting").id;
     assert!(store.flush(Duration::from_secs(30)));
 
-    let open = recording(&meeting, "PA_1", 0, false);
+    let open = recording(&session, "PA_1", 0, false);
     let id = store
         .note_recording(&open, at)
         .expect("the recording is written down");
@@ -868,7 +1272,7 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     // restarted writes it down under a new id and has to land on the same row.
     let closed = Recording {
         id: recording_id(),
-        ..recording(&meeting, "PA_1", 0, true)
+        ..recording(&session, "PA_1", 0, true)
     };
     let same = store
         .note_recording(&closed, at)
@@ -879,7 +1283,7 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     );
     assert_eq!(
         store
-            .recordings(&meeting)
+            .recordings(&session)
             .expect("the database answers")
             .len(),
         1
@@ -892,7 +1296,6 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     assert_eq!(taken[0].recording.local_path, closed.local_path);
     assert_eq!(taken[0].recording.sample_rate, 48_000);
     assert_eq!(taken[0].recording.channels, 1);
-    assert_eq!(taken[0].recording.account_id.as_deref(), Some("AC_alice"));
 
     assert!(
         store
@@ -975,18 +1378,18 @@ fn a_postponed_upload_says_why_and_comes_back_when_it_is_due() {
     let at = now_ms();
 
     let store = scratch.store("ND_only");
-    store.note(
+    store.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = store.live("demo").expect("a meeting").id;
+    let session = store.live("demo").expect("a meeting").id;
     assert!(store.flush(Duration::from_secs(30)));
 
     let id = store
-        .note_recording(&recording(&meeting, "PA_1", 0, true), at)
+        .note_recording(&recording(&session, "PA_1", 0, true), at)
         .expect("the recording is written down");
 
     store
@@ -1037,9 +1440,9 @@ fn a_rooms_history_comes_back_a_page_at_a_time_from_the_database() {
     for index in 0..5i64 {
         let when = at + index * 10_000;
         let sid = format!("PA_{index}");
-        store.note(
+        store.noted(
             "standup",
-            &[member(&sid, "alice", Some("AC_alice"), when)],
+            &[member(&sid, "alice", &[("accountId", "AC_alice")], when)],
             0,
             0,
             when,
@@ -1074,9 +1477,14 @@ fn a_rooms_history_comes_back_a_page_at_a_time_from_the_database() {
 
     // A meeting that is happening now belongs at the top of the first page even
     // though the writer may not have reached it.
-    store.note(
+    store.noted(
         "standup",
-        &[member("PA_now", "alice", Some("AC_alice"), at + 60_000)],
+        &[member(
+            "PA_now",
+            "alice",
+            &[("accountId", "AC_alice")],
+            at + 60_000,
+        )],
         0,
         0,
         at + 60_000,
@@ -1094,7 +1502,7 @@ fn a_rooms_history_comes_back_a_page_at_a_time_from_the_database() {
 /// A node that is still here does not have its own meeting closed under it.
 ///
 /// **The mechanism this pins is the renewal**, the
-/// `UPDATE mediacore_meeting SET kept_alive_at_ms = ...` inside the sweep. It
+/// `UPDATE mediacore_session SET kept_alive_at_ms = ...` inside the sweep. It
 /// is what the whole lease rests on, and it was untested: replacing the
 /// statement with a no-op left every test in this crate green, because the only
 /// test that watched a lease was about the node that had *stopped* -- and the
@@ -1113,9 +1521,9 @@ fn a_node_that_is_still_here_does_not_close_its_own_meeting() {
     // A two-hundred-millisecond lease, so a lease can be watched running out
     // rather than waited for.
     let store = scratch.impatient("ND_live", 5);
-    store.note(
+    store.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         90_000,
         at,
@@ -1139,7 +1547,7 @@ fn a_node_that_is_still_here_does_not_close_its_own_meeting() {
     let mut client = scratch.client();
     let row = client
         .query_one(
-            "SELECT ended_at_ms, ended_by, kept_alive_at_ms FROM mediacore_meeting WHERE id = $1",
+            "SELECT ended_at_ms, ended_by, kept_alive_at_ms FROM mediacore_session WHERE id = $1",
             &[&id],
         )
         .expect("the meeting is in the database");
@@ -1180,18 +1588,18 @@ fn a_claim_that_has_gone_cannot_be_given_back_by_the_node_that_lost_it() {
     let at = now_ms();
 
     let slow = scratch.impatient("ND_slow", 5);
-    slow.note(
+    slow.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = slow.live("demo").expect("a meeting").id;
+    let session = slow.live("demo").expect("a meeting").id;
     assert!(slow.flush(Duration::from_secs(30)));
 
     let id = slow
-        .note_recording(&recording(&meeting, "PA_1", 0, true), at)
+        .note_recording(&recording(&session, "PA_1", 0, true), at)
         .expect("the recording is written down");
     slow.uploaded(&id, "SE_x/PA_1-0.ogg", Some(4_096), now_ms())
         .expect("the upload is written down");
@@ -1290,14 +1698,14 @@ fn an_upload_waiting_for_a_node_that_never_came_back_is_counted() {
     let at = now_ms();
 
     let seeding = scratch.store("ND_seed");
-    seeding.note(
+    seeding.noted(
         "demo",
-        &[member("PA_1", "alice", Some("AC_alice"), at)],
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
         0,
         0,
         at,
     );
-    let meeting = seeding.live("demo").expect("a meeting").id;
+    let session = seeding.live("demo").expect("a meeting").id;
     assert!(seeding.flush(Duration::from_secs(30)));
 
     // A finished recording on a node that is gone for good: an ephemeral volume,
@@ -1305,7 +1713,7 @@ fn an_upload_waiting_for_a_node_that_never_came_back_is_counted() {
     // restart hands out. Written down an hour ago and never picked up since.
     let stranded = Recording {
         node: Some("ND_gone".to_owned()),
-        ..recording(&meeting, "PA_1", 0, true)
+        ..recording(&session, "PA_1", 0, true)
     };
     seeding
         .note_recording(&stranded, at - 3_600_000)

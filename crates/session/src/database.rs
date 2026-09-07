@@ -337,7 +337,7 @@ pub(crate) struct Database {
     /// startup do not each go and take the advisory lock.
     preparing: Mutex<()>,
     healthy: AtomicBool,
-    meetings: AtomicU64,
+    sessions: AtomicU64,
     /// Recording work nobody is going to move: given up on, or waiting so far
     /// past its time that whoever it was waiting for is not coming back. On
     /// `/healthz`; refreshed on the same slow clock as the meeting count.
@@ -378,7 +378,7 @@ impl Database {
             ready: AtomicBool::new(false),
             preparing: Mutex::new(()),
             healthy: AtomicBool::new(false),
-            meetings: AtomicU64::new(0),
+            sessions: AtomicU64::new(0),
             stuck: AtomicU64::new(0),
             counted_at: Mutex::new(None),
             complained_at: Mutex::new(None),
@@ -477,7 +477,7 @@ impl Database {
             // walks every row of a table that keeps a recording's history for
             // ever.
             let row = client.query_one(
-                "SELECT (SELECT count(*) FROM mediacore_meeting),
+                "SELECT (SELECT count(*) FROM mediacore_session),
                         (SELECT count(*) FROM mediacore_recording_work
                           WHERE state = 'failed')
                       + (SELECT count(*) FROM mediacore_recording_work
@@ -488,9 +488,9 @@ impl Database {
         });
 
         match counted {
-            Ok((meetings, stuck)) => {
-                self.meetings
-                    .store(meetings.max(0) as u64, Ordering::Relaxed);
+            Ok((sessions, stuck)) => {
+                self.sessions
+                    .store(sessions.max(0) as u64, Ordering::Relaxed);
                 self.stuck.store(stuck.max(0) as u64, Ordering::Relaxed);
                 *self.counted_at.lock().expect("session count lock") =
                     Some(std::time::Instant::now());
@@ -556,7 +556,7 @@ impl Database {
 
             if !held.is_empty() {
                 transaction.execute(
-                    "UPDATE mediacore_meeting
+                    "UPDATE mediacore_session
                         SET kept_alive_at_ms = $1, node = $2
                       WHERE id = ANY($3) AND ended_at_ms IS NULL",
                     &[&now_ms, &node, &held],
@@ -617,7 +617,7 @@ impl Sink for Database {
     }
 
     fn count(&self) -> usize {
-        self.meetings.load(Ordering::Relaxed) as usize
+        self.sessions.load(Ordering::Relaxed) as usize
     }
 
     /// One transaction: the meeting row, then its attendance list replaced
@@ -650,16 +650,21 @@ impl Sink for Database {
         let outcome = self.pool.run(move |client| {
             let mut transaction = client.transaction()?;
 
+            // The metadata is written when the row is inserted and left
+            // alone by every update after it. It is what the room said when
+            // this meeting opened, and a later write of the same record is a
+            // membership change, not a reason to reopen that question.
             let written = transaction.query_opt(
-                "INSERT INTO mediacore_meeting
-                     (id, room, started_at_ms, ended_at_ms, ended_by, node, kept_alive_at_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO mediacore_session
+                     (id, room, started_at_ms, ended_at_ms, ended_by, node, kept_alive_at_ms,
+                      metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (id) DO UPDATE
                      SET ended_at_ms = EXCLUDED.ended_at_ms,
                          ended_by = EXCLUDED.ended_by,
                          node = EXCLUDED.node,
                          kept_alive_at_ms = EXCLUDED.kept_alive_at_ms
-                   WHERE mediacore_meeting.ended_at_ms IS NULL
+                   WHERE mediacore_session.ended_at_ms IS NULL
                  RETURNING id",
                 &[
                     &session.id,
@@ -669,6 +674,7 @@ impl Sink for Database {
                     &session.ended_by.map(|ending| ending.as_str()),
                     &node,
                     &kept_alive,
+                    &session.metadata,
                 ],
             )?;
 
@@ -678,7 +684,7 @@ impl Sink for Database {
             }
 
             transaction.execute(
-                "DELETE FROM mediacore_attendance WHERE meeting = $1",
+                "DELETE FROM mediacore_attendance WHERE session = $1",
                 &[&session.id],
             )?;
 
@@ -703,11 +709,24 @@ impl Sink for Database {
                     .iter()
                     .map(|attendance| attendance.kind.as_str())
                     .collect();
-                let accounts: Vec<Option<&str>> = session
+                // Serialised here rather than kept as a map on the row: the
+                // column holds whatever the platform above put in the token and
+                // this server has no business turning it into structure it
+                // might then have an opinion about. Null rather than `{}` for a
+                // participant whose token carried none, so that "said nothing"
+                // and "said the empty thing" stay different in the database.
+                let attributes: Vec<Option<String>> = session
                     .participants
                     .iter()
-                    .map(|attendance| attendance.account_id.as_deref())
-                    .collect();
+                    .map(|attendance| {
+                        (!attendance.attributes.is_empty())
+                            .then(|| serde_json::to_string(&attendance.attributes))
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<Option<String>>, serde_json::Error>>()
+                    .map_err(|error| {
+                        Failure::Nonsense(format!("attributes that will not serialise: {error}"))
+                    })?;
                 let joined: Vec<i64> = session
                     .participants
                     .iter()
@@ -725,15 +744,15 @@ impl Sink for Database {
                 // that keeps up and one that does not.
                 transaction.execute(
                     "INSERT INTO mediacore_attendance
-                         (meeting, ordinal, sid, identity, display_name, kind, account_id,
+                         (session, ordinal, sid, identity, display_name, kind, attributes,
                           joined_at_ms, left_at_ms)
                      SELECT $1, (person.ordinal - 1)::int, person.sid, person.identity,
-                            person.display_name, person.kind, person.account_id,
+                            person.display_name, person.kind, person.attributes,
                             person.joined_at_ms, person.left_at_ms
                        FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                                    $7::bigint[], $8::bigint[])
                             WITH ORDINALITY AS person(sid, identity, display_name, kind,
-                                                      account_id, joined_at_ms, left_at_ms,
+                                                      attributes, joined_at_ms, left_at_ms,
                                                       ordinal)",
                     &[
                         &session.id,
@@ -741,7 +760,7 @@ impl Sink for Database {
                         &identities,
                         &names,
                         &kinds,
-                        &accounts,
+                        &attributes,
                         &joined,
                         &left,
                     ],
@@ -781,18 +800,18 @@ impl Sink for Database {
         let id = id.to_owned();
         let found = self.pool.run(move |client| {
             let Some(row) = client.query_opt(
-                "SELECT id, room, started_at_ms, ended_at_ms, ended_by
-                   FROM mediacore_meeting WHERE id = $1",
+                "SELECT id, room, started_at_ms, ended_at_ms, ended_by, metadata
+                   FROM mediacore_session WHERE id = $1",
                 &[&id],
             )?
             else {
                 return Ok(None);
             };
 
-            let mut session = read_meeting(&row)?;
+            let mut session = read_session(&row)?;
             let people = client.query(
-                "SELECT sid, identity, display_name, kind, account_id, joined_at_ms, left_at_ms
-                   FROM mediacore_attendance WHERE meeting = $1 ORDER BY ordinal",
+                "SELECT sid, identity, display_name, kind, attributes, joined_at_ms, left_at_ms
+                   FROM mediacore_attendance WHERE session = $1 ORDER BY ordinal",
                 &[&id],
             )?;
             session.participants = people
@@ -818,7 +837,7 @@ impl Sink for Database {
 
             let total: i64 = transaction
                 .query_one(
-                    "SELECT count(*) FROM mediacore_meeting WHERE room = $1",
+                    "SELECT count(*) FROM mediacore_session WHERE room = $1",
                     &[&room],
                 )?
                 .get(0);
@@ -827,8 +846,8 @@ impl Sink for Database {
             // started in the same millisecond do not swap places between one
             // page and the next.
             let rows = transaction.query(
-                "SELECT id, room, started_at_ms, ended_at_ms, ended_by
-                   FROM mediacore_meeting
+                "SELECT id, room, started_at_ms, ended_at_ms, ended_by, metadata
+                   FROM mediacore_session
                   WHERE room = $1
                   ORDER BY started_at_ms DESC, id DESC
                  OFFSET $2 LIMIT $3",
@@ -837,7 +856,7 @@ impl Sink for Database {
 
             let mut sessions: Vec<Session> = rows
                 .iter()
-                .map(read_meeting)
+                .map(read_session)
                 .collect::<Result<Vec<Session>, Failure>>()?;
             let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
 
@@ -845,11 +864,11 @@ impl Sink for Database {
             // per meeting: a hundred meetings is a hundred round trips
             // otherwise, with the answer being a few thousand short rows.
             let people = transaction.query(
-                "SELECT meeting, sid, identity, display_name, kind, account_id,
+                "SELECT session, sid, identity, display_name, kind, attributes,
                         joined_at_ms, left_at_ms
                    FROM mediacore_attendance
-                  WHERE meeting = ANY($1)
-                  ORDER BY meeting, ordinal",
+                  WHERE session = ANY($1)
+                  ORDER BY session, ordinal",
                 &[&ids],
             )?;
             drop(ids);
@@ -857,7 +876,7 @@ impl Sink for Database {
             let mut lists: HashMap<String, Vec<Attendance>> = HashMap::new();
             for row in &people {
                 lists
-                    .entry(row.get::<_, String>("meeting"))
+                    .entry(row.get::<_, String>("session"))
                     .or_default()
                     .push(read_attendance(row)?);
             }
@@ -930,11 +949,11 @@ impl Sink for Database {
             let id: String = transaction
                 .query_one(
                     "INSERT INTO mediacore_recording
-                         (id, meeting, participant, account_id, segment, local_path, node,
+                         (id, session, participant, segment, local_path, node,
                           object_key, bytes, sample_rate, channels, started_at_ms, ended_at_ms,
                           offset_ms, duration_ms)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                     ON CONFLICT (meeting, participant, segment) DO UPDATE
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                     ON CONFLICT (session, participant, segment) DO UPDATE
                          SET local_path = EXCLUDED.local_path,
                              node = EXCLUDED.node,
                              bytes = EXCLUDED.bytes,
@@ -943,9 +962,8 @@ impl Sink for Database {
                      RETURNING id",
                     &[
                         &recording.id,
-                        &recording.meeting,
+                        &recording.session,
                         &recording.participant,
-                        &recording.account_id,
                         &segment,
                         &path,
                         // Taken from the row and not from this node's settings:
@@ -1000,19 +1018,19 @@ impl Sink for Database {
         self.report(outcome)
     }
 
-    fn recordings(&self, meeting: &str) -> Result<Vec<Recording>, StoreError> {
+    fn recordings(&self, session: &str) -> Result<Vec<Recording>, StoreError> {
         self.ready()?;
 
-        let meeting = meeting.to_owned();
+        let session = session.to_owned();
         let found = self.pool.run(move |client| {
             let rows = client.query(
-                "SELECT id, meeting, participant, account_id, segment, local_path, node,
+                "SELECT id, session, participant, segment, local_path, node,
                         object_key, bytes, sample_rate, channels, started_at_ms, ended_at_ms,
                         offset_ms, duration_ms
                    FROM mediacore_recording
-                  WHERE meeting = $1
+                  WHERE session = $1
                   ORDER BY participant, segment",
-                &[&meeting],
+                &[&session],
             )?;
             rows.iter().map(read_recording).collect()
         });
@@ -1025,19 +1043,19 @@ impl Sink for Database {
         self.report(outcome)
     }
 
-    fn meeting_work(&self, meeting: &str) -> Result<Vec<Work>, StoreError> {
+    fn session_work(&self, session: &str) -> Result<Vec<Work>, StoreError> {
         self.ready()?;
 
-        let meeting = meeting.to_owned();
+        let session = session.to_owned();
         let found = self.pool.run(move |client| {
             let rows = client.query(
                 "SELECT work.recording, work.stage, work.state, work.attempts, work.due_at_ms,
                         work.claimed_by, work.claim_ends_at_ms, work.done_at_ms, work.last_error
                    FROM mediacore_recording_work AS work
                    JOIN mediacore_recording AS file ON file.id = work.recording
-                  WHERE file.meeting = $1
+                  WHERE file.session = $1
                   ORDER BY file.participant, file.segment, work.stage",
-                &[&meeting],
+                &[&session],
             )?;
             rows.iter().map(read_work).collect()
         });
@@ -1135,7 +1153,7 @@ impl Sink for Database {
             // poller taking ten pieces of work should cost two round trips and
             // not eleven.
             let found = transaction.query(
-                "SELECT id, meeting, participant, account_id, segment, local_path, node,
+                "SELECT id, session, participant, segment, local_path, node,
                         object_key, bytes, sample_rate, channels, started_at_ms, ended_at_ms,
                         offset_ms, duration_ms
                    FROM mediacore_recording WHERE id = ANY($1)",
@@ -1350,26 +1368,26 @@ fn reap(
 ) -> Result<Vec<(String, String, i64)>, Failure> {
     let rows = transaction.query(
         "WITH abandoned AS (
-             SELECT meeting.id,
+             SELECT held.id,
                     greatest(
-                        meeting.started_at_ms,
+                        held.started_at_ms,
                         coalesce((SELECT max(greatest(person.joined_at_ms,
                                                       coalesce(person.left_at_ms,
                                                                person.joined_at_ms)))
                                     FROM mediacore_attendance AS person
-                                   WHERE person.meeting = meeting.id),
-                                 meeting.started_at_ms)
+                                   WHERE person.session = held.id),
+                                 held.started_at_ms)
                     ) AS last_known
-               FROM mediacore_meeting AS meeting
-              WHERE meeting.ended_at_ms IS NULL
-                AND meeting.kept_alive_at_ms < $1
+               FROM mediacore_session AS held
+              WHERE held.ended_at_ms IS NULL
+                AND held.kept_alive_at_ms < $1
               LIMIT 200
          )
-         UPDATE mediacore_meeting AS meeting
+         UPDATE mediacore_session AS held
             SET ended_at_ms = abandoned.last_known, ended_by = 'restart'
            FROM abandoned
-          WHERE meeting.id = abandoned.id AND meeting.ended_at_ms IS NULL
-         RETURNING meeting.id, meeting.room, meeting.ended_at_ms",
+          WHERE held.id = abandoned.id AND held.ended_at_ms IS NULL
+         RETURNING held.id, held.room, held.ended_at_ms",
         &[&older_than_ms],
     )?;
 
@@ -1391,10 +1409,10 @@ fn reap(
         // measured.
         transaction.execute(
             "UPDATE mediacore_attendance AS person
-                SET left_at_ms = meeting.ended_at_ms
-               FROM mediacore_meeting AS meeting
-              WHERE person.meeting = meeting.id
-                AND person.meeting = ANY($1)
+                SET left_at_ms = held.ended_at_ms
+               FROM mediacore_session AS held
+              WHERE person.session = held.id
+                AND person.session = ANY($1)
                 AND person.left_at_ms IS NULL",
             &[&ids],
         )?;
@@ -1451,7 +1469,7 @@ fn apply(client: &mut Client) -> Result<Vec<(i32, &'static str)>, Failure> {
     Ok(applied)
 }
 
-fn read_meeting(row: &Row) -> Result<Session, Failure> {
+fn read_session(row: &Row) -> Result<Session, Failure> {
     let ended_by: Option<String> = row.get("ended_by");
     let ended_by = match ended_by.as_deref() {
         None => None,
@@ -1467,11 +1485,23 @@ fn read_meeting(row: &Row) -> Result<Session, Failure> {
         ended_at_ms: row.get("ended_at_ms"),
         ended_by,
         participants: Vec::new(),
+        metadata: row.get("metadata"),
     })
 }
 
 fn read_attendance(row: &Row) -> Result<Attendance, Failure> {
     let kind: String = row.get("kind");
+    let attributes: Option<String> = row.get("attributes");
+    // Refused rather than read as nothing. This column only ever holds what
+    // this server serialised into it, so a value that will not parse was put
+    // there by hand -- and quietly answering "they had no attributes" would
+    // hide that from the one person who could fix it.
+    let attributes = match attributes.as_deref() {
+        None => HashMap::new(),
+        Some(json) => serde_json::from_str(json).map_err(|error| {
+            Failure::Nonsense(format!("attributes that are not a map of strings: {error}"))
+        })?,
+    };
 
     Ok(Attendance {
         sid: row.get("sid"),
@@ -1479,7 +1509,7 @@ fn read_attendance(row: &Row) -> Result<Attendance, Failure> {
         name: row.get("display_name"),
         kind: Kind::parse(&kind)
             .ok_or_else(|| Failure::Nonsense(format!("`{kind}` is not a kind of participant")))?,
-        account_id: row.get("account_id"),
+        attributes,
         joined_at_ms: row.get("joined_at_ms"),
         left_at_ms: row.get("left_at_ms"),
     })
@@ -1494,9 +1524,8 @@ fn read_recording(row: &Row) -> Result<Recording, Failure> {
 
     Ok(Recording {
         id: row.get("id"),
-        meeting: row.get("meeting"),
+        session: row.get("session"),
         participant: row.get("participant"),
-        account_id: row.get("account_id"),
         segment: segment.max(0) as u32,
         local_path: path.into(),
         node: row.get("node"),

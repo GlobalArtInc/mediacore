@@ -125,23 +125,20 @@ pub struct TrackSpec {
     pub participant: String,
     /// What the room calls them, for logs and for the sidecar.
     pub identity: String,
-    /// The platform account behind them, copied onto the recording so that
-    /// "whose audio is this" survives the meeting record being pruned.
-    pub account_id: Option<String>,
     /// The track's sid, for logs.
     pub track: String,
 }
 
 /// What the media path and the control paths send to the writer thread.
 pub(crate) enum Message {
-    Meeting {
+    SessionStarted {
         room: String,
-        meeting: String,
+        session: String,
         started_at_ms: i64,
     },
-    MeetingOver {
+    SessionEnded {
         room: String,
-        meeting: String,
+        session: String,
     },
     Open {
         key: u64,
@@ -167,7 +164,7 @@ impl Message {
     pub(crate) fn track(&self) -> Option<u64> {
         match self {
             Self::Open { key, .. } | Self::Packet { key, .. } | Self::Close { key } => Some(*key),
-            Self::Meeting { .. } | Self::MeetingOver { .. } | Self::Stop => None,
+            Self::SessionStarted { .. } | Self::SessionEnded { .. } | Self::Stop => None,
         }
     }
 }
@@ -260,20 +257,20 @@ impl Recorder {
     /// Until this is said, audio published in that room is not written down:
     /// somebody alone in a room waiting for a meeting to reach its floor is not
     /// in a meeting, and their audio belongs to no record.
-    pub fn meeting_started(&self, room: &str, meeting: &str, started_at_ms: i64) {
-        let _ = self.shared.messages.send(Message::Meeting {
+    pub fn session_started(&self, room: &str, session: &str, started_at_ms: i64) {
+        let _ = self.shared.messages.send(Message::SessionStarted {
             room: room.to_owned(),
-            meeting: meeting.to_owned(),
+            session: session.to_owned(),
             started_at_ms,
         });
     }
 
     /// A meeting has ended. Every file of it is closed, whoever is still
     /// publishing into the room.
-    pub fn meeting_ended(&self, room: &str, meeting: &str) {
-        let _ = self.shared.messages.send(Message::MeetingOver {
+    pub fn session_ended(&self, room: &str, session: &str) {
+        let _ = self.shared.messages.send(Message::SessionEnded {
             room: room.to_owned(),
-            meeting: meeting.to_owned(),
+            session: session.to_owned(),
         });
     }
 

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// The prefix every recording id carries, beside `RM_` for a room, `PA_` for a
-/// participant and `SE_` for a meeting.
+/// participant and `SE_` for a session.
 pub const RECORDING_ID_PREFIX: &str = "RE_";
 
 /// One stretch of one participant's audio, and the file it is in.
@@ -32,26 +32,26 @@ pub const RECORDING_ID_PREFIX: &str = "RE_";
 /// stretch: somebody who drops out and comes back produces two files, and a
 /// recorder that rolls a file over at a size limit produces several. `segment`
 /// numbers them within one participant's time in one meeting, from zero, so
-/// that `(meeting, participant, segment)` names a file exactly once however
+/// that `(session, participant, segment)` names a file exactly once however
 /// many times the recorder is asked to write it down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Recording {
     pub id: String,
-    /// The meeting this belongs to, never the room. A room holds another
+    /// The session this belongs to, never the room. A room holds another
     /// meeting tomorrow and this recording is not of that one.
-    pub meeting: String,
+    ///
+    /// `meeting` when it was written by a release before the session table was
+    /// called the session table: an alias rather than a rename, because the
+    /// sidecars beside the audio on a node's disk are read back by the next
+    /// start of that node, and a node that could not read its own sidecars
+    /// would leave every unfinished recording on its disk unaccounted for.
+    #[serde(alias = "meeting")]
+    pub session: String,
     /// The participant's `sid`, which is what the attendance list is keyed by
     /// as well, so a recording can be lined up with the stretch it was made
     /// during.
     pub participant: String,
-    /// The platform account behind that participant, copied off the attendance
-    /// row at the moment the recording started.
-    ///
-    /// Copied rather than joined because it is the answer to "whose audio is
-    /// this" and that answer must survive a meeting record being pruned. `None`
-    /// when the token carried no account -- a recorder, an agent, or a guest.
-    pub account_id: Option<String>,
     /// Which file of this participant's, from zero.
     pub segment: u32,
     /// Where the file is on the node that recorded it.

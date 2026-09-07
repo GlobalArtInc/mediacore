@@ -344,10 +344,6 @@ pub struct Ready {
     pub participant: String,
     /// What the room called them: `alice`, or `alice#2` for a second tab.
     pub identity: String,
-    /// The platform account behind them, or `null` for a recorder, an agent or
-    /// a guest whose token named nobody.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
     /// Which file of this participant's this is, from zero. More than one means
     /// they left and came back, or they talked for long enough that the file
     /// was rolled over.
@@ -489,6 +485,7 @@ mod tests {
             ended_at_ms: None,
             ended_by: None,
             participants: Vec::new(),
+            metadata: None,
         }
     }
 
@@ -622,7 +619,6 @@ mod tests {
             room: "standup".to_owned(),
             participant: "PA_000000000000".to_owned(),
             identity: "alice".to_owned(),
-            account_id: Some("AC_9271".to_owned()),
             segment: 0,
             bucket: "meetings".to_owned(),
             object_key: "SE_000000000000/PA_000000000000-0.ogg".to_owned(),

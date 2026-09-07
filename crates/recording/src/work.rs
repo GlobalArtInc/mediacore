@@ -336,7 +336,7 @@ impl<Q: Queue, A: Announce> Worker<Q, A> {
                 Ok(Ok(id)) => {
                     tracing::info!(
                         recording = %id,
-                        meeting = %owed.recording.meeting,
+                        session = %owed.recording.session,
                         "a recording is in the store and its upload is queued"
                     );
 

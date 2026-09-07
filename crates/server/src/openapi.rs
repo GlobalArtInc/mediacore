@@ -740,6 +740,20 @@ fn session_schema() -> Value {
                 "description":
                     "Every stretch of attendance, oldest first. One entry per stretch and not per                      person: somebody who dropped out and came back is two.",
             },
+            "metadata": {
+                "type": "string",
+                "nullable": true,
+                "description":
+                    "The room's metadata as it stood when this meeting began, byte for byte, or \
+                     null when the room had none. **Opaque**: this is where a platform built on \
+                     this server puts what a meeting means to it, and nothing here reads it or \
+                     gives it a shape -- the one exception is `sessionPolicy`, which the room \
+                     service reads long before a record exists and which is left in place here \
+                     like everything else. Metadata changed halfway through a meeting belongs to \
+                     the next one; a record is of what was true at the time. Null as well when \
+                     the metadata was larger than `sessions.max_opaque_bytes`, which is dropped \
+                     whole rather than truncated and logged when it happens.",
+            },
         },
     })
 }
@@ -774,14 +788,17 @@ fn attendance_schema() -> Value {
                 "description":
                     "When they arrived. Can be earlier than `startedAtMs`: the first person into                      a room with a floor of two was waiting for the second.",
             },
-            "accountId": {
-                "type": "string",
-                "nullable": true,
+            "attributes": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
                 "description":
-                    "Who the platform that issued the token says this is, as opposed to \
-                     `identity`, which is only what one room calls them. Null when the token \
-                     named no account, which a recorder, an agent and a guest legitimately do \
-                     not.",
+                    "The participant's attributes as they stood when this stretch began -- they \
+                     arrive in the join token and can be changed while somebody is in a room, and \
+                     a change afterwards does not reach back into a record of what already \
+                     happened. **Opaque**: this is where a platform built on this server puts its \
+                     own identifiers for whoever this is, and nothing here reads a key of it. \
+                     Empty when nothing set any, and empty as well when they were larger than \
+                     `sessions.max_opaque_bytes`, which is dropped whole rather than truncated.",
             },
             "leftAtMs": {
                 "type": "integer",
@@ -800,12 +817,12 @@ fn recording_schema() -> Value {
         "description":
             "One stretch of one participant's audio and the object it is in. Ogg with Opus              inside it, exactly as it came off the wire -- nothing in this server decodes or              re-encodes audio, so what is in the object is what the browser produced. More              than one segment for the same participant means they left and came back, or they              talked for long enough that the file was rolled over.",
         "required": [
-            "id", "meeting", "participant", "segment", "sampleRate", "channels",
+            "id", "session", "participant", "segment", "sampleRate", "channels",
             "startedAtMs", "offsetMs", "work"
         ],
         "properties": {
             "id": { "type": "string", "description": "`RE_` and twelve hex digits." },
-            "meeting": {
+            "session": {
                 "type": "string",
                 "description":
                     "The meeting this belongs to, never the room: a room holds another meeting                      tomorrow and this is not a recording of that one.",
@@ -814,12 +831,6 @@ fn recording_schema() -> Value {
                 "type": "string",
                 "description":
                     "The participant's sid, which is what the meeting's attendance list is keyed                      by, so a recording can be lined up with the stretch it was made during.",
-            },
-            "accountId": {
-                "type": "string",
-                "nullable": true,
-                "description":
-                    "The platform account behind that participant, copied off the attendance row                      when the recording started so that it survives the meeting record being                      pruned. Null for a recorder, an agent or a guest.",
             },
             "segment": {
                 "type": "integer",
