@@ -996,11 +996,11 @@ What the page will not do is look calm about something it cannot see:
 
 - **Speaking is measured, not announced.** This SFU does not send `SpeakersChanged`, so an
   indicator driven by the server's opinion would stay dark for ever. Every ring on this page comes
-  from an `AnalyserNode` on the track's own audio; the section below says how.
+  from an AudioWorklet on the track's own audio, measuring every block; the section below says how.
 - **A participant nobody can measure reads as unknown**, with a dashed outline and a sentence on
   hover: a track that is published but not subscribed, one the server paused for bandwidth, a
-  microphone that was never opened, or a browser that gave the page no audio context at all. None of
-  those are shown as `listening`.
+  microphone that was never opened, a browser that gave the page no audio context at all, or a meter
+  that has stopped reporting. None of those are shown as `listening`.
 - **A muted microphone reads as muted on every page**, because the mute travels as a track event and
   each page paints it from the publication rather than from a guess.
 - **Every control says what it will do and reports what happened.** A refused microphone says which
@@ -1402,17 +1402,205 @@ that address itself through `rtc.advertise_addresses`.
 ## Who is speaking
 
 The SFU does not send `SpeakersChanged` yet, so `RoomEvent.ActiveSpeakersChanged` never fires and a
-speaking indicator driven by it would stay dark for ever. The page measures levels itself instead:
-one `AnalyserNode` per participant, fed from the track's own `MediaStreamTrack`, sampled every
-150 ms, RMS over the threshold marks that participant as speaking and holds it for half a second so
-the dot does not flicker between syllables. Local and remote are measured the same way, which also
-means the indicator keeps working unchanged once the server does start reporting speakers.
+speaking indicator driven by it would stay dark for ever. The page measures levels itself instead.
+
+### What it used to do, and why the roster lied
+
+An `AnalyserNode` per participant, `fftSize` 512, read from a `setInterval` every 150 ms, and
+anything whose RMS came out above 0.02 was called speech. Both halves of that were wrong.
+
+**The threshold could not be right.** 0.02 is −34 dBFS. Measured on the subscriber side, on a
+continuous undistorted tone arriving at 49 kb/s with no loss: RMS 0.0239 read `speaking`, 0.0197 read
+`listening`, 0.0100 read `listening`. A quiet or distant speaker lives permanently below that line
+while everybody in the room can hear them, which is the complaint this started from — *I can hear
+them and the roster says they are listening.* Lowering the constant does not fix it, it inverts it: a
+room with a fan beside a large condenser microphone sits at −40 dBFS with nobody in it, so a
+threshold low enough for the quiet speaker paints every row `speaking` for ever. That is the worse
+lie of the two, because a roster that always says yes cannot be caught being wrong.
+
+**And it judged a sliver.** 512 samples is 21.3 ms in a 24 kHz context, read once every 150 ms: 7 to
+14 per cent of the audio was ever looked at, and *which* seven per cent was decided by wherever the
+timer happened to land. Chrome throttles a background tab's timers to about once a second, taking it
+to two per cent. Measured A/B on one loud continuous source: the foreground tab said `listening`
+0 % of the time and the background tab 67 %. The page changed its mind about who was talking
+depending on which window had focus.
+
+Two things that were **not** the cause, and were ruled out with numbers before anything was changed:
+`createMediaStreamSource` on a remote track reads exactly what arrives (a remote meter and the
+publisher's own local meter agreed to three decimal places), and the half-second hold behaves
+correctly across gaps.
+
+### What it does now
+
+**`level-meter.js`, an AudioWorklet, measures every sample of every block** and posts an RMS every
+50 ms. The render thread is the only place that sees every block by construction: it is never
+throttled by tab visibility because it is feeding a sound card in real time, and it cannot miss a
+block without the audio itself breaking up. The alternative considered was a much larger analyser
+window plus a rolling peak kept between polls, which loses nothing *within* a poll but still runs on
+a main-thread timer — so a browser that decides to run that timer once a second still decides how
+much of the audio is judged. The measurement is complete by construction rather than by luck, and
+the main thread's job shrinks to reading messages. The node's output goes to a
+`MediaStreamAudioDestinationNode` whose stream is attached to nothing: a destination is what makes
+the graph pull the node, and the one destination it must never be pulled towards is the speakers,
+where everybody is already audible once through their own `<audio>` element.
+
+The worklet is registered, fed and stopped the same way the denoiser's two are — `addModule` once
+per context, a `"stop"` message on the way out so the processor returns `false` and is collected.
+
+**`voice.js` decides, and it asks two questions rather than one.** How loud is this against the room,
+and how long has it lasted. Level alone cannot answer it at any threshold, because a keystroke and
+the first syllable of a word are the same height for fifty milliseconds — a key measured thirty
+decibels over a quiet room — and the only thing that tells them apart is that fifty milliseconds
+later the key has stopped and the syllable has not. A floor-relative test with no duration in it
+paints somebody taking notes as a talker for the whole meeting.
+
+So speech is a level `ATTACK_OVER_FLOOR_DB` (9 dB) over the room that has occupied `ONSET_MS`
+(200 ms) of the last `ONSET_WINDOW_MS` (400 ms) — a duty cycle of one half, where speech runs at
+about seven tenths and a key every four hundred milliseconds runs at one eighth. It stops being
+speech below `RELEASE_OVER_FLOOR_DB` (6 dB), two levels rather than one so a voice sitting on the
+line settles on an answer instead of strobing, and it is held for half a second so the dot does not
+flicker between syllables. The occupancy is measured as a share of the window rather than as an
+unbroken run because syllables are 120 to 260 ms long and the dips between them are real: a rule
+wanting a fifth of a second of *unbroken* loudness cannot be started by a short syllable at all, and
+measured, it cost ordinary speech seventeen points of coverage.
+
+**The room is a median, not a minimum.** Four seconds, kept in eight half-second buckets, each
+holding the quietest level of its own half second. Minima *within* a bucket are what find the gaps in
+speech, so the estimate lands on the room and not on the voice. A median *across* buckets is what
+refuses a dropout: the previous shape of this took the minimum of the buckets, which is one number
+decided by one bucket, so a single half second in which the track carried nothing rewrote the room
+and every real sound for the next quarter of a minute was tens of decibels "above" it. A median
+cannot be moved by anything occupying less than half the window. Both halves are needed; either one
+alone gets one of the two cases wrong.
+
+Three rules sit around that:
+
+- **The floor may move nine decibels a second, in either direction.** Rooms change over seconds; a
+  fan spins up, a window opens. Anything faster is the *track* changing, and the estimate does not
+  follow it. It was previously rate-limited only upwards, on the reasoning that a level below the
+  floor is direct evidence the room is quieter — and it is, but evidence about the track is not
+  evidence about the room. The limit is what keeps a voice the far end has compressed flat: a speaker
+  with two decibels of modulation and no breath for eight seconds reads `speaking` 99 % of the time
+  with the limit and 31 % without it, and that is the case the test stands on. Its cost is that a fan
+  which *starts* mid-call reads as somebody talking until the floor catches up — the two seconds the
+  buckets need plus the jump divided by nine, measured at 3.8 s for a twenty-decibel jump and 5.9 s
+  for forty, bounded and self-correcting.
+- **Nothing at or below `QUIETEST_ROOM_DBFS` (−80 dBFS) is a room.** A microphone in a room, however
+  still, is measuring air, a preamplifier and a converter. A level under that line is the track not
+  carrying the room — a hardware-muted headset whose samples are zeros, an Opus DTX gap, a jitter
+  buffer that ran dry, our own denoise gate before the wasm is live — and none of those are evidence
+  about how loud the room is, so none of them reach the estimate. This is the rule that makes a
+  dropout free: fifty milliseconds, a second or a minute of digital silence all cost zero seconds of
+  `speaking` afterwards, where the old shape charged between ten and eighteen seconds for the
+  shortest of them.
+- **Nothing below `QUIETEST_SPEECH_DBFS` (−65 dBFS) is speech**, however far above the floor it sits.
+  With the line above in place this only bites in one corner — a room sitting just over the bottom of
+  what counts as a room, where a −68 dBFS tick is eleven decibels "above" it — but it is the only
+  absolute statement left and the corner is real.
+
+Everything in the gate except staleness runs on the audio clock the reports carry, not on the wall
+clock, because that is the time the sound happened in. A main thread that reads twenty reports in one
+burst therefore reaches exactly the same answer as one that read them fifty milliseconds apart, which
+is the property that makes a background tab agree with a foreground one. The one place wall time
+overrules it is a gap in the reports longer than the staleness limit: the answer was withdrawn out
+loud while that gap lasted, so the hold is dropped rather than resumed, and a tab coming back after a
+minute does not spend half a second showing a syllable that ended before it left.
+
+**What it deliberately does not do.** A room whose own level swings six decibels every few seconds —
+traffic through a window rather than a fan — still reads `speaking` about 15 % of the time; a four
+second window cannot estimate a room that changes materially inside four seconds. A meter that
+attaches in the middle of somebody's monologue, on a microphone compressing their gaps to under nine
+decibels, reads `listening` until they pause — measured, a two-second pause recovers it and a
+one-second pause does not, where the shape this replaced needed a pause longer than the whole
+four-second window. Both are the safe direction: a missed speaker is a mistake somebody can see, and
+a permanent `speaking` is not.
+
+### A meter that stopped says so
+
+A reading nobody has refreshed for a second is withdrawn: the participant goes to `unknown` with the
+sentence saying how long ago the meter last reported, the same treatment a track nobody is subscribed
+to gets. A browser that will not run the worklet at all is told so too, and is *not* quietly demoted
+to a main-thread meter — that is the meter this page just stopped believing.
+
+The reasons are the participant's own where the reason is. A worklet that dies on one person's track
+says so about that person; only a module the browser refuses to install at all is reported about the
+browser, because only that one is true of the browser. And a meter still being built says *that*,
+rather than the page claiming it was given no audio context during the second the `addModule` round
+trip takes — which is a claim about a browser that had just handed one over.
+
+`visibilitychange` repaints when the tab comes back, and resumes an `AudioContext` the browser
+suspended while it was away. Nothing about who is speaking changed while the tab was hidden — the
+audio thread went on measuring, which is the whole reason the meter is on it — but what was on
+screen was painted from readings that have since aged.
 
 Changing a processing setting or switching input device replaces the local `MediaStreamTrack` behind
 the publication, and a meter left on the old one would report silence for ever. The capture module
-announces the swap as `microphonetrack`, and the page re-attaches the analyser to the new track on
-that event. Where no analyser could be built at all — no `AudioContext`, or a track that is not
-subscribed — the participant is painted as unknown rather than as quiet.
+announces the swap as `microphonetrack`, and the page re-attaches the meter to the new track on that
+event. Installing a worklet is asynchronous and a device change can replace a track twice before the
+first attach finishes, so each attempt carries a token and one that finds a newer attempt in its
+place disposes of what it built.
+
+Local and remote are measured the same way, which also means the indicator keeps working unchanged
+once the server does start reporting speakers. "The same way" means *what is published*: a local
+track with a processor on it sends `processor.processedTrack`, and that is the track the meter is put
+on. Measuring the capture instead would judge your own row on audio nobody else receives — RNNoise
+takes most of the keyboard and the room tone out before any remote meter sees them — so your row and
+everybody else's row for you could disagree for the whole call, with both of them right.
+
+### The roster and the stage agree
+
+Each repaint describes every participant once and hands that one description to the roster, the
+tiles and the line across the shared screen. The line used to read the speaking set directly, with no
+mute check in it, so somebody who muted mid-word was named as talking on the one view that hides the
+roster saying otherwise, for as long as the hold lasted.
+
+A participant who leaves without their track being unsubscribed first now takes their `<audio>`
+element with them. `onTrackUnsubscribed` detaches on the way out and does not fire for somebody who
+simply left, so every departure used to leave an element behind in `#audio` holding a dead stream for
+the rest of the call.
+
+The numbers are arguable rather than assertable: `voice.js` is a leaf module the behaviour suite
+drives directly, so `node --test crates/front/tests/browser-modules.test.mjs` puts a −40 dBFS speaker
+in a −60 dBFS room, a −30 dBFS fan in an empty one, a minute of uninterrupted speech and the same
+audio delivered in one-second bunches, and asserts what the roster says about each.
+
+### Measured in a browser
+
+Driven in Chrome against a local SFU, with `HTMLMediaElement.prototype.muted` and `volume` redefined
+as accessors that ignore writes and the microphone replaced by an oscillator through a
+`MediaStreamAudioDestinationNode` — so the real device is never opened and nothing can reach the
+speakers. Levels below are what the meter measured, not what was asked for.
+
+| what was published | what the meter measured | the roster |
+|---|---|---|
+| the quiet speaker: syllables at RMS 0.0199 (−34 dBFS) in a −55 dBFS room | `−34.0 dBFS, 21.1 dB above this room's own −55.0 dBFS` | `speaking` from 464 ms, 100 % after |
+| a monologue: syllables at −27 dBFS, 15 dB dips, 31 s | level −27.1 dBFS, floor settled at −42.0 dBFS | `speaking` from 346 ms, **100 %** for the whole 31 s |
+| a loud speaker over a −40 dBFS fan | level −25 dBFS, floor −40.0 dBFS | `speaking` throughout |
+| **somebody typing**: 50 ms of key at −30 dBFS every 400 ms, −70 dBFS room | keys −30.1 dBFS, floor held at −70.0 dBFS — the keys are **40 dB over the room** | `listening`, **0 %** speaking over 19 s |
+| 50 ms and 1 s of digital silence, in −40, −50 and −60 dBFS rooms | level −100.0 dBFS, floor unmoved in all six | `listening`, **0 s** of speaking afterwards |
+| a fan starting, −60 → −40 dBFS | floor climbed −60.0 → −40.0 | `speaking` for 3.0 s, then `listening` |
+| a fan starting, −60 → −20 dBFS | floor climbed −60.0 → −20.0 | `speaking` for 6.0 s, then `listening` |
+| a meter attached mid-utterance | floor found the dips at −42.0 dBFS | `speaking` from 401 ms, 100 % after |
+
+The six digital-silence rows are the ones worth staring at. Under the shape this replaced, a *single*
+fifty-millisecond window of silence bought between 10.7 and 17.6 seconds of `speaking` in a room
+where nobody had spoken, because the floor fell to its clamp in one report and then had to climb back
+at three decibels a second. They now cost nothing at all: a level that far down is not a room.
+
+The typing row is the other one. Those keys are forty decibels over the floor — no threshold
+separates them from a voice — and the reason the row says `listening` is that they last fifty
+milliseconds.
+
+The whole run happened in a tab Chrome was throttling. A control `setInterval(…, 150)` — the old
+meter's own cadence — ran in the same page throughout and fired **1.1 times a second** instead of the
+6.6 it manages with the tab in front. That is the throttling the old `AnalyserNode` meter died of,
+which took it from judging 14 % of the audio to 2 %, and the roster's answers above were measured
+under it.
+
+Two things this run does *not* show, and both are known: a room whose own level swings six decibels
+every few seconds still reads `speaking` about 15 % of the time, and the hover text on a row is a
+snapshot from the last repaint rather than a live reading, because the roster is repainted when the
+answer changes rather than twenty times a second per participant.
 
 ## Two decisions worth stating
 

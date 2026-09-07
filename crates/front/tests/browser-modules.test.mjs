@@ -73,6 +73,19 @@ const {
   roomPath,
 } = await import(`file://${assetPath("room.js")}`);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
+const {
+  ATTACK_OVER_FLOOR_DB,
+  HOLD_MS,
+  NOTHING_MEASURED,
+  ONSET_MS,
+  QUIETEST_ROOM_DBFS,
+  QUIETEST_SPEECH_DBFS,
+  RELEASE_OVER_FLOOR_DB,
+  STALE_AFTER_MS,
+  createVoiceGate,
+} = await import(`file://${assetPath("voice.js")}`);
+const { LEVEL_METER_PROCESSOR, REPORT_EVERY_MS, install: installLevelMeter, levelMeter } =
+  await import(`file://${assetPath("level-meter.js")}`);
 
 const QUANTUM = 128;
 const SAMPLE_RATE = 48000;
@@ -2315,6 +2328,656 @@ describe("the bench tells one local track's numbers from another's", () => {
   });
 });
 
+// --------------------------------------------------------------- the meter
+
+describe("the meter measures every block, not a sample of them", () => {
+  it("accounts for every sample the audio thread handed it", () => {
+    const meter = openMeter();
+
+    // Nineteen quanta is the first window that reaches the reporting cadence,
+    // so four windows is seventy-six blocks, and every sample in every one of
+    // them has to be in the arithmetic. The thing this replaced looked at
+    // 21.3 ms out of every 150 ms and guessed about the other 128.
+    meter.run({ quanta: 76, dbfs: -20 });
+
+    assert.equal(meter.reports.length, 4, "the meter did not report on the cadence it was given");
+    const counted = meter.reports.reduce((total, report) => total + report.samples, 0);
+    assert.equal(
+      counted,
+      76 * 128,
+      `the meter measured ${counted} of the ${76 * 128} samples it was handed, so who is ` +
+        "speaking is decided from a sample of the audio again",
+    );
+  });
+
+  it("reports the level of the whole window and not of the block it finished on", () => {
+    const meter = openMeter();
+
+    // Eighteen loud blocks and one quiet one. A meter that reads whatever it
+    // happens to be holding when the clock fires would report the quiet one;
+    // one that measures everything reports the energy of all nineteen.
+    meter.run({ quanta: 18, dbfs: -20 });
+    meter.run({ quanta: 1, dbfs: -60 });
+
+    assert.equal(meter.reports.length, 1, "nineteen quanta is one window at 48 kHz");
+    // Rounded to single precision first, because that is what a block of audio
+    // is and what the meter therefore added up.
+    const loud = Math.fround(amplitude(-20));
+    const quiet = Math.fround(amplitude(-60));
+    const expected = Math.sqrt((18 * loud ** 2 + quiet ** 2) / 19);
+    assert.ok(
+      Math.abs(meter.reports[0].rms - expected) < 1e-12,
+      `the window came back at ${dbfs(meter.reports[0].rms).toFixed(1)} dBFS where the audio in ` +
+        `it was ${dbfs(expected).toFixed(1)} dBFS, so the meter is reading part of the block ` +
+        "again",
+    );
+  });
+
+  it("says nothing arrived rather than saying silence arrived", () => {
+    const meter = openMeter();
+
+    // The browser hands a worklet an input with no channels while the track
+    // behind it is disabled. That is the absence of a measurement, and a zero
+    // there would be read downstream as a room with nothing in it.
+    meter.run({ quanta: 19, silent: true });
+
+    const report = meter.reports[0];
+    assert.equal(report.samples, 0, "a block with no channels in it was counted as audio");
+    assert.equal(
+      report.rms,
+      null,
+      "a window nothing arrived in is reported as digital silence, which is a measurement of a " +
+        "room rather than the news that there was no room to measure",
+    );
+    assert.ok(
+      report.windowMs > 0,
+      "time did not pass while nothing arrived, so a hold started before it would never run out",
+    );
+  });
+
+  it("registers under the name the page builds its node from", () => {
+    const registered = new Map();
+    installLevelMeter({
+      AudioWorkletProcessor: FakeWorkletProcessor,
+      sampleRate: SAMPLE_RATE,
+      registerProcessor: (name, klass) => registered.set(name, klass),
+    });
+
+    assert.ok(
+      registered.has(LEVEL_METER_PROCESSOR),
+      `the worklet registers nothing called ${LEVEL_METER_PROCESSOR}, so the page's ` +
+        "AudioWorkletNode would throw and nobody would be shown as speaking",
+    );
+  });
+
+  it("keeps no clock of its own, because the one it would keep is the throttled one", () => {
+    const source = readFileSync(assetPath("level-meter.js"), "utf8");
+    for (const timer of ["setInterval(", "setTimeout(", "requestAnimationFrame("]) {
+      assert.ok(
+        !source.includes(timer),
+        `the meter drives itself from ${timer}, which is the main-thread timer a browser slows ` +
+          "to once a second in a background tab -- the exact thing measuring on the audio " +
+          "thread exists to escape",
+      );
+    }
+  });
+});
+
+// ------------------------------------------------------- who is speaking
+
+describe("somebody talking normally shows as speaking within a few hundred milliseconds", () => {
+  it("hears the quiet speaker the old threshold refused", () => {
+    // Measured, subscriber side, on a continuous undistorted tone: an RMS of
+    // 0.0197 read "listening" under the old fixed threshold while everybody in
+    // the room could hear them. That is -34 dBFS, and this is quieter still.
+    assert.ok(
+      amplitude(-40) < 0.02,
+      "this test is about a speaker under the threshold that started all this, and the level it " +
+        "uses is no longer under it",
+    );
+
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -60, ms: 5000 }, ...speech({ dbfs: -40, ms: 6000 })]);
+
+    const heard = firstAt(said, "speaking", 5000);
+    assert.ok(
+      heard !== null && heard - 5000 <= ONSET_MS + 2 * REPORT_MS,
+      `a speaker at -40 dBFS in a -60 dBFS room was ${
+        heard === null ? "never shown as speaking" : `not shown as speaking for ${heard - 5000} ms`
+      }, and everybody in the room can hear them`,
+    );
+    // Not all of it: this speaker breathes, and the pauses between their
+    // phrases are the roster being right rather than the roster going dark.
+    assert.ok(
+      share(said, "speaking", { from: 5400, to: 10500 }) > 0.85,
+      "the roster went back to listening while they were still talking",
+    );
+  });
+
+  it("does not go dark between two syllables", () => {
+    // The plan ends on a syllable rather than on the gap after one, so the
+    // moment speech stops is a moment this test knows.
+    const stopped = 5000 + 6000 + 200;
+    const gate = createVoiceGate();
+    const said = feed(gate, [
+      { dbfs: -55, ms: 5000 },
+      ...talking({ dbfs: -30, ms: 6000 }),
+      { dbfs: -30, ms: 200 },
+      { dbfs: -55, ms: 2000 },
+    ]);
+
+    assert.equal(
+      share(said, "speaking", { from: 5400, to: stopped }),
+      1,
+      "the roster reported the waveform rather than the person: it went dark in the gaps " +
+        "between syllables",
+    );
+
+    const quiet = firstAt(said, "listening", stopped);
+    const held = quiet === null ? null : quiet - stopped;
+    assert.ok(
+      held !== null && held >= HOLD_MS && held <= HOLD_MS + 2 * REPORT_MS,
+      `speech was held for ${held === null ? "ever" : `${held} ms`} after it stopped, where the ` +
+        `hold is ${HOLD_MS} ms`,
+    );
+  });
+
+  it("keeps a voice the far end has compressed flat, which is what the rate limit is for", () => {
+    // Two decibels of modulation and no breath for eight seconds: an aggressive
+    // limiter and an automatic gain control leave a voice that is nearly a tone,
+    // and a floor free to follow the quietest thing it hears would climb onto it
+    // and report the speaker as their own room. This is the *only* case the
+    // limit changes -- deleting it takes this from 99 % to 31 %, measured -- so
+    // it is the case the limit is tested on. The fan test below is the other
+    // side of the same number and fails if the limit is made slower.
+    const gate = createVoiceGate();
+    const said = feed(
+      gate,
+      [
+        { dbfs: -60, ms: 6000 },
+        ...speech({ dbfs: -25, ms: 8000, dipDb: 2, breathDb: 3, phraseMs: 30000 }),
+      ],
+      { noise: jitter(1) },
+    );
+
+    assert.ok(
+      share(said, "speaking", { from: 6600, to: 14000 }) > 0.95,
+      "a speaker whose microphone flattened them to a two-decibel wobble was absorbed into their " +
+        "own room and the roster said they had stopped talking",
+    );
+  });
+
+  it("holds a long answer at speaking instead of raising the room up to meet it", () => {
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -55, ms: 4000 }, ...talking({ dbfs: -30, ms: 60000 })]);
+
+    assert.equal(
+      share(said, "speaking", { from: 34000 }),
+      1,
+      "a minute into an uninterrupted answer the speaker had been absorbed into their own room " +
+        "and the roster said they had stopped talking",
+    );
+  });
+
+  it("keeps one answer for a voice sitting exactly on the line", () => {
+    // Attack and release are different levels for this: seven and a half
+    // decibels over a -60 dBFS room is under the one and over the other, so it
+    // cannot start speech and cannot end it either.
+    const gate = createVoiceGate();
+    const said = feed(gate, [
+      { dbfs: -60, ms: 8000 },
+      { dbfs: -60 + ATTACK_OVER_FLOOR_DB - 1.5, ms: 700 },
+      { dbfs: -60 + ATTACK_OVER_FLOOR_DB + 1, ms: 400 },
+      { dbfs: -60 + ATTACK_OVER_FLOOR_DB - 1.5, ms: 700 },
+      { dbfs: -60 + RELEASE_OVER_FLOOR_DB - 1, ms: 2000 },
+    ]);
+
+    // The raised stretch is kept under half the floor's window on purpose. Past
+    // that it stops being a voice near the line and starts being the room,
+    // which is a different question with a different right answer.
+    assert.equal(
+      share(said, "listening", { from: 8000, to: 8700 }),
+      1,
+      "a level under the attack level started speech, so anything hovering near the line will " +
+        "strobe the roster",
+    );
+    assert.equal(
+      share(said, "speaking", { from: 8700 + ONSET_MS, to: 9800 }),
+      1,
+      "speech ended at a level above the release level, twice as long as the hold, so the same " +
+        "voice was reported as starting and stopping over and over",
+    );
+    assert.equal(
+      share(said, "listening", { from: 10400 }),
+      1,
+      "a level below the release level never ended speech",
+    );
+  });
+
+  it("catches a meter that attached in the middle of a word", () => {
+    // Nothing about the room is known here: the first thing this meter ever
+    // measures is a voice. The floor follows the buckets outright until it has a
+    // window of them to be careful with, so the first gap between syllables is
+    // what tells it which of the two it has been listening to -- and the onset
+    // rule then costs the length of a syllable on top.
+    const gate = createVoiceGate();
+    const said = feed(gate, talking({ dbfs: -30, ms: 4000 }));
+
+    const heard = firstAt(said, "speaking", 0);
+    assert.ok(
+      heard !== null && heard <= 700,
+      `a meter that attached mid-sentence took ${
+        heard === null ? "for ever" : `${heard} ms`
+      } to notice it was listening to a person`,
+    );
+  });
+});
+
+describe("a keyboard is not a voice, whatever it measures", () => {
+  // The failure this exists to stop is the worst one a roster has: somebody
+  // taking notes while they listen, reading "speaking" for the whole meeting,
+  // with nothing on screen that could be caught being wrong. A key is thirty
+  // decibels over a quiet room -- far above any floor -- and the only thing
+  // that separates it from the first syllable of a word is that fifty
+  // milliseconds later it has stopped.
+  for (const key of [-30, -40, -50]) {
+    it(`says nobody is speaking while somebody types at ${key} dBFS`, () => {
+      const gate = createVoiceGate();
+      const said = feed(gate, typing({ roomDbfs: -70, keyDbfs: key, ms: 30000 }), {
+        noise: jitter(1.5),
+      });
+
+      assert.equal(
+        share(said, "speaking", { from: 2000 }),
+        0,
+        `keys at ${key} dBFS in a -70 dBFS room read as somebody talking, and a row that says ` +
+          "speaking for a person who is typing cannot be caught being wrong by anybody looking " +
+          "at it",
+      );
+    });
+  }
+
+  it("is not fooled by somebody typing quickly either", () => {
+    // Seven keys a second. The duty cycle is a third, where speech is about
+    // seven tenths, which is the whole of the distinction being drawn.
+    const gate = createVoiceGate();
+    const said = feed(
+      gate,
+      typing({ roomDbfs: -70, keyDbfs: -30, ms: 30000, burstMs: 50, everyMs: 150 }),
+      { noise: jitter(1.5) },
+    );
+
+    assert.equal(share(said, "speaking", { from: 2000 }), 0, "a fast typist read as a talker");
+  });
+
+  it("still hears the person who was typing the moment they say something", () => {
+    const gate = createVoiceGate();
+    const said = feed(
+      gate,
+      [
+        ...typing({ roomDbfs: -70, keyDbfs: -30, ms: 10000 }),
+        ...speech({ dbfs: -35, ms: 6000 }),
+        ...typing({ roomDbfs: -70, keyDbfs: -30, ms: 4000 }),
+      ],
+      { noise: jitter(1.5) },
+    );
+
+    assert.ok(
+      share(said, "speaking", { from: 10600, to: 15500 }) > 0.85,
+      "the rule that keeps a keyboard quiet also kept the person holding it quiet, which is the " +
+        "old bug wearing the new fix's clothes",
+    );
+    assert.equal(
+      share(said, "speaking", { from: 17000 }),
+      0,
+      "the roster stayed lit after they stopped talking and went back to typing",
+    );
+  });
+});
+
+describe("a track that stops carrying the room does not rewrite it", () => {
+  // The floor used to fall without limit, so one fifty-millisecond window of
+  // digital silence dropped it to the bottom and bought between ten and
+  // eighteen seconds of "speaking" in a room where nobody spoke. Digital
+  // silence on a live track is ordinary: a hardware-muted headset, an Opus DTX
+  // gap, a jitter buffer that ran dry, our own denoise gate before the wasm is
+  // live. None of those are evidence about the room, and none of them are
+  // allowed into the estimate of it any more.
+  for (const room of [-40, -50, -60]) {
+    for (const gapMs of [REPORT_EVERY_MS, 1000]) {
+      it(`survives ${gapMs} ms of digital silence in a ${room} dBFS room`, () => {
+        const gate = createVoiceGate();
+        const said = feed(
+          gate,
+          [{ dbfs: room, ms: 20000 }, { dbfs: -Infinity, ms: gapMs }, { dbfs: room, ms: 30000 }],
+          { noise: jitter(1.5) },
+        );
+
+        assert.equal(
+          share(said, "speaking", { from: 20000 + gapMs }),
+          0,
+          `${gapMs} ms in which the track carried nothing left the room estimated far below ` +
+            `${room} dBFS, and every real sound afterwards was tens of decibels "above the ` +
+            'room" in a room where nobody spoke',
+        );
+      });
+    }
+  }
+
+  it("survives a headset that was hardware-muted for a minute", () => {
+    const gate = createVoiceGate();
+    const said = feed(
+      gate,
+      [{ dbfs: -45, ms: 20000 }, { dbfs: -Infinity, ms: 60000 }, { dbfs: -45, ms: 20000 }],
+      { noise: jitter(1.5) },
+    );
+
+    assert.equal(
+      share(said, "speaking", { from: 80000 }),
+      0,
+      "somebody who muted at the headset and unmuted a minute later was reported as talking " +
+        "whether they said anything or not",
+    );
+  });
+
+  it("keeps a level a room could not have produced out of the estimate", () => {
+    // A stretch of near-silence rather than of exact zeros: dither on a line
+    // that has effectively gone away. The rule is about levels, not about the
+    // number zero, or every mechanism that fades instead of cutting walks
+    // straight back through the hole.
+    //
+    // The level here is written out rather than derived from
+    // QUIETEST_ROOM_DBFS, and that is the point of the test: a level that moves
+    // when the constant moves cannot hold the constant in place. -88 dBFS is
+    // below anything a microphone in a room produces and above the -100 dBFS
+    // this module calls digital silence, so it is exactly the band the constant
+    // decides.
+    assert.ok(
+      QUIETEST_ROOM_DBFS > -88,
+      "the line under which a level stops counting as a room has been dropped below the dither " +
+        "this test is about, so a track that has gone away can lower the room again",
+    );
+
+    const gate = createVoiceGate();
+    const said = feed(
+      gate,
+      [{ dbfs: -45, ms: 20000 }, { dbfs: -88, ms: 4000 }, { dbfs: -45, ms: 20000 }],
+      { noise: jitter(1.5) },
+    );
+
+    assert.equal(
+      share(said, "speaking", { from: 24000 }),
+      0,
+      "four seconds at -88 dBFS was treated as a very quiet room rather than as a track " +
+        "carrying nothing, and the room came back forty decibels above itself",
+    );
+  });
+
+  it("refuses to call a faint tick speech even when the room is at the bottom", () => {
+    // The last absolute rule, and the only case left where it bites. A room
+    // sitting just above the line where a room stops counting as one leaves the
+    // floor near the bottom, and anything ten decibels over the bottom is still
+    // thirty decibels below any voice worth showing. Without
+    // QUIETEST_SPEECH_DBFS this reads "speaking".
+    const gate = createVoiceGate();
+    const said = feed(gate, [
+      { dbfs: -79, ms: 6000 },
+      { dbfs: -68, ms: 600 },
+      { dbfs: -79, ms: 3000 },
+    ]);
+
+    const tick = said.find((entry) => entry.audioAt === 6600);
+    assert.ok(
+      tick.over >= ATTACK_OVER_FLOOR_DB,
+      `this test is about a level the floor-relative test would accept, and ${tick.over.toFixed(
+        1,
+      )} dB over the room is no longer one`,
+    );
+    assert.equal(
+      share(said, "speaking", { from: 6000, to: 7200 }),
+      0,
+      "a -68 dBFS tick on a track that had all but gone away was called a person talking, " +
+        "because the only thing under the floor-relative test is the floor",
+    );
+  });
+
+  it("does not find a voice in the dither after a silent track", () => {
+    const gate = createVoiceGate();
+    const said = feed(gate, [
+      { dbfs: -Infinity, ms: 4000 },
+      { dbfs: QUIETEST_SPEECH_DBFS - 5, ms: 3000 },
+      ...speech({ dbfs: -40, ms: 3000 }),
+    ]);
+
+    assert.equal(
+      share(said, "speaking", { from: 4000, to: 7000 }),
+      0,
+      "a floor with nothing under it made the first faint thing after a silent track forty " +
+        'decibels "above the room", and the page called it a person',
+    );
+    assert.ok(
+      share(said, "speaking", { from: 7400 }) > 0.85,
+      "a real voice after the silence was refused along with the dither",
+    );
+  });
+
+  it("hears somebody quiet who follows somebody loud", () => {
+    // Found in a browser: the room stayed pinned at the level of the last thing
+    // anybody said, and the next person to speak more quietly was not heard at
+    // all. The floor has to come back down -- but it comes down because the
+    // room it can hear is quieter, not because the track went silent, which
+    // says nothing about the room either way.
+    const gate = createVoiceGate();
+    const said = feed(gate, [
+      { dbfs: -60, ms: 4000 },
+      ...speech({ dbfs: -25, ms: 6000 }),
+      { dbfs: -Infinity, ms: 6000 },
+      ...speech({ dbfs: -45, ms: 14000, seed: 9 }),
+    ]);
+
+    const heard = firstAt(said, "speaking", 16000);
+    assert.ok(
+      heard !== null && heard - 16000 <= 4000,
+      `somebody speaking twenty decibels below the person before them was ${
+        heard === null ? "never heard" : `not heard for ${((heard - 16000) / 1000).toFixed(1)} s`
+      }, because the room was left where the loud one put it`,
+    );
+    assert.ok(
+      share(said, "speaking", { from: 21000 }) > 0.8,
+      "the quiet speaker was heard once and then lost again",
+    );
+  });
+});
+
+describe("a room with a fan in it and nobody talking shows nobody speaking", () => {
+  for (const level of [-40, -30]) {
+    it(`says nobody is speaking in a ${level} dBFS room`, () => {
+      // The owner runs a fan beside a large USB microphone, which is why the
+      // loud end of this is here: -30 dBFS with nobody in the room is four
+      // decibels above the fixed threshold this replaced, so the old page
+      // painted every row "speaking" for as long as the fan ran.
+      assert.ok(
+        amplitude(-30) > 0.02,
+        "the loud room in this test is no longer above the threshold that started all this",
+      );
+
+      const gate = createVoiceGate();
+      const said = feed(gate, [{ dbfs: level, ms: 30000 }], { noise: jitter(2) });
+
+      assert.equal(
+        share(said, "speaking", { from: 1000 }),
+        0,
+        `a ${level} dBFS room with nobody in it was reported as somebody talking, which is the ` +
+          "one lie a roster cannot be caught telling",
+      );
+    });
+  }
+
+  it("says nobody is speaking in a room quiet enough to be mistaken for a dead track", () => {
+    // The line between "a very quiet room" and "a track carrying nothing" is an
+    // absolute one, and it has to sit under any room somebody might actually be
+    // sitting in. A -70 dBFS room is a real room; if the line were drawn above
+    // it, the room would be thrown away and the floor left at the bottom, where
+    // the room's own noise reads ten decibels "above" it.
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -70, ms: 30000 }], { noise: jitter(2) });
+
+    assert.equal(
+      share(said, "speaking", { from: 1000 }),
+      0,
+      "a -70 dBFS room with nobody in it was reported as somebody talking, so the level below " +
+        "which a room stops counting as a room has been drawn above one",
+    );
+  });
+
+  it("still hears somebody talking over the fan", () => {
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -40, ms: 6000 }, ...speech({ dbfs: -25, ms: 6000 })], {
+      noise: jitter(2),
+    });
+
+    assert.ok(
+      share(said, "speaking", { from: 6600, to: 11500 }) > 0.85,
+      "a voice fifteen decibels over the fan was lost in it",
+    );
+  });
+
+  it("learns a fan that starts in the middle of a call, and says so afterwards", () => {
+    // A room that suddenly gets louder is indistinguishable from somebody
+    // starting to talk, and stays that way until the buckets are full of the
+    // new room and the floor has climbed to it. The bound is the two seconds
+    // the buckets need plus the jump divided by the rate limit, which is what
+    // these two numbers are: twenty decibels in four seconds, forty in six.
+    for (const [from, to, within] of [
+      [-60, -40, 5000],
+      [-60, -20, 7000],
+    ]) {
+      const gate = createVoiceGate();
+      const said = feed(gate, [{ dbfs: from, ms: 10000 }, { dbfs: to, ms: 30000 }], {
+        noise: jitter(2),
+      });
+
+      assert.equal(
+        share(said, "speaking", { from: 10000 + within }),
+        0,
+        `a fan that took the room from ${from} to ${to} dBFS mid-call was still being reported ` +
+          `as a person talking ${within / 1000} seconds later, which is a roster that takes too ` +
+          "long to come back",
+      );
+    }
+  });
+});
+
+describe("the answer does not change when the tab goes to the background", () => {
+  it("gives the same answers when the same reports arrive late and in bunches", () => {
+    const plan = [
+      { dbfs: -55, ms: 6000 },
+      ...talking({ dbfs: -30, ms: 6000 }),
+      { dbfs: -55, ms: 3000 },
+    ];
+
+    const foreground = feed(createVoiceGate(), plan);
+    // The audio thread was never throttled -- it is feeding a sound card in
+    // real time -- so a background tab does not change the audio. What it can
+    // change is when the main thread gets round to reading the reports, so the
+    // same reports are delivered here in one-second bunches.
+    const background = feed(createVoiceGate(), plan, {
+      deliver: (audioAt) => Math.ceil(audioAt / 1000) * 1000,
+    });
+
+    assert.deepEqual(
+      background.map((entry) => entry.state),
+      foreground.map((entry) => entry.state),
+      "the page changed its mind about who was talking because of when it happened to read the " +
+        "meter, which is the whole of the bug this replaced: measured A/B on one loud " +
+        "continuous source, the foreground tab said 'listening' 0 % of the time and the " +
+        "background tab 67 %",
+    );
+    assert.ok(
+      share(foreground, "speaking", { from: 6400, to: 12000 }) === 1,
+      "the audio this compares the two deliveries on was not speech in either of them",
+    );
+  });
+
+  it("does not spend a held syllable on a tab that has been away for a minute", () => {
+    // The hold is arithmetic on the audio clock, and a suspended context stops
+    // that clock rather than advancing it. Without this the first reports after
+    // `resume()` finish a hold that started before the tab was hidden, and the
+    // roster shows a syllable that ended a minute ago.
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -55, ms: 5000 }, ...talking({ dbfs: -30, ms: 1000 })]);
+    const left = said[said.length - 1];
+    assert.equal(left.state, "speaking", "the tab was not hidden in the middle of speech");
+
+    const back = gate.observe({ rms: amplitude(-55), windowMs: REPORT_MS }, left.wallAt + 60000);
+    assert.equal(
+      back.state,
+      "listening",
+      "a tab that came back after a minute finished a hold that had been withdrawn while it was " +
+        "away, so the roster showed a syllable a minute old",
+    );
+  });
+});
+
+describe("a meter that has stopped running says so rather than saying listening", () => {
+  it("says nothing before it has measured anything", () => {
+    const reading = createVoiceGate().describe(1000);
+    assert.equal(reading.state, "unknown", "a meter with no readings behind it answered anyway");
+    assert.equal(reading.reason, NOTHING_MEASURED, "and it did not say why");
+  });
+
+  it("withdraws an answer nobody has refreshed", () => {
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -55, ms: 5000 }, { dbfs: -30, ms: 400 }]);
+    const last = said[said.length - 1].wallAt;
+
+    assert.equal(
+      gate.describe(last + STALE_AFTER_MS - 1).state,
+      "speaking",
+      "a reading younger than the staleness limit was thrown away, so an ordinary busy frame " +
+        "blanks the roster",
+    );
+
+    const withdrawn = gate.describe(last + 4000);
+    assert.equal(
+      withdrawn.state,
+      "unknown",
+      "a meter that stopped four seconds ago went on reporting the last thing it saw as though " +
+        "it were the room now",
+    );
+    assert.match(
+      withdrawn.reason,
+      /4\.0 seconds/,
+      `the reason does not say how old the reading is: ${withdrawn.reason}`,
+    );
+    assert.equal(withdrawn.speaking, false, "a withdrawn answer still lit the speaking ring");
+  });
+
+  it("comes back as soon as there are reports to come back on", () => {
+    const gate = createVoiceGate();
+    const said = feed(gate, [{ dbfs: -55, ms: 5000 }, { dbfs: -30, ms: 400 }]);
+    const last = said[said.length - 1].wallAt;
+
+    assert.equal(gate.describe(last + 4000).state, "unknown", "the reading did not go stale");
+
+    // Not on one report: the answer was withdrawn out loud, so it has to be
+    // earned again, and a single fifty-millisecond window is a keystroke as
+    // easily as a word. What it must not do is stay withdrawn.
+    let resumed = null;
+    for (let index = 1; index <= 8; index += 1) {
+      resumed = gate.observe(
+        { rms: amplitude(-30), windowMs: REPORT_MS },
+        last + 4000 + index * REPORT_MS,
+      );
+    }
+    assert.equal(
+      resumed.state,
+      "speaking",
+      "a meter that started reporting again was still being treated as stopped",
+    );
+  });
+});
+
 // -------------------------------------------------------------------- rigs
 
 /**
@@ -2791,6 +3454,180 @@ function silentGraph() {
       node.port.onmessage({ data });
     },
   };
+}
+
+/**
+ * The level meter's processor, built against a made-up worklet scope and driven
+ * a render quantum at a time. Nothing here is a browser: the point is that the
+ * arithmetic on the audio thread can be checked against blocks whose level is
+ * known exactly.
+ */
+function openMeter({ sampleRate = SAMPLE_RATE } = {}) {
+  const reports = [];
+  const Meter = levelMeter({
+    AudioWorkletProcessor: FakeWorkletProcessor,
+    sampleRate,
+    registerProcessor: () => {},
+  });
+
+  const meter = new Meter({ processorOptions: {} });
+  meter.port.postMessage = (data) => reports.push(data);
+
+  return {
+    reports,
+    run({ quanta, dbfs, silent = false }) {
+      for (let index = 0; index < quanta; index += 1) {
+        meter.process(silent ? [[]] : [[filled(amplitude(dbfs))]]);
+      }
+    },
+  };
+}
+
+class FakeWorkletProcessor {
+  constructor() {
+    this.port = { onmessage: null, postMessage: () => {} };
+  }
+}
+
+/** The reporting cadence the page asks the meter for, in the tests' own words. */
+const REPORT_MS = REPORT_EVERY_MS;
+
+const amplitude = (level) => 10 ** (level / 20);
+const dbfs = (value) => 20 * Math.log10(value);
+
+/**
+ * Feeds one gate a plan -- a list of levels in dBFS, each held for a number of
+ * milliseconds -- as the meter would feed it, and returns what it said after
+ * every report. Two of the levels are not levels: `-Infinity` is digital
+ * silence, which is a measurement of a very quiet room, and `null` is a window
+ * the browser handed no channels for, which is no measurement at all.
+ *
+ * `deliver` is how a throttled main thread is imitated: it maps the audio time
+ * a report was made at to the wall time it was read at. The gate reasons in
+ * audio time and looks at wall time only to decide a reading has gone stale,
+ * which is the property that test leans on.
+ */
+function feed(gate, plan, options = {}) {
+  const noise = options.noise || (() => 0);
+  const said = [];
+  let audioAt = 0;
+
+  for (const segment of plan) {
+    const reports = Math.round(segment.ms / REPORT_MS);
+    for (let index = 0; index < reports; index += 1) {
+      audioAt += REPORT_MS;
+      const wallAt = options.deliver ? options.deliver(audioAt) : audioAt;
+      const rms =
+        segment.dbfs === null
+          ? null
+          : segment.dbfs === -Infinity
+            ? 0
+            : amplitude(segment.dbfs + noise());
+      said.push({ audioAt, wallAt, ...gate.observe({ rms, windowMs: REPORT_MS }, wallAt) });
+    }
+  }
+
+  return said;
+}
+
+/**
+ * A voice, in the shape a floor tracker has to survive. Speech is not a level,
+ * it is syllables with gaps between them, and those gaps are the whole reason a
+ * minimum taken over a few seconds lands on the room instead of on the speaker.
+ * A constant tone is a fan, and this deliberately is not one.
+ */
+function talking({ dbfs: level, ms, dipDb = 15, syllableMs = 200, gapMs = 100 }) {
+  const plan = [];
+  for (let filled = 0; filled < ms; filled += syllableMs + gapMs) {
+    plan.push({ dbfs: level, ms: syllableMs });
+    plan.push({ dbfs: level - dipDb, ms: gapMs });
+  }
+  return plan;
+}
+
+/**
+ * Speech in the shape speech has at the meter's fifty-millisecond resolution,
+ * which the flat `talking` rig above deliberately is not. Syllables of 120 to
+ * 260 ms, an inter-syllable dip of a few decibels for 40 to 110 ms, phrases a
+ * few seconds long and a breath between them. The distinction matters to every
+ * assertion about a floor: a flat plateau with a periodic notch is a machine,
+ * and a floor tuned against one is tuned against the wrong signal.
+ */
+function speech({
+  dbfs: level,
+  ms,
+  dipDb = 10,
+  breathDb = 25,
+  phraseMs = 3000,
+  breathMs = 600,
+  seed = 77,
+}) {
+  const random = rolls(seed);
+  const plan = [];
+  let filled = 0;
+
+  while (filled < ms) {
+    const phraseLength = phraseMs * (0.6 + random() * 0.8);
+    let phrase = 0;
+    while (phrase < phraseLength && filled < ms) {
+      const syllable = 120 + random() * 140;
+      const gap = 40 + random() * 70;
+      plan.push({ dbfs: level + (random() - 0.5) * 6, ms: syllable });
+      plan.push({ dbfs: level - dipDb - random() * 6, ms: gap });
+      phrase += syllable + gap;
+      filled += syllable + gap;
+    }
+    plan.push({ dbfs: level - breathDb, ms: breathMs * (0.5 + random()) });
+    filled += breathMs;
+  }
+
+  return plan;
+}
+
+/**
+ * Somebody taking notes while they listen. A key is a transient -- fifty
+ * milliseconds of clatter tens of decibels over the room, several times a
+ * second -- and it is the one signal a level-against-a-floor test cannot
+ * refuse, because for those fifty milliseconds it is exactly the first syllable
+ * of a word.
+ */
+function typing({ roomDbfs, keyDbfs, ms, burstMs = 50, everyMs = 400 }) {
+  const plan = [];
+  for (let filled = 0; filled < ms; filled += everyMs) {
+    plan.push({ dbfs: keyDbfs, ms: burstMs });
+    plan.push({ dbfs: roomDbfs, ms: everyMs - burstMs });
+  }
+  return plan;
+}
+
+/** Room noise that is noise, so a floor is not tracked against a straight line. */
+function jitter(spreadDb, seed = 20260906) {
+  const random = rolls(seed);
+  return () => (random() * 2 - 1) * spreadDb;
+}
+
+/** The same numbers on every run, because a threshold argued from dice is not argued. */
+function rolls(seed) {
+  let state = seed;
+  return () => {
+    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    return state / 0x7fffffff;
+  };
+}
+
+/** What share of the reports in a window of audio time said one thing. */
+function share(said, state, window = {}) {
+  const from = window.from === undefined ? -Infinity : window.from;
+  const to = window.to === undefined ? Infinity : window.to;
+  const inside = said.filter((entry) => entry.audioAt > from && entry.audioAt <= to);
+  assert.ok(inside.length > 0, "no reports fell in the window this assertion is about");
+  return inside.filter((entry) => entry.state === state).length / inside.length;
+}
+
+/** When it first said one thing after a moment in audio time, or null. */
+function firstAt(said, state, after) {
+  const found = said.find((entry) => entry.audioAt > after && entry.state === state);
+  return found ? found.audioAt : null;
 }
 
 function filled(level) {

@@ -1196,14 +1196,33 @@ async fn the_room_is_a_roster_a_stage_and_a_bar() {
 }
 
 #[tokio::test]
-async fn who_is_speaking_is_measured_from_the_audio() {
+async fn who_is_speaking_is_measured_from_all_of_the_audio() {
     let addr = spawn().await;
     let (_, js) = get(addr, "/app.js").await;
     let (_, css) = get(addr, "/app.css").await;
+    let (status, meter) = get(addr, "/level-meter.js").await;
 
+    assert_eq!(
+        status, 200,
+        "the level meter's worklet is not served, so nothing measures anybody"
+    );
     assert!(
-        js.contains("createAnalyser()") && js.contains("getByteTimeDomainData"),
-        "the speaking indicator no longer measures the audio itself"
+        !js.contains("createAnalyser") && !js.contains("getByteTimeDomainData"),
+        "the page is back on an AnalyserNode read from a main-thread timer, which judges a \
+         twentieth of the audio in a foreground tab and a fiftieth in a background one, and \
+         decides who is speaking from whichever sliver the timer happened to land on"
+    );
+    assert!(
+        js.contains("audioWorklet")
+            && js.contains(".addModule(LEVEL_METER_URL)")
+            && js.contains("new AudioWorkletNode(context, LEVEL_METER_PROCESSOR"),
+        "the level is not measured on the audio thread, so nothing keeps a browser that \
+         throttles background tabs from changing its mind about who is talking"
+    );
+    assert!(
+        meter.contains("for (let index = 0; index < block.length; index += 1)"),
+        "the meter no longer walks every sample of every block, which is the one thing it is \
+         on the audio thread to do"
     );
     assert!(
         !js.contains("ActiveSpeakersChanged"),
@@ -1218,6 +1237,121 @@ async fn who_is_speaking_is_measured_from_the_audio() {
     assert!(
         css.contains(r#"[data-speaking="true"]"#),
         "nothing lights up around whoever is speaking"
+    );
+}
+
+/// The threshold that started this: `SPEAKING_RMS = 0.02` is -34 dBFS, which a
+/// quiet or distant speaker lives permanently underneath while everybody in the
+/// room can hear them. The answer is not a smaller constant -- that paints a
+/// room with a fan in it as a room where everybody is talking, for ever -- so
+/// what this guards is that the comparison is against something measured.
+#[tokio::test]
+async fn speech_is_judged_against_the_room_and_not_against_a_constant() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (status, voice) = get(addr, "/voice.js").await;
+
+    assert_eq!(
+        status, 200,
+        "the module that decides who is speaking is not served"
+    );
+    assert!(
+        !js.contains("SPEAKING_RMS"),
+        "the page is back on one fixed amplitude for every room, microphone and voice"
+    );
+    assert!(
+        voice.contains("createFloorTracker(")
+            && voice.contains("ATTACK_OVER_FLOOR_DB")
+            && voice.contains("RELEASE_OVER_FLOOR_DB"),
+        "speech is not measured against a floor tracked per meter, with different levels to \
+         start and to stop, so a voice on the boundary strobes the roster"
+    );
+    assert!(
+        voice.contains("QUIETEST_SPEECH_DBFS"),
+        "a floor-relative test with no absolute floor under it calls the faintest tick on a \
+         track that has gone away a person talking"
+    );
+    assert!(
+        voice.contains("QUIETEST_ROOM_DBFS"),
+        "nothing separates a very quiet room from a track carrying no room at all, so one \
+         window of digital silence rewrites the floor and buys a quarter of a minute of \
+         \"speaking\" in a room where nobody spoke"
+    );
+    assert!(
+        voice.contains("FLOOR_MOVE_DB_PER_SECOND"),
+        "the floor may follow what it hears as fast as it likes, so a long answer ends with the \
+         room raised to meet it and a dropout drops the room out from under everybody"
+    );
+    assert!(
+        voice.contains("ONSET_MS") && voice.contains("ONSET_WINDOW_MS"),
+        "speech is decided from level alone again, and a keystroke is thirty decibels over a \
+         quiet room: somebody taking notes reads \"speaking\" for the whole meeting, which is \
+         the one lie a roster cannot be caught telling"
+    );
+}
+
+/// The rule this crate already applies everywhere else: what cannot be measured
+/// comes back as unknown carrying the reason. A reading nobody has refreshed
+/// cannot be measured any more.
+#[tokio::test]
+async fn a_meter_that_stopped_running_says_so_rather_than_saying_listening() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, voice) = get(addr, "/voice.js").await;
+
+    assert!(
+        voice.contains("STALE_AFTER_MS") && voice.contains("function meterStopped("),
+        "a reading is trusted however old it is, so a meter that stopped goes on reporting the \
+         last thing it saw as though it were the room now"
+    );
+
+    let level = body_of(&js, "\nfunction level(");
+    assert!(
+        level.contains("gate.describe(") && level.contains("reading.reason"),
+        "the roster prints the gate's answer without asking whether it is still current: {level}"
+    );
+
+    let why = body_of(&js, "\nfunction whyNoMeter(");
+    assert!(
+        why.contains("attaching.has(identity)") && why.contains("meterFailures.get(identity)"),
+        "everybody without a meter is given the same reason, so one dead worklet on one \
+         participant tells the whole room the browser will not run a level meter, and the \
+         second the module takes to install is reported as this browser having no audio \
+         context at all: {why}"
+    );
+
+    assert!(
+        js.contains(r#"document.addEventListener("visibilitychange", onVisibilityChange)"#),
+        "nothing repaints when the tab comes back, so a viewer returns to whatever was on \
+         screen when they left"
+    );
+
+    let sweep = body_of(&js, "\nfunction sweepLevels(");
+    assert!(
+        sweep.contains("gate.describe(now)"),
+        "nothing notices a meter going quiet until something else causes a render: {sweep}"
+    );
+}
+
+/// Two the roster got wrong in passing.
+#[tokio::test]
+async fn a_muted_person_is_not_named_speaking_and_a_departure_takes_its_audio_with_it() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let stage = body_of(&js, "\nfunction paintStageSpeaking(");
+    assert!(
+        stage.contains("described.get(") && !stage.contains("meters."),
+        "the line across the shared screen reads the meter instead of the description the \
+         roster is painted from, so it names somebody who muted mid-word for as long as the \
+         hold lasts -- on the one view that hides the roster saying otherwise: {stage}"
+    );
+
+    let gone = body_of(&js, "\nfunction onParticipantDisconnected(");
+    assert!(
+        gone.contains("dropAudioElements("),
+        "somebody who leaves without their track being unsubscribed first leaves an <audio> \
+         element behind in #audio for the rest of the call: {gone}"
     );
 }
 
@@ -1685,11 +1819,13 @@ async fn the_shared_screen_is_never_displaced_by_whoever_is_speaking() {
         );
     }
 
-    let sample = body_of(&js, "\nfunction sample(");
-    assert!(
-        !sample.contains("Share"),
-        "the speaking meter reaches into the stage: {sample}"
-    );
+    for name in ["\nfunction onLevel(", "\nfunction sweepLevels("] {
+        let body = body_of(&js, name);
+        assert!(
+            !body.contains("Share"),
+            "the speaking meter reaches into the stage: {body}"
+        );
+    }
 
     let render = body_of(&js, "\nfunction render(");
     assert!(

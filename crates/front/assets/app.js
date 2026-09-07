@@ -36,6 +36,8 @@ import {
   roomPath,
 } from "/room.js";
 import { createDenoiser } from "/denoise.js";
+import { LEVEL_METER_PROCESSOR, REPORT_EVERY_MS } from "/level-meter.js";
+import { createVoiceGate } from "/voice.js";
 import {
   afterRefusal,
   afterRequest,
@@ -57,9 +59,16 @@ const RNNOISE_SIMD_WASM_URL = "/vendor/rnnoise-simd-0.4.0.wasm";
 const RNNOISE_WORKLET_URL = "/vendor/rnnoise-worklet-0.4.0.js";
 const DENOISE_GATE_URL = "/denoise-gate.js";
 const DENOISE_PROBE_URL = "/denoise-probe.js";
-const SPEAKING_RMS = 0.02;
-const SPEAKING_HOLD_MS = 500;
-const METER_INTERVAL_MS = 150;
+const LEVEL_METER_URL = "/level-meter.js";
+
+/**
+ * How often the page checks whether a meter has stopped reporting. Nothing here
+ * decides who is speaking -- `voice.js` did that when the last report arrived,
+ * and every repaint asks it again -- this only exists so that a meter which
+ * went quiet is *repainted* as unknown rather than sitting on its last answer
+ * until something else happens to cause a render.
+ */
+const METER_SWEEP_MS = 500;
 const BENCH_INTERVAL_MS = 1000;
 const NOTICE_MS = 12000;
 const TOGGLE_GUARD_MS = 350;
@@ -133,6 +142,17 @@ const DENOISE_OFF =
 
 const NO_AUDIO_CONTEXT =
   "this browser gave the page no audio context, so nothing here can tell whether they are speaking";
+const NO_LEVEL_METER =
+  "this browser will not run the level meter on its audio thread, and a meter on the main thread " +
+  "is one the browser throttles away in a background tab, so nothing here can tell whether they " +
+  "are speaking";
+const METER_STOPPED =
+  "the level meter on this participant's audio stopped on the audio thread, so nothing here can " +
+  "tell whether they are speaking";
+const METER_ATTACHING = "a level meter is being put on this audio, and has not measured it yet";
+const METER_NOT_YET =
+  "no level meter has been put on this audio yet, so whether they are speaking is not something " +
+  "this page can say";
 const NOT_SUBSCRIBED =
   "the server has not sent this track to this browser, so nothing here can tell whether they are speaking";
 const NOT_PUBLISHED =
@@ -263,15 +283,49 @@ let settings = {
 };
 let room = null;
 let cameraTrack = null;
-let speaking = new Set();
+
+/**
+ * One entry per participant whose microphone this page is measuring: the graph
+ * that feeds the meter, and the gate in `voice.js` that turns its reports into
+ * an answer. `state` is only the last answer that was *painted*, and it exists
+ * so the sweep knows whether a repaint is owed -- the answer itself is always
+ * asked for fresh.
+ */
 const meters = new Map();
+
+/**
+ * Meters being built. Installing the worklet module is asynchronous, and a
+ * device change can replace a track twice before the first attach finishes, so
+ * each attempt carries a token and a finished attempt that is no longer the
+ * current one throws away what it built.
+ */
+const attaching = new Map();
+let attachCount = 0;
+
+/**
+ * Why this page can put no meter on anything, once it knows -- which is a claim
+ * about the *browser*, so it is only ever set by the one thing that is true of
+ * the browser rather than of a track: a worklet module that will not install.
+ * One dead worklet on one participant used to set this for everybody and never
+ * clear it, so every meterless row for the rest of the session was told the
+ * browser would not run a level meter, which was not true of any of them.
+ */
+let meterFault = null;
+let meterModule = null;
+
+/**
+ * Why one participant has no meter, when the reason is theirs alone. Cleared
+ * when a meter is attached to them again, because a device change is exactly
+ * how a dead worklet gets replaced by a live one.
+ */
+const meterFailures = new Map();
 const arriving = new Map();
 const cards = new Map();
 const switches = new Map();
 const noiseChoices = new Map();
 const denoiseCells = new Map();
 const pending = { mute: false, share: false, camera: false, noise: false };
-let meterTimer = null;
+let meterSweep = null;
 let audioContext = null;
 let bench = null;
 let benchTimer = null;
@@ -335,6 +389,7 @@ async function start() {
   el.noticeDismiss.addEventListener("click", () => clearNotice());
   document.addEventListener("keydown", onKeydown);
   document.addEventListener("pointerdown", onPointerDown);
+  document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("pagehide", () => {
     if (room) room.disconnect();
   });
@@ -751,7 +806,6 @@ async function leave(reason) {
   paintShare(null, false);
   paintShareTabs([]);
   el.audio.replaceChildren();
-  speaking = new Set();
   pinnedShare = null;
   stageFocus = null;
   layoutStage({ mode: "grid", main: null });
@@ -1245,31 +1299,185 @@ function onTrackUnsubscribed(track, publication, participant) {
 
 function onParticipantDisconnected(participant) {
   dropLevel(participant.identity);
+  dropAudioElements(participant.identity);
   render();
 }
 
+/**
+ * The `<audio>` element somebody's track was attached to, when the person went
+ * without the track being unsubscribed first. `onTrackUnsubscribed` detaches on
+ * the way out and does not fire for a participant who simply left, so every
+ * departure used to leave an element behind in `#audio` holding a dead stream,
+ * for the rest of the call.
+ */
+function dropAudioElements(identity) {
+  for (const element of [...el.audio.children]) {
+    if (element.dataset.identity !== identity) continue;
+    element.srcObject = null;
+    element.remove();
+  }
+}
+
+/**
+ * Puts a meter on one participant's microphone.
+ *
+ * The measurement runs in an AudioWorklet, so this cannot be synchronous: the
+ * module has to be in the context before a node can be built from it. Which
+ * makes the ordering matter -- a device change replaces the local track and
+ * calls this again while the first attach is still waiting on `addModule` --
+ * so each attempt takes a token, and one that finds a newer attempt in its
+ * place when it wakes up disposes of what it built instead of installing it.
+ */
 function watchLevel(identity, track) {
-  const source = track && track.mediaStreamTrack;
-  if (!source) return;
+  // Two handlers rather than a `catch` after a `then`, so that a throw from the
+  // repaint is not reported as the meter having failed. `attachLevel` used to
+  // end in `render()` inside the try, and any exception a repaint raised put
+  // "this browser will not run the level meter" on the row while a perfectly
+  // good meter went on measuring.
+  attachLevel(identity, track).then(
+    () => render(),
+    (error) => {
+      console.warn("no level meter could be put on this track", error);
+      meterFailures.set(identity, NO_LEVEL_METER);
+      attaching.delete(identity);
+      render();
+    },
+  );
+}
+
+async function attachLevel(identity, track) {
+  // What is *published*, not what was captured. A LiveKit track with a
+  // processor on it sends `processor.processedTrack`, and measuring the capture
+  // instead would judge your own row on audio nobody else receives: RNNoise
+  // takes most of the keyboard and the room tone out before any remote meter
+  // sees them, so your row and everybody else's row for you could disagree
+  // permanently. Remote tracks have no processor and this is the track itself.
+  const processed = track && track.processor ? track.processor.processedTrack : null;
+  const measured = processed || (track && track.mediaStreamTrack);
+  if (!measured) return;
 
   dropLevel(identity);
   const context = ensureAudioContext();
   if (!context) return;
 
-  const node = context.createMediaStreamSource(new MediaStream([source]));
-  const analyser = context.createAnalyser();
-  analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = 0.3;
-  node.connect(analyser);
+  attachCount += 1;
+  const token = attachCount;
+  attaching.set(identity, token);
 
-  meters.set(identity, {
-    node,
-    analyser,
-    samples: new Uint8Array(analyser.fftSize),
-    loudUntil: 0,
+  const ready = await meterModuleIn(context);
+  if (attaching.get(identity) !== token) return;
+  attaching.delete(identity);
+  if (!ready) return;
+
+  const node = context.createMediaStreamSource(new MediaStream([measured]));
+  const meter = new AudioWorkletNode(context, LEVEL_METER_PROCESSOR, {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    channelCount: 1,
+    channelCountMode: "explicit",
+    channelInterpretation: "speakers",
+    processorOptions: { reportEveryMs: REPORT_EVERY_MS },
   });
 
-  if (!meterTimer) meterTimer = setInterval(sample, METER_INTERVAL_MS);
+  // A node whose output goes nowhere is a node the graph never has to pull, and
+  // this one must never be pulled towards the speakers: everybody in the room
+  // is already audible through their own `<audio>` element, and a second path
+  // to the output would be each of them heard twice. A
+  // MediaStreamAudioDestinationNode is pulled like any other destination and
+  // its stream is attached to nothing at all.
+  const sink = context.createMediaStreamDestination();
+  node.connect(meter).connect(sink);
+
+  const entry = { node, meter, sink, gate: createVoiceGate(), state: "unknown" };
+  meter.port.onmessage = (event) => onLevel(identity, entry, event.data);
+  meter.onprocessorerror = () => onMeterError(identity);
+  meters.set(identity, entry);
+
+  meterFailures.delete(identity);
+  if (!meterSweep) meterSweep = setInterval(sweepLevels, METER_SWEEP_MS);
+}
+
+/**
+ * Installs the meter's worklet module, once per context, and remembers the
+ * answer. A browser that will not take it is not quietly demoted to a
+ * main-thread meter: that is the meter this page just stopped believing, and
+ * one that reads a fraction of the audio chosen by whether the tab has focus is
+ * worse than saying nothing. It says nothing, with the reason attached.
+ */
+function meterModuleIn(context) {
+  if (meterModule) return meterModule;
+
+  if (typeof AudioWorkletNode !== "function" || !context.audioWorklet) {
+    meterFault = NO_LEVEL_METER;
+    meterModule = Promise.resolve(false);
+    return meterModule;
+  }
+
+  meterModule = context.audioWorklet
+    .addModule(LEVEL_METER_URL)
+    .then(() => true)
+    .catch((error) => {
+      console.warn("the level meter would not load, so nobody can be shown as speaking", error);
+      meterFault = NO_LEVEL_METER;
+      return false;
+    });
+  return meterModule;
+}
+
+/**
+ * One report from the audio thread. The gate is what decides; this only asks
+ * whether the answer on screen has stopped being the answer.
+ */
+function onLevel(identity, entry, report) {
+  if (meters.get(identity) !== entry) return;
+  const reading = entry.gate.observe(report, performance.now());
+  if (reading.state === entry.state) return;
+  entry.state = reading.state;
+  render();
+}
+
+// A worklet that throws is dead for the rest of its life and its node reports
+// nothing ever again, so the meter is taken out rather than left to age into
+// "unknown" without a reason worth reading.
+function onMeterError(identity) {
+  console.warn("the level meter stopped on the audio thread", identity);
+  dropLevel(identity);
+  meterFailures.set(identity, METER_STOPPED);
+  render();
+}
+
+/**
+ * Repaints when a meter's answer has changed without a report arriving to say
+ * so -- which is what going stale is. Nothing is decided here.
+ */
+function sweepLevels() {
+  const now = performance.now();
+  let changed = false;
+  for (const entry of meters.values()) {
+    const state = entry.gate.describe(now).state;
+    if (state === entry.state) continue;
+    entry.state = state;
+    changed = true;
+  }
+  if (changed) render();
+}
+
+/**
+ * A tab coming back to the front. Nothing about who is speaking changed while
+ * it was away -- the audio thread went on measuring, which is the whole reason
+ * the meter is on it -- but a context the browser suspended has been measuring
+ * nothing, and either way what is on screen was painted from readings that have
+ * since aged, so it is painted again from the readings there are now.
+ */
+function onVisibilityChange() {
+  if (document.visibilityState !== "visible") return;
+  if (audioContext && audioContext.state === "suspended") {
+    audioContext.resume().catch(() => {});
+  }
+  const now = performance.now();
+  for (const entry of meters.values()) entry.state = entry.gate.describe(now).state;
+  render();
 }
 
 function ensureAudioContext() {
@@ -1291,47 +1499,41 @@ function ensureAudioContext() {
 }
 
 function dropLevel(identity) {
-  const level = meters.get(identity);
-  if (!level) return;
-  level.node.disconnect();
+  attaching.delete(identity);
+  meterFailures.delete(identity);
+  const entry = meters.get(identity);
+  if (!entry) return;
   meters.delete(identity);
-  speaking.delete(identity);
+
+  entry.meter.port.onmessage = null;
+  entry.meter.onprocessorerror = null;
+  try {
+    entry.meter.port.postMessage("stop");
+  } catch {
+    // The port went with the context; there is nothing left to stop.
+  }
+  for (const node of [entry.node, entry.meter, entry.sink]) node.disconnect();
+  for (const track of entry.sink.stream.getTracks()) track.stop();
+
+  // The sweep exists to notice readings going stale, and there is nothing left
+  // to go stale. Clearing it only on the way out of the room left it firing
+  // twice a second over an empty map for the rest of the session.
+  if (meters.size === 0 && meterSweep) {
+    clearInterval(meterSweep);
+    meterSweep = null;
+  }
 }
 
 function dropAllLevels() {
   for (const identity of [...meters.keys()]) dropLevel(identity);
-  if (meterTimer) {
-    clearInterval(meterTimer);
-    meterTimer = null;
+  attaching.clear();
+  meterFailures.clear();
+  // `meterFault` is deliberately kept: it is a fact about this browser, not
+  // about this visit to a room, and `meterModule` has cached the same answer.
+  if (meterSweep) {
+    clearInterval(meterSweep);
+    meterSweep = null;
   }
-}
-
-function sample() {
-  const now = performance.now();
-  let changed = false;
-
-  for (const [identity, level] of meters) {
-    level.analyser.getByteTimeDomainData(level.samples);
-    let energy = 0;
-    for (const value of level.samples) {
-      const centred = (value - 128) / 128;
-      energy += centred * centred;
-    }
-    if (Math.sqrt(energy / level.samples.length) > SPEAKING_RMS) {
-      level.loudUntil = now + SPEAKING_HOLD_MS;
-    }
-
-    const talking = now < level.loudUntil;
-    if (talking === speaking.has(identity)) continue;
-    changed = true;
-    if (talking) {
-      speaking.add(identity);
-    } else {
-      speaking.delete(identity);
-    }
-  }
-
-  if (changed) render();
 }
 
 function onConnectionState(state) {
@@ -1391,6 +1593,18 @@ function render() {
   const people = [room.localParticipant, ...room.remoteParticipants.values()];
   const labels = labelsFor(people);
 
+  // One description per participant, made once and given to everything that
+  // paints them. The roster, the tiles and the line across the shared screen
+  // used to ask separately, which meant three answers taken at three instants
+  // and, because only two of them went through `describeParticipant` at all,
+  // three different opinions about a muted person.
+  const described = new Map(
+    people.map((participant) => [
+      participant.identity,
+      describeParticipant(participant, participant === room.localParticipant),
+    ]),
+  );
+
   arriving.clear();
   el.participants.replaceChildren(
     ...people.map((participant) =>
@@ -1398,6 +1612,7 @@ function render() {
         participant,
         participant === room.localParticipant,
         labels.get(participant.identity),
+        described.get(participant.identity),
       ),
     ),
   );
@@ -1414,7 +1629,7 @@ function render() {
   // The stage is holding a share while it is waiting for one too: the section
   // is up, saying so, and the room is laid out around it either way.
   const holding = Boolean(step.entry) || step.outcome === "waiting";
-  const entries = cardEntries(people, labels);
+  const entries = cardEntries(people, labels, described);
   const plan = stagePlan(stageFocus, holding ? step : null, entries, {
     link: linkState(),
     fullscreen: fullscreen !== "off",
@@ -1443,7 +1658,7 @@ function render() {
 
   el.bench.hidden = !showBench;
   el.cards.dataset.compact = String(plan.mode === "share");
-  paintStageSpeaking(people, labels);
+  paintStageSpeaking(people, labels, described);
   announceShareChange(step);
   paintFocusControl();
   paintControls();
@@ -1535,9 +1750,16 @@ function announceShareChange(step) {
  * Fullscreen hides the roster and the tiles, which were the only two places the
  * page ever showed who was talking, so the stage carries its own line.
  */
-function paintStageSpeaking(people, labels) {
+function paintStageSpeaking(people, labels, described) {
   const talking = people
-    .filter((participant) => speaking.has(participant.identity))
+    .filter((participant) => {
+      // The same description the roster is painted from, muted people already
+      // taken out of it. Reading the meter straight from here named a person
+      // who had muted mid-word for as long as the hold lasted, on the one view
+      // that hides the roster saying otherwise.
+      const entry = described.get(participant.identity);
+      return Boolean(entry && entry.speaking);
+    })
     .map((participant) =>
       participant === room.localParticipant
         ? "you"
@@ -1896,16 +2118,15 @@ function capitalise(text) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function cardEntries(people, labels) {
+function cardEntries(people, labels, described) {
   return people.map((participant) => {
     const isLocal = participant === room.localParticipant;
-    const described = describeParticipant(participant, isLocal);
     return {
       key: participant.identity,
       label: labels.get(participant.identity) || displayName(participant),
       local: isLocal,
       track: cameraFor(participant, isLocal),
-      ...described,
+      ...described.get(participant.identity),
     };
   });
 }
@@ -2030,28 +2251,53 @@ function describeParticipant(participant, isLocal) {
 }
 
 function mutedState() {
-  return { state: "muted", text: "muted", reason: null, muted: true, speaking: false };
+  return { state: "muted", text: "muted", reason: null, detail: null, muted: true, speaking: false };
 }
 
+/**
+ * What the meter says, or why there is nothing to say. A reading the meter has
+ * stopped refreshing is withdrawn here rather than repeated: `voice.js` decides
+ * when it has gone stale, and a stale reading comes back as unknown carrying
+ * the sentence that explains it, the same as a track nobody is subscribed to.
+ */
 function level(identity) {
-  if (!meters.has(identity)) return unknownState("level unknown", NO_AUDIO_CONTEXT);
-  const talking = speaking.has(identity);
+  const entry = meters.get(identity);
+  if (!entry) return unknownState("level unknown", whyNoMeter(identity));
+
+  const reading = entry.gate.describe(performance.now());
+  if (reading.state === "unknown") return unknownState("level unknown", reading.reason);
+
   return {
-    state: talking ? "speaking" : "listening",
-    text: talking ? "speaking" : "listening",
+    state: reading.speaking ? "speaking" : "listening",
+    text: reading.speaking ? "speaking" : "listening",
     reason: null,
+    detail: reading.detail,
     muted: false,
-    speaking: talking,
+    speaking: reading.speaking,
   };
 }
 
-function unknownState(text, reason) {
-  return { state: "unknown", text, reason, muted: false, speaking: false };
+/**
+ * Why there is no meter on somebody, in the order the reasons actually apply.
+ * The order is the whole of it: the page used to answer "this browser gave the
+ * page no audio context" for everybody without an entry, which during the
+ * second or two the worklet module takes to install was said about a browser
+ * that had just handed over a perfectly good context.
+ */
+function whyNoMeter(identity) {
+  if (attaching.has(identity)) return METER_ATTACHING;
+  const failure = meterFailures.get(identity);
+  if (failure) return failure;
+  if (meterFault) return meterFault;
+  if (!audioContext) return NO_AUDIO_CONTEXT;
+  return METER_NOT_YET;
 }
 
-function renderParticipant(participant, isLocal, label) {
-  const described = describeParticipant(participant, isLocal);
+function unknownState(text, reason) {
+  return { state: "unknown", text, reason, detail: null, muted: false, speaking: false };
+}
 
+function renderParticipant(participant, isLocal, label, described) {
   const row = document.createElement("li");
   row.dataset.speaking = String(described.speaking);
   row.dataset.muted = String(described.muted);
@@ -2073,7 +2319,11 @@ function renderParticipant(participant, isLocal, label) {
   const state = document.createElement("span");
   state.className = "state";
   state.textContent = described.text;
-  if (described.reason) state.title = described.reason;
+  // Why it is unknown when it is, and the two numbers behind it when it is not:
+  // a level on its own cannot be argued with, and neither can a row that only
+  // says "listening".
+  const note = described.reason || described.detail;
+  if (note) state.title = note;
 
   row.append(dot, who, state);
 
@@ -2198,8 +2448,9 @@ function paintCard(card, entry, middle) {
 
   card.who.textContent = entry.local ? `${entry.label} - you` : entry.label;
   card.state.textContent = entry.text;
-  if (entry.reason) {
-    card.state.title = entry.reason;
+  const note = entry.reason || entry.detail;
+  if (note) {
+    card.state.title = note;
   } else {
     card.state.removeAttribute("title");
   }

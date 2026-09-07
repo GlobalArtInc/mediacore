@@ -28,6 +28,8 @@ const READOUT_JS: &str = include_str!("../assets/readout.js");
 const STAGE_JS: &str = include_str!("../assets/stage.js");
 const ROOM_JS: &str = include_str!("../assets/room.js");
 const PREFS_JS: &str = include_str!("../assets/prefs.js");
+const VOICE_JS: &str = include_str!("../assets/voice.js");
+const LEVEL_METER_JS: &str = include_str!("../assets/level-meter.js");
 const DENOISE_JS: &str = include_str!("../assets/denoise.js");
 const DENOISE_GATE_JS: &str = include_str!("../assets/denoise-gate.js");
 const DENOISE_PROBE_JS: &str = include_str!("../assets/denoise-probe.js");
@@ -62,6 +64,11 @@ pub const RNNOISE_SIMD_WASM_PATH: &str = "/vendor/rnnoise-simd-0.4.0.wasm";
 pub const RNNOISE_WORKLET_PATH: &str = "/vendor/rnnoise-worklet-0.4.0.js";
 pub const DENOISE_GATE_PATH: &str = "/denoise-gate.js";
 pub const DENOISE_PROBE_PATH: &str = "/denoise-probe.js";
+
+/// The level meter's worklet. It is served like any other module because the
+/// page also imports it on the main thread for the processor's name, and
+/// `addModule` fetches it from the same place.
+pub const LEVEL_METER_PATH: &str = "/level-meter.js";
 
 /// Apache-2.0 and MIT both require the notice to travel with what they cover.
 /// It is compiled into this binary like the assets it covers, so a container
@@ -106,6 +113,8 @@ pub fn router(config: Config) -> Router {
         .route("/stage.js", get(stage))
         .route("/room.js", get(room))
         .route("/prefs.js", get(prefs))
+        .route("/voice.js", get(voice))
+        .route(LEVEL_METER_PATH, get(level_meter))
         .route("/denoise.js", get(denoise))
         .route(DENOISE_GATE_PATH, get(denoise_gate))
         .route(DENOISE_PROBE_PATH, get(denoise_probe))
@@ -223,6 +232,14 @@ async fn room() -> impl IntoResponse {
 
 async fn prefs() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, PREFS_JS)
+}
+
+async fn voice() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, VOICE_JS)
+}
+
+async fn level_meter() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, LEVEL_METER_JS)
 }
 
 async fn denoise() -> impl IntoResponse {
@@ -551,6 +568,8 @@ mod tests {
             ("/room.js", ROOM_JS),
             ("/prefs.js", PREFS_JS),
             ("/media.js", MEDIA_JS),
+            ("/voice.js", VOICE_JS),
+            (LEVEL_METER_PATH, LEVEL_METER_JS),
             ("/denoise.js", DENOISE_JS),
             (DENOISE_GATE_PATH, DENOISE_GATE_JS),
         ];
@@ -569,6 +588,8 @@ mod tests {
             ("/stage.js", STAGE_JS),
             ("/room.js", ROOM_JS),
             ("/prefs.js", PREFS_JS),
+            ("/voice.js", VOICE_JS),
+            (LEVEL_METER_PATH, LEVEL_METER_JS),
         ] {
             assert!(
                 imports(module).is_empty(),
@@ -709,6 +730,8 @@ mod tests {
             ("denoise-probe.js", DENOISE_PROBE_JS),
             ("app.js", APP_JS),
             ("prefs.js", PREFS_JS),
+            ("voice.js", VOICE_JS),
+            ("level-meter.js", LEVEL_METER_JS),
         ] {
             for host in ["cdn.jsdelivr.net", "unpkg.com", "cdn.mezon.ai", "https://"] {
                 assert!(
