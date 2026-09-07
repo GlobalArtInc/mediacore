@@ -40,7 +40,8 @@ RUN useradd --system --create-home --uid 10001 mediacore
 # because it cannot create its own directory. deploy/docker-compose.yml mounts
 # one here.
 RUN install -d -o mediacore -g mediacore /var/lib/mediacore/sessions \
-    && install -d -o mediacore -g mediacore /var/lib/mediacore/events
+    && install -d -o mediacore -g mediacore /var/lib/mediacore/events \
+    && install -d -o mediacore -g mediacore /var/lib/mediacore/recordings
 COPY --from=builder /out/mediacore /out/mediacore-front /usr/local/bin/
 USER mediacore
 WORKDIR /home/mediacore
