@@ -230,6 +230,17 @@ Nothing prunes it. One small file per meeting, so
 whole of a retention policy for whoever wants one, and costs nothing to whoever
 does not.
 
+**This stack is one server process, which is what makes a directory the right
+store for it.** Two things make it the wrong one, and both are a matter of
+setting `sessions.postgres.url` instead: running more than one SFU process
+against the same rooms, because three processes cannot share a directory and a
+node that dies takes its unfinished meetings out of reach of the ones still up;
+and recording anything at all, because the upload queue is a thing several
+processes poll and a directory refuses to be one. The database is down does not
+stop the server -- calls carry on and `unwritten_sessions=` on `/healthz`
+climbs -- and the schema is the server's to create, so there is nothing to run
+before starting it. See "Sessions" in the top-level README.
+
 The second volume is `events`, at `/var/lib/mediacore/events`: the outbox of
 events promised to a webhook endpoint or a broker and not yet taken by one. It
 stays empty until `events.webhooks.urls` or `events.kafka.brokers` names
@@ -244,6 +255,22 @@ events its endpoint was away for**, which is the one thing the outbox is there
 to prevent. Everything announced is also recorded, so what is lost is the
 notification and never the fact: the meeting is still under
 `/api/rooms/<room>/sessions`.
+
+### Recording, and what this stack would need to do it
+
+`recording:` is in the template and switched off, because turning it on takes
+more than a flag. It needs a database — an upload is a row several processes
+claim, and the sessions directory cannot be a queue — and it needs a bucket and
+a third volume at `recording.directory`, where audio is written while a meeting
+is happening and from which it is uploaded whole when the meeting ends. A
+recording volume inside the image would take every not-yet-uploaded recording
+with the next release, which is the same failure as a sessions directory inside
+the image and costs more.
+
+The server refuses to start if `recording.enabled` or a bucket is set without a
+database behind it. That is deliberate: the alternative is a deployment that
+holds meetings for a week and has no recordings, discovered when somebody asks
+for one.
 
 ## TLS without a domain
 
@@ -640,7 +667,7 @@ are honoured for the calls the front end makes to the provider.
   allow. See that directory's README to move to another version. swagger-ui,
   under `crates/server/assets/vendor/`, is vendored into the SFU on the same
   terms and for the same reasons.
-- **What this is not.** One node, no TURN, no recording, and — unless you switch
+- **What this is not.** One node, no TURN, no recording switched on, and — unless you switch
   signing in on — a room that anyone with the URL can join under any name. There
   *is* a room management API —
   `livekit.RoomService`, documented at `/swagger` — but it needs a token signed

@@ -510,6 +510,7 @@ fn create_room(
             max_participants: chosen(max_participants),
             min_humans: policy.min_humans,
             end_grace: policy.end_grace,
+            record: policy.record,
         },
         adoption,
     );
@@ -792,15 +793,16 @@ fn update_room_metadata(
 
     state
         .registry
-        .set_session_policy(&room, policy.min_humans, policy.end_grace);
+        .set_session_policy(&room, policy.min_humans, policy.end_grace, policy.record);
     room.set_metadata(&request.metadata);
 
     Ok(room.to_proto())
 }
 
-/// When a session ends, read out of the room metadata.
+/// When a session ends and whether it is recorded, read out of the room
+/// metadata.
 ///
-/// `CreateRoomRequest` has no field for either number -- LiveKit has no such
+/// `CreateRoomRequest` has no field for any of these -- LiveKit has no such
 /// policy -- so the only way one can reach us through an unmodified server SDK
 /// is inside the metadata the caller already sends. MCN's backoffice keeps a
 /// room record shaped `{"sessionPolicy": {"minHumans": 2, "endGraceMs": 90000}}`
@@ -808,10 +810,18 @@ fn update_room_metadata(
 /// leaves the policy to the server configuration, and metadata that is not
 /// JSON at all is left entirely alone: it is the caller's opaque blob and it
 /// round-trips unchanged either way.
+///
+/// `record` lives beside `minHumans` rather than in a block of its own because
+/// the two are one decision. Recording follows the meeting: there is no second
+/// threshold saying how many people make a recording, so a room where everybody
+/// sits together and joins from one account sets `minHumans` to one and is
+/// recorded like any other. A rule that could not be set to one is a rule that
+/// loses meetings, which is what happened next door.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SessionPolicy {
     min_humans: Option<u32>,
     end_grace: Option<u32>,
+    record: Option<bool>,
 }
 
 impl SessionPolicy {
@@ -832,6 +842,7 @@ impl SessionPolicy {
                 .get("endGraceMs")
                 .and_then(serde_json::Value::as_u64)
                 .map(|milliseconds| saturating(milliseconds.div_ceil(1_000))),
+            record: policy.get("record").and_then(serde_json::Value::as_bool),
         }
     }
 }
@@ -1036,8 +1047,42 @@ mod tests {
             SessionPolicy {
                 min_humans: Some(2),
                 end_grace: None,
+                record: None,
             },
             "half a policy leaves the other half to the server configuration"
+        );
+    }
+
+    /// The rule the recorder next door got wrong: a room where everybody sits
+    /// in one place and joins from one account has one human in it, and it
+    /// still has to be recorded.
+    #[test]
+    fn a_room_can_ask_to_be_recorded_with_one_person_in_it() {
+        let policy = SessionPolicy::read(r#"{"sessionPolicy":{"minHumans":1,"record":true}}"#);
+
+        assert_eq!(
+            policy,
+            SessionPolicy {
+                min_humans: Some(1),
+                end_grace: None,
+                record: Some(true),
+            },
+            "one is a floor this server takes as written; a recorder with a minimum of its own \
+             that could not go below two is how a meeting room's meetings went missing"
+        );
+    }
+
+    #[test]
+    fn a_room_that_says_nothing_about_recording_leaves_it_to_the_server() {
+        assert_eq!(
+            SessionPolicy::read(r#"{"sessionPolicy":{"minHumans":2}}"#).record,
+            None,
+            "a room that never mentioned recording must not be read as having turned it off"
+        );
+        assert_eq!(
+            SessionPolicy::read(r#"{"sessionPolicy":{"record":false}}"#).record,
+            Some(false),
+            "and one that turned it off has to be heard, on a server that records by default"
         );
     }
 

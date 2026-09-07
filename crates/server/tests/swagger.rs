@@ -573,6 +573,97 @@ async fn every_session_endpoint_is_on_the_page_with_a_grant_on_it() {
     );
 }
 
+/// The two session schemas are the only hand-written ones on the page -- there
+/// is no protobuf behind a meeting record -- so they are the two that can drift
+/// away from what the server actually answers with. This is the check that
+/// makes them drift loudly: the record is serialised exactly as the endpoints
+/// serialise it, and every key it produces has to be a key the page describes.
+#[tokio::test]
+async fn the_meeting_schemas_name_every_field_a_meeting_answers_with() {
+    let addr = spawn_server().await;
+    let document = specification(addr).await;
+
+    let session = mediacore_session::Session {
+        id: "SE_0123456789ab".to_owned(),
+        room: ROOM.to_owned(),
+        started_at_ms: 1_757_155_200_000,
+        ended_at_ms: Some(1_757_156_740_000),
+        ended_by: Some(mediacore_session::Ending::Grace),
+        participants: vec![mediacore_session::Attendance {
+            sid: "PA_0123456789ab".to_owned(),
+            identity: "alice".to_owned(),
+            name: "Alice".to_owned(),
+            kind: mediacore_session::Kind::Standard,
+            account_id: Some("AC_9271".to_owned()),
+            joined_at_ms: 1_757_155_188_000,
+            left_at_ms: Some(1_757_156_650_000),
+        }],
+    };
+    let answered = serde_json::to_value(&session).expect("a meeting record encodes");
+
+    // The recordings endpoint answers with the recording's own fields and the
+    // work behind it on the same object, so the shape held against the page is
+    // built the same way here.
+    let mut recording = serde_json::to_value(mediacore_session::Recording {
+        id: "RE_0123456789ab".to_owned(),
+        meeting: "SE_0123456789ab".to_owned(),
+        participant: "PA_0123456789ab".to_owned(),
+        account_id: Some("AC_9271".to_owned()),
+        segment: 0,
+        local_path: std::path::PathBuf::from("/var/lib/mediacore/audio/x.ogg"),
+        node: Some("ND_one".to_owned()),
+        object_key: Some("SE_0123456789ab/PA_0123456789ab-0.ogg".to_owned()),
+        bytes: Some(1_048_576),
+        sample_rate: 48_000,
+        channels: 1,
+        started_at_ms: 1_757_155_200_000,
+        ended_at_ms: Some(1_757_156_740_000),
+        offset_ms: 0,
+        duration_ms: Some(1_540_000),
+    })
+    .expect("a recording encodes");
+    let work = serde_json::to_value(mediacore_session::Work {
+        recording: "RE_0123456789ab".to_owned(),
+        stage: mediacore_session::Stage::Upload,
+        state: mediacore_session::WorkState::Done,
+        attempts: 1,
+        due_at_ms: 1_757_156_740_000,
+        claimed_by: None,
+        claim_ends_at_ms: None,
+        done_at_ms: Some(1_757_156_742_000),
+        last_error: None,
+    })
+    .expect("a piece of work encodes");
+    recording["work"] = serde_json::Value::Array(vec![work.clone()]);
+
+    for (schema, body) in [
+        ("session.Session", &answered),
+        ("session.Attendance", &answered["participants"][0]),
+        ("session.Recording", &recording),
+        ("session.RecordingWork", &work),
+    ] {
+        let produced: BTreeSet<String> = body
+            .as_object()
+            .expect("the record encodes as an object")
+            .keys()
+            .cloned()
+            .collect();
+        let documented: BTreeSet<String> = document["components"]["schemas"][schema]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{schema}` is documented with no properties"))
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            produced, documented,
+            "`{schema}` on the page is not what this server answers with. A field added to the \
+             record and not to the page is a field an integrator never finds out about; one on \
+             the page and not in the record is one they write code against and never receive."
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_table_and_the_service_name_the_same_methods() {
     let pool = pool();

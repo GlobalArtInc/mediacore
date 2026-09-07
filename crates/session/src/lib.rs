@@ -8,44 +8,74 @@
 //! meeting they had in it still happened. So the record is kept beside the
 //! registry rather than inside a room, and it survives the room it belongs to.
 //!
-//! Records live on disk, one JSON file per session, and are rewritten in place
-//! as the meeting goes on. The alternative -- keeping them in memory and
-//! emitting an event when a meeting ends -- makes the event the only copy of
-//! the fact, so a consumer that was down at half past six can never learn what
-//! it missed. That is the failure this is meant to make impossible, and a
-//! record that dies with the process reintroduces it. See [`SessionStore`] for
-//! what a restart does and does not cost.
+//! The record is written as the meeting goes on, rather than emitted when it
+//! ends. The alternative -- keeping it in memory and announcing the end --
+//! makes the event the only copy of the fact, so a consumer that was down at
+//! half past six can never learn what it missed. That is the failure this is
+//! meant to make impossible, and a record that dies with the process
+//! reintroduces it.
 //!
-//! This crate also owns one decision that is easy to make twice: **where the
-//! boundary of a meeting is**. A meeting begins when a room reaches the number
-//! of people it needs and ends when it has been below that number for the
-//! whole of its grace period, and both halves of that sentence are decided
-//! here, in [`SessionStore::note`], against the roster the registry hands
-//! over. Whoever else needs the deadline -- the room, so that it can end
-//! itself under a session policy -- reads it back with
-//! [`SessionStore::ends_at`] rather than keeping a second one. Two deadlines
-//! armed by two conditions drift apart, and the shape of that drift is a
-//! record closed under people who are still sitting in the room.
+//! # Two stores, and which one a deployment wants
+//!
+//! [`SessionStore::files`] keeps one JSON file per meeting in a directory. It
+//! needs nothing installed, an operator reads a meeting with `cat`, and a
+//! retention policy is `find -mtime +90 -delete`. It is right for exactly one
+//! server process and wrong for more than one: three processes cannot share a
+//! directory -- each would hold its own index of it and overwrite the others'
+//! records -- and a node that dies takes its unfinished meetings out of reach
+//! of the two that are still up.
+//!
+//! [`SessionStore::postgres`] keeps the same records in a database every
+//! process can read, plus the recordings hanging off a meeting and the queue of
+//! work that has to happen to them. A deployment that runs more than one server
+//! process, or that records anything at all, needs this one.
+//!
+//! Both are the same store from the outside, and the reason they are is that
+//! the thing worth having only once lives above them: **where the boundary of a
+//! meeting is**. A meeting begins when a room reaches the number of people it
+//! needs and ends when it has been below that number for the whole of its grace
+//! period, and both halves of that sentence are decided in
+//! [`SessionStore::note`], in memory, against the roster the registry hands
+//! over. Whoever else needs the deadline -- the room, so that it can end itself
+//! under a session policy -- reads it back with [`SessionStore::ends_at`]
+//! rather than keeping a second one. Two deadlines armed by two conditions
+//! drift apart, and the shape of that drift is a record closed under people who
+//! are still talking.
+//!
+//! # Nothing waits on a store on the way into a room
+//!
+//! A membership change takes one in-memory lock, edits a record and wakes a
+//! thread. It never opens a file and never speaks to a database, and that is
+//! the property everything else here is arranged around: the first version of
+//! this crate flushed to disk on the thread that was letting somebody into a
+//! room, under a lock every other room's arrivals also needed, so one busy disk
+//! delayed joining everywhere at once. A database at the other end of a network
+//! is that failure again with a longer tail. See
+//! [`SessionStore::flush`] for what the trade costs, and the test called
+//! `recording_a_membership_change_never_waits_for_the_store` for the shape of
+//! the regression it is meant to catch.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+mod database;
+mod files;
+mod recording;
+mod schema;
+
+pub use database::PostgresSettings;
+pub use recording::{
+    Claim, RECORDING_ID_PREFIX, Recording, Stage, State as WorkState, Work, recording_id,
+};
 
 /// The prefix every session id carries, in the shape of the other ids on this
 /// server: `RM_` for a room, `PA_` for a participant, `SE_` for a session.
 pub const SESSION_ID_PREFIX: &str = "SE_";
-
-/// The suffix a record wears while it is being written.
-///
-/// A record is written to this name and then renamed onto its own, so a reader
-/// -- the next start of this server included -- never sees half a file. The
-/// loader skips anything that is not `<id>.json`, which is what keeps a
-/// temporary file left behind by a crash from being read back as a meeting.
-const PENDING_SUFFIX: &str = ".writing";
 
 /// How many meetings one page of a room's history holds when the caller does
 /// not say.
@@ -58,6 +88,22 @@ pub const DEFAULT_PAGE: usize = 100;
 /// takes a second to build and a megabyte to send.
 pub const MAX_PAGE: usize = 1_000;
 
+/// How often the writer wakes when nothing is happening.
+///
+/// Short, because it is also how long a record that failed to be written waits
+/// before anybody notices it is due again. It is not a poll of anything: an
+/// arrival wakes the writer immediately.
+const WRITER_TICK: Duration = Duration::from_millis(250);
+
+/// The wait before a record that could not be written is tried again, and the
+/// cap on that wait as it doubles.
+///
+/// The cap matters more than the doubling: without one, a database that came
+/// back a moment ago would go unwritten for minutes because the last attempt
+/// happened to be the eleventh.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+const RETRY_AT_MOST: Duration = Duration::from_secs(30);
+
 /// What a participant was, which is what decides whether they count towards a
 /// quorum.
 ///
@@ -65,7 +111,8 @@ pub const MAX_PAGE: usize = 1_000;
 /// again here rather than borrowed from the room crate because the dependency
 /// runs the other way -- the registry writes records, the records know nothing
 /// about a registry -- and because these three strings are part of the JSON a
-/// backoffice parses, so they should be nailed down where the JSON is defined.
+/// backoffice parses and of the `kind` column a query filters on, so they
+/// should be nailed down where the record is defined.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -86,6 +133,23 @@ impl Kind {
     pub fn is_human(self) -> bool {
         matches!(self, Self::Standard)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Egress => "egress",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "standard" => Some(Self::Standard),
+            "egress" => Some(Self::Egress),
+            "agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
 }
 
 /// Why a session stopped.
@@ -102,10 +166,31 @@ pub enum Ending {
     Grace,
     /// The room was deleted, or the meeting was closed from the outside.
     Closed,
-    /// The record was found unfinished when the server started, so the process
-    /// that was keeping it is gone. The end time is the last thing the record
-    /// itself knows about, not the moment the meeting really stopped.
+    /// Nobody watched this meeting end. The server holding it stopped -- it
+    /// was found unfinished on the next start of a single-process deployment,
+    /// or it stopped saying it was alive and another node closed it. The end
+    /// time is the last thing the record itself knows about, not the moment
+    /// the meeting really stopped.
     Restart,
+}
+
+impl Ending {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grace => "grace",
+            Self::Closed => "closed",
+            Self::Restart => "restart",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "grace" => Some(Self::Grace),
+            "closed" => Some(Self::Closed),
+            "restart" => Some(Self::Restart),
+            _ => None,
+        }
+    }
 }
 
 /// One stretch of one connection being in one meeting.
@@ -133,6 +218,15 @@ pub struct Attendance {
     #[serde(default)]
     pub name: String,
     pub kind: Kind,
+    /// Who they are to the platform that let them in, out of their token.
+    ///
+    /// `identity` is what this server calls them and is only unique inside one
+    /// room; this is the account the platform bills, shows a history to and
+    /// hangs a recording off, and it is the same string in every room. It is
+    /// `null` when the token carried none -- see [`Member::account_id`] for
+    /// what that means and why it is not a refusal.
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// When they arrived, never earlier than the end of this room's previous
     /// meeting. This can still be earlier than the session started: the first
     /// person into a room with a floor of two waits for the second, and the
@@ -163,6 +257,7 @@ impl Attendance {
             identity: member.identity.clone(),
             name: member.name.clone(),
             kind: member.kind,
+            account_id: member.account_id.clone(),
             joined_at_ms: member.joined_at_ms.max(not_before_ms),
             left_at_ms: None,
         }
@@ -182,9 +277,9 @@ impl Attendance {
 /// A meeting: when it began, when it ended, and who was in it.
 ///
 /// Enough to answer "was there a meeting in this room, who was in it, how
-/// long", and enough to hang a recording off later -- a recording belongs to
-/// the meeting it recorded and not to the room, which will hold another
-/// meeting tomorrow.
+/// long", and enough to hang a recording off -- a recording belongs to the
+/// meeting it recorded and not to the room, which will hold another meeting
+/// tomorrow.
 ///
 /// The room is named, not identified by sid. A meeting that survives a blink
 /// spans two `Room` objects with two different sids, because a room nobody
@@ -211,6 +306,24 @@ pub struct Session {
 impl Session {
     pub fn is_live(&self) -> bool {
         self.ended_at_ms.is_none()
+    }
+
+    /// The accounts that were at this meeting, each once, in the order they
+    /// first arrived.
+    ///
+    /// The attendance list is per stretch, so an account that dropped out and
+    /// came back is in it twice and an account with two tabs open is in it
+    /// twice again. This is the answer to "whose meeting was this", which is
+    /// the question a platform asks of a meeting, and it is here rather than
+    /// in every caller so that the de-duplication is done once and the same
+    /// way.
+    pub fn account_ids(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        self.participants
+            .iter()
+            .filter_map(|attendance| attendance.account_id.as_deref())
+            .filter(|account| seen.insert(*account))
+            .collect()
     }
 
     fn open(room: &str, roster: &[Member], now_ms: i64, not_before_ms: i64) -> Self {
@@ -258,8 +371,8 @@ impl Session {
 
     /// The latest moment this record knows anything about.
     ///
-    /// What an unfinished record is closed at when it is found on disk. It is
-    /// not when the meeting stopped -- nobody saw that happen -- it is the
+    /// What an unfinished record is closed at when nobody watched it end. It
+    /// is not when the meeting stopped -- nobody saw that happen -- it is the
     /// last thing the server managed to write down, and closing at anything
     /// later would be inventing a meeting that went on after the server did.
     fn last_known_ms(&self) -> i64 {
@@ -279,6 +392,18 @@ pub struct Member {
     pub identity: String,
     pub name: String,
     pub kind: Kind,
+    /// The platform account in their token, when there was one.
+    ///
+    /// **What happens when it is absent.** Nothing is refused. A recorder and
+    /// an agent have no account by their nature; a guest let in by a token that
+    /// names nobody has none either, and both are legitimate participants in a
+    /// meeting that legitimately happened. So the record says `null` and
+    /// everything downstream that groups by account leaves them out, which is
+    /// the honest answer -- refusing the join instead would mean a platform
+    /// that forgot one claim could not hold meetings at all, and defaulting it
+    /// to the identity would put a room-scoped name into a column that
+    /// everything else treats as an account and bills against.
+    pub account_id: Option<String>,
     pub joined_at_ms: i64,
 }
 
@@ -294,47 +419,177 @@ pub struct Page {
     pub total: usize,
 }
 
-/// Every session this server has recorded, and the files they are kept in.
+/// One page of a room's meetings on its way out of a store: the ids in the
+/// order they belong in, and whatever the store had for each.
+struct Listing {
+    entries: Vec<(String, Option<Session>)>,
+    total: usize,
+}
+
+/// What a store can refuse to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    /// The store could not be reached, or refused the statement. The meeting
+    /// carries on; the caller sees this only on a read.
+    Unavailable(String),
+    /// This store does not do this at all -- a directory of files asked for a
+    /// work queue.
+    Unsupported(&'static str),
+    /// The store answered and the answer made no sense: a row written by hand,
+    /// or by a version of this server that spelled something differently.
+    Nonsense(String),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(what) => {
+                write!(formatter, "the session store is not answering: {what}")
+            }
+            Self::Unsupported(what) => write!(formatter, "this session store cannot {what}"),
+            Self::Nonsense(what) => write!(formatter, "the session store answered with {what}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// Where records are actually kept.
 ///
-/// **What a restart costs.** Every meeting this server has held is on disk,
-/// and the record of one that was still running when the process died is
-/// closed at load with [`Ending::Restart`] and an end time taken from the last
-/// thing the record itself knows -- which is a lower bound on when the meeting
-/// really stopped and never a guess above it.
-///
-/// What a crash costs on top of that is a **freshness** window, and it is the
-/// price of the write not being on the join path. Membership changes are
-/// recorded in memory and handed to a writer thread; that thread has them on
-/// disk a moment later, and a crash inside that moment loses the changes it
-/// had not reached yet. So after a crash a record may be missing its last few
-/// arrivals and departures, and a meeting that started in that moment may be
-/// missing altogether. It never says anything that did not happen: a record on
-/// disk is always a state the meeting really passed through, because each is
-/// written whole, flushed, and renamed into place. A shutdown that runs
-/// [`SessionStore::flush`] -- which dropping the store does -- loses nothing
-/// at all, so the window belongs to a crash and not to a restart.
-///
-/// The alternative was the fsync staying where it was, on the thread carrying
-/// somebody's media, under a lock every other room's arrivals also need. A
-/// busy disk then delays people joining, and delays them everywhere at once.
-/// Freshness measured in milliseconds is worth strictly less than that.
+/// Everything about *when* a meeting starts and stops is above this and shared
+/// by both implementations; everything below it is about a disk or a database
+/// and nothing else. Nothing here is ever called on the path a participant
+/// joins by, with one exception that is spelled out on [`Sink::opened`].
+trait Sink: Send + Sync + 'static {
+    /// One line for a log and for `/healthz`.
+    fn describe(&self) -> String;
+
+    /// Whether the store answered the last time anybody asked it anything.
+    fn healthy(&self) -> bool;
+
+    /// How many meetings the store holds. Cheap by construction: a store that
+    /// would have to ask for this keeps a recent answer instead, because
+    /// `/healthz` is scraped and the number is a gauge, not a fact anybody
+    /// acts on to the meeting.
+    fn count(&self) -> usize;
+
+    /// A meeting has just started.
+    ///
+    /// **The one thing here that runs on the join path**, so it may take an
+    /// in-memory lock and may do nothing else. It exists because a directory
+    /// keeps its own index of what it holds, and a room's history that did not
+    /// mention the meeting happening in it until the writer caught up would be
+    /// wrong in the one case anybody is looking at.
+    fn opened(&self, _session: &Session) {}
+
+    /// Writes a record down. `now_ms` is this node's own clock at the moment
+    /// of the write, which is what a shared store renews a meeting's lease
+    /// against -- deliberately not any of the times inside the record, which
+    /// are the meeting's clock and are handed in by whoever is driving it.
+    fn persist(&self, session: &Session, now_ms: i64) -> Result<(), StoreError>;
+    fn fetch(&self, id: &str) -> Result<Option<Session>, StoreError>;
+
+    /// One page of a room's meetings, newest first: the ids in order, and
+    /// whatever the store could produce for each of them.
+    ///
+    /// The ids come back even when the record behind one does not, because
+    /// this node may be carrying a copy of it that has not been written yet --
+    /// which is the ordinary case for the meeting happening right now. The
+    /// store above decides what to put in the gaps; a gap nobody can fill is
+    /// left out of the page rather than failing it.
+    fn page(&self, room: &str, offset: usize, limit: usize) -> Result<Listing, StoreError>;
+
+    /// How often [`Sink::tick`] is worth calling.
+    fn tick_every(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// Whatever this store has to do when nothing is happening: say this node
+    /// is still holding the meetings it is holding, and notice that another
+    /// node has stopped saying so.
+    fn tick(&self, _live: &[String], _now_ms: i64) {}
+
+    fn note_recording(&self, _recording: &Recording, _now_ms: i64) -> Result<String, StoreError> {
+        Err(StoreError::Unsupported("keep recordings"))
+    }
+
+    fn recordings(&self, _meeting: &str) -> Result<Vec<Recording>, StoreError> {
+        Err(StoreError::Unsupported("keep recordings"))
+    }
+
+    fn work(&self, _recording: &str) -> Result<Vec<Work>, StoreError> {
+        Err(StoreError::Unsupported("keep recordings"))
+    }
+
+    fn meeting_work(&self, _meeting: &str) -> Result<Vec<Work>, StoreError> {
+        Err(StoreError::Unsupported("keep recordings"))
+    }
+
+    fn claim(&self, _stage: Stage, _now_ms: i64, _limit: usize) -> Result<Vec<Claim>, StoreError> {
+        Err(StoreError::Unsupported("hand out work"))
+    }
+
+    fn renew(&self, _recording: &str, _stage: Stage, _now_ms: i64) -> Result<bool, StoreError> {
+        Err(StoreError::Unsupported("hand out work"))
+    }
+
+    fn uploaded(
+        &self,
+        _recording: &str,
+        _object_key: &str,
+        _bytes: Option<u64>,
+        _now_ms: i64,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("hand out work"))
+    }
+
+    fn announced(&self, _recording: &str, _now_ms: i64) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("hand out work"))
+    }
+
+    fn postpone(
+        &self,
+        _recording: &str,
+        _stage: Stage,
+        _error: &str,
+        _due_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unsupported("hand out work"))
+    }
+
+    /// How much work is in a state nobody is going to move: given up on, or
+    /// waiting so far past its time that whoever it is waiting for is not
+    /// coming.
+    ///
+    /// A queue that strands work silently is worse than one that fails loudly,
+    /// and this is the number that stops it being silent. Zero for a store that
+    /// has no queue.
+    fn stuck(&self) -> u64 {
+        0
+    }
+}
+
+/// Every session this server is holding, and the store they are kept in.
 ///
 /// **What it costs while running.** A membership change takes one lock, edits
-/// a record in memory and wakes a thread. No caller waits for a disk.
+/// a record in memory and wakes a thread. No caller waits for a disk or a
+/// database.
 ///
-/// **What is kept in memory.** An index of every meeting -- its id, its room
-/// and when it started -- plus the full record of each meeting that is
-/// running, each one waiting to be written, and each one the disk refused.
-/// Everything else is read back from its file when somebody asks for it. A
-/// server two years into a deployment holds an index of a few hundred
-/// thousand short strings rather than a few hundred thousand records, and
-/// [`SessionStore::of_room`] hands back a page rather than a history.
+/// **What a crash costs** is a freshness window, and it is the price of the
+/// write not being on the join path. Membership changes are recorded in memory
+/// and handed to a writer thread; that thread has them in the store a moment
+/// later, and a crash inside that moment loses the changes it had not reached
+/// yet. So after a crash a record may be missing its last few arrivals and
+/// departures, and a meeting that started in that moment may be missing
+/// altogether. It never says anything that did not happen: what is in the store
+/// is always a state the meeting really passed through, because each write is
+/// whole. A shutdown that runs [`SessionStore::flush`] loses nothing at all, so
+/// the window belongs to a crash and not to a restart.
 ///
-/// **What it does not do.** Nothing here deletes a record. The directory grows
-/// with one small file per meeting and an operator prunes it with `find -mtime
-/// +90 -delete` if they want it pruned -- which is a real answer only because
-/// the layout is one self-describing file per session and not a database
-/// nobody may touch from outside.
+/// **What is kept in memory.** The record of each meeting that is running, and
+/// each one waiting to be written. Everything else is asked for when somebody
+/// asks for it, so a server two years into a deployment does not hold two years
+/// of meetings.
 pub struct SessionStore {
     inner: Arc<Inner>,
     writer: Option<JoinHandle<()>>,
@@ -342,7 +597,7 @@ pub struct SessionStore {
 
 /// Everything the writer thread and the callers share.
 struct Inner {
-    directory: PathBuf,
+    sink: Arc<dyn Sink>,
     records: Mutex<Records>,
     /// Woken when there is a record to write, or when the store is closing.
     work: Condvar,
@@ -351,35 +606,19 @@ struct Inner {
     written: Condvar,
 }
 
-/// Where a record's file is and what the index knows about it without opening
-/// it.
-struct Indexed {
-    /// Shared with every other record of the same room: a room with a thousand
-    /// meetings holds its name once.
-    room: Arc<str>,
-    started_at_ms: i64,
-    /// The file this record came out of, when that is not `<id>.json`.
-    ///
-    /// The two only differ because a record was copied about by hand. The id
-    /// inside is the one everything else refers to it by, so the record is
-    /// filed under that -- and the name it is actually in has to be kept, or
-    /// the record could be listed and never read.
-    file: Option<Box<str>>,
-}
-
-/// A record owed to the disk, and which edit of it is owed.
+/// A record owed to the store, and which edit of it is owed.
 struct Queued {
     version: u64,
     session: Session,
+    /// How many times writing this has failed. A record with any attempts on
+    /// it is what `unwritten` counts and what `/healthz` reports.
+    attempts: u32,
+    /// When it may next be tried.
+    due_at_ms: i64,
 }
 
 #[derive(Default)]
 struct Records {
-    /// Every meeting this server can be asked about, by id.
-    index: HashMap<String, Indexed>,
-    /// Session ids per room, oldest first. A created room holds many meetings
-    /// and this is the order they happened in.
-    by_room: HashMap<String, Vec<String>>,
     /// The meeting currently running in a room, in full, by room name.
     live: HashMap<String, Session>,
     /// When the meeting running in a room ends if nobody comes back, by room
@@ -390,176 +629,115 @@ struct Records {
     /// When the last finished meeting in a room ended, by room name. The floor
     /// under every arrival time in the next one, so that one connection's
     /// stretches never overlap across two records.
+    ///
+    /// This node's own memory of it, and that is enough: the invariant it
+    /// protects is about one `sid` appearing in two meetings, and a `sid` is
+    /// minted by the process a connection is attached to, so the two meetings
+    /// it could appear in are both this node's.
     last_ended_ms: HashMap<String, i64>,
-    /// Records owed to the disk, by id, newest edit only: a meeting that
+    /// Records owed to the store, by id, newest edit only: a meeting that
     /// changes twice before the writer gets to it is written once.
     queued: HashMap<String, Queued>,
-    /// Records the disk refused. A meeting is never failed because a disk was:
-    /// the record stays here and serves reads until the process ends, and the
-    /// size of this is how an operator finds out it is going to be lost.
-    unwritten: HashMap<String, Session>,
     next_version: u64,
     closing: bool,
 }
 
 impl SessionStore {
-    /// Opens the directory, indexing every meeting it holds.
+    /// One JSON file per meeting, in a directory.
     ///
     /// Creating the directory is part of opening it: a server told to record
     /// meetings somewhere that does not exist yet should make the place rather
     /// than refuse to start, and a server that cannot make it should refuse to
     /// start rather than run for a month and be asked for records it never
     /// kept.
-    ///
-    /// Only the head of each file is parsed -- the id, the room and the two
-    /// times -- and only the records that were still running when the last
-    /// process stopped are read in full. Reading every attendance list of
-    /// every meeting ever held would put the whole history in memory for the
-    /// life of the process to answer questions about one afternoon of it.
-    pub fn open(directory: impl Into<PathBuf>) -> io::Result<Self> {
-        let directory = directory.into();
-        std::fs::create_dir_all(&directory)?;
+    pub fn files(directory: impl Into<std::path::PathBuf>) -> io::Result<Self> {
+        let loaded = files::Files::open(directory)?;
+        let mut records = Records {
+            last_ended_ms: loaded.last_ended,
+            ..Records::default()
+        };
 
-        let mut records = Records::default();
-        let mut interrupted = Vec::new();
-
-        for entry in std::fs::read_dir(&directory)? {
-            let path = entry?.path();
-            if !is_record(&path) {
-                continue;
-            }
-
-            match read_header(&path) {
-                Ok(header) => {
-                    // The id names the file every later read and write of this
-                    // record goes to, so a record whose id is not one this
-                    // server could have minted is left alone rather than
-                    // followed out of the directory it was found in.
-                    if !is_id(&header.id) {
-                        tracing::error!(
-                            path = %path.display(),
-                            id = %header.id,
-                            "a session record carries an id this server did not mint; it is left \
-                             alone and that meeting cannot be looked up"
-                        );
-                        continue;
-                    }
-
-                    match header.ended_at_ms {
-                        Some(ended) => records.remember_ending(&header.room, ended),
-                        None => interrupted.push(header.id.clone()),
-                    }
-                    records.index_record(&header, &path);
-                }
-                // Kept, not deleted, and not fatal. One unreadable file is one
-                // meeting nobody can look up; refusing to start over it takes
-                // the server down with it, and deleting it destroys the only
-                // copy of whatever is still legible in there.
-                Err(error) => tracing::error!(
-                    path = %path.display(),
-                    %error,
-                    "a session record could not be read and was left alone; that meeting cannot \
-                     be looked up"
-                ),
-            }
-        }
-
-        records.sort();
-
-        // Nothing that was running is running now: this process has no rooms
-        // and no participants yet. Closing them here rather than leaving them
-        // open is what stops a meeting from last March being reported as the
-        // one happening right now. They are closed one by one by id rather
-        // than through a per-room map, because two unfinished records for one
-        // room is not supposed to be possible but becomes possible the moment
-        // a close fails to reach the disk -- and a map keyed by room would
-        // keep whichever of the two it saw last and leave the other open for
-        // ever, reported as the meeting happening now.
-        for id in &interrupted {
-            let Some(path) = records
-                .index
-                .get(id)
-                .map(|indexed| indexed.path(&directory, id))
-            else {
-                continue;
-            };
-            let mut session = match read_record(&path) {
-                Ok(session) => session,
-                Err(error) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        %error,
-                        "a meeting that was still running could not be read back and so cannot be \
-                         closed; it stays open on the disk"
-                    );
-                    continue;
-                }
-            };
-
-            let at_ms = session.last_known_ms();
-            session.close(at_ms, Ending::Restart);
-
-            tracing::warn!(
-                session = %session.id,
-                room = %session.room,
-                ended_at_ms = at_ms,
-                "a meeting was still running when this server last stopped; its record is closed \
-                 at the last moment it knows about"
-            );
-
-            records.remember_ending(&session.room, at_ms);
+        for session in loaded.closed {
             records.queue(session);
         }
 
-        tracing::info!(
-            directory = %directory.display(),
-            sessions = records.index.len(),
-            "session records loaded"
-        );
+        Ok(Self::around(Arc::new(loaded.files), records))
+    }
 
+    /// Meetings, recordings and the work queue in Postgres, shared with every
+    /// other process pointed at the same database.
+    ///
+    /// **This does not connect.** A media server that refuses to carry calls
+    /// because a database is down is a worse failure than one that carries them
+    /// and cannot record: nothing on the media path goes anywhere near this
+    /// crate. So a database that is away at startup costs the meetings held
+    /// while it is away and not the calls -- the records queue in memory, one
+    /// line a minute says the store is not answering, `/healthz` carries
+    /// `session_store=postgres:host:5432/database:down` with
+    /// `unwritten_sessions=` climbing beside it, and everything queued is
+    /// written when it comes back.
+    ///
+    /// The one thing that does fail here is a url that is not a url. That is a
+    /// typo in a config file rather than an outage, and a server that started
+    /// anyway would be one that can never record anything and said so once, at
+    /// boot, in a line nobody reads again.
+    pub fn postgres(settings: PostgresSettings) -> Result<Self, String> {
+        let database = database::Database::open(settings)?;
+        Ok(Self::around(Arc::new(database), Records::default()))
+    }
+
+    fn around(sink: Arc<dyn Sink>, records: Records) -> Self {
         let inner = Arc::new(Inner {
-            directory,
+            sink,
             records: Mutex::new(records),
             work: Condvar::new(),
             written: Condvar::new(),
         });
+
         let writing = Arc::clone(&inner);
         let writer = std::thread::Builder::new()
             .name("session-records".to_owned())
-            .spawn(move || write_queued(&writing))?;
+            .spawn(move || write_queued(&writing))
+            .expect("a thread for the session records");
 
-        Ok(Self {
+        Self {
             inner,
             writer: Some(writer),
-        })
+        }
     }
 
-    /// Where the records are kept.
-    pub fn directory(&self) -> &Path {
-        &self.inner.directory
+    /// Where the records are kept, in one line: `files:/var/lib/...` or
+    /// `postgres:host:5432/database`, never a password.
+    pub fn describe(&self) -> String {
+        self.inner.sink.describe()
     }
 
-    /// How many meetings this server can be asked about.
+    /// Whether the store answered the last time anybody asked it anything.
+    pub fn healthy(&self) -> bool {
+        self.inner.sink.healthy()
+    }
+
+    /// How many meetings the store holds.
     pub fn count(&self) -> usize {
-        self.inner.records.lock().expect("session lock").index.len()
+        self.inner.sink.count()
     }
 
-    /// How many meetings are running right now, across every room.
+    /// How many meetings are running right now on this node.
     pub fn live_count(&self) -> usize {
         self.inner.records.lock().expect("session lock").live.len()
     }
 
-    /// How many records are held in memory in full, rather than only indexed.
+    /// How many records are held in memory in full, rather than being asked
+    /// for.
     ///
-    /// The bound this server is meant to keep: the meetings running, the ones
-    /// waiting to be written and the ones the disk refused, and nothing else
-    /// however long the history is.
+    /// The bound this server is meant to keep: the meetings running and the
+    /// ones waiting to be written, and nothing else however long the history
+    /// is.
     pub fn resident(&self) -> usize {
         let records = self.inner.records.lock().expect("session lock");
         let mut ids: HashSet<&str> = HashSet::new();
 
         ids.extend(records.queued.keys().map(String::as_str));
-        ids.extend(records.unwritten.keys().map(String::as_str));
         ids.extend(records.live.values().map(|session| session.id.as_str()));
 
         ids.len()
@@ -568,7 +746,7 @@ impl SessionStore {
     /// How many records are waiting to be written.
     ///
     /// Zero almost always: it rises while a burst of arrivals outruns the
-    /// disk and falls again. Staying up is a disk that cannot keep pace with
+    /// store and falls again. Staying up is a store that cannot keep pace with
     /// the meetings being held on top of it.
     pub fn owed(&self) -> usize {
         self.inner
@@ -579,29 +757,49 @@ impl SessionStore {
             .len()
     }
 
-    /// How many records this server has failed to write and still holds.
+    /// How many records this server has failed to write and is still carrying.
     ///
     /// A gauge rather than a tally: a record whose next write succeeds comes
-    /// back off it, so a disk that hiccuped once is not reported for ever as a
-    /// meeting that is going to be lost.
+    /// back off it, so a store that hiccuped once is not reported for ever as
+    /// a meeting that is going to be lost. It is the alertable number here --
+    /// every other one goes up when the server is working.
     pub fn unwritten(&self) -> u64 {
         self.inner
             .records
             .lock()
             .expect("session lock")
-            .unwritten
-            .len() as u64
+            .queued
+            .values()
+            .filter(|queued| queued.attempts > 0)
+            .count() as u64
     }
 
-    /// Waits until everything recorded so far is on the disk.
+    /// Waits until everything recorded so far is in the store, or until the
+    /// deadline, and says which happened.
     ///
     /// What makes a planned stop lose nothing. It is not a promise about a
-    /// crash: a crash is exactly the stop that does not get to call this.
-    pub fn flush(&self) {
+    /// crash: a crash is exactly the stop that does not get to call this. The
+    /// deadline is not decoration either -- "wait until it lands" against a
+    /// database that is down is "wait for ever", and a server that will not
+    /// shut down is a worse problem than a few meetings that end a minute
+    /// early in the record.
+    pub fn flush(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
         let mut records = self.inner.records.lock().expect("session lock");
+
         while !records.queued.is_empty() {
-            records = self.inner.written.wait(records).expect("session lock");
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (guard, _) = self
+                .inner
+                .written
+                .wait_timeout(records, left)
+                .expect("session lock");
+            records = guard;
         }
+
+        true
     }
 
     /// Takes in who is in a room, and works out what that means for the
@@ -628,6 +826,9 @@ impl SessionStore {
     /// rather than working it out again: a room that armed a countdown on its
     /// own condition would end itself on one clock while its record ended on
     /// another.
+    ///
+    /// **Nothing here waits on the store.** It takes one lock, edits memory,
+    /// and wakes the writer.
     ///
     /// Returns the meeting if this roster started one, so that the caller can
     /// announce it. A meeting only ever *starts* here -- it ends in
@@ -664,7 +865,7 @@ impl SessionStore {
                     floor,
                     "a meeting started"
                 );
-                records.start(session.clone());
+                records.live.insert(room.to_owned(), session.clone());
                 records.queue(session.clone());
                 Some(session)
             } else {
@@ -727,6 +928,13 @@ impl SessionStore {
                 None
             }
         };
+
+        // Outside the lock, and it only takes an in-memory one of its own: a
+        // directory has to know about a meeting before the writer gets to it,
+        // or the room's history would not mention the meeting happening in it.
+        if let Some(session) = &started {
+            self.inner.sink.opened(session);
+        }
 
         self.inner.work.notify_one();
         started
@@ -800,7 +1008,29 @@ impl SessionStore {
         ended
     }
 
-    /// The meeting running in a room, if one is.
+    /// What the store has to do when nothing is happening: say this node is
+    /// still holding the meetings it is holding, and take away the meetings of
+    /// a node that has stopped saying so.
+    ///
+    /// The writer thread calls this on its own clock. It is public and takes
+    /// the time for the same reason [`SessionStore::expire`] does -- a test has
+    /// to be able to be the clock, and a lease that can only be tested by
+    /// waiting for one is a lease nobody tests.
+    pub fn tick(&self, now_ms: i64) {
+        let live: Vec<String> = self
+            .inner
+            .records
+            .lock()
+            .expect("session lock")
+            .live
+            .values()
+            .map(|session| session.id.clone())
+            .collect();
+
+        self.inner.sink.tick(&live, now_ms);
+    }
+
+    /// The meeting running in a room on this node, if one is.
     pub fn live(&self, room: &str) -> Option<Session> {
         self.inner
             .records
@@ -832,48 +1062,160 @@ impl SessionStore {
     /// Newest first because the question is almost always about the last one:
     /// a backoffice opening a room's history wants what happened today above
     /// what happened in March. A page rather than the history because a room a
-    /// service has been meeting in for two years has thousands, and building
-    /// all of them into one answer would read thousands of files with a lock
-    /// held that every arrival on the server also needs.
+    /// service has been meeting in for two years has thousands.
     ///
-    /// The files are read outside that lock. A record that has gone missing
-    /// under the server -- deleted by the retention policy between the index
-    /// being consulted and the file being opened -- is left out of the page
-    /// rather than failing it.
-    pub fn of_room(&self, room: &str, offset: usize, limit: usize) -> Page {
+    /// The meeting happening right now is put at the top of the first page even
+    /// if the store has not caught up with it yet, and any meeting on the page
+    /// that this node holds a fresher copy of is answered from that copy --
+    /// otherwise a backoffice polling for the end of a meeting would watch it
+    /// un-end for a moment.
+    ///
+    /// **Blocking.** It asks the store. A caller on an async runtime has to run
+    /// it on a blocking thread, exactly as it would a file read.
+    pub fn of_room(&self, room: &str, offset: usize, limit: usize) -> Result<Page, StoreError> {
         let limit = limit.min(MAX_PAGE);
+        let listing = self.inner.sink.page(room, offset, limit)?;
 
-        let (total, wanted) = {
-            let records = self.inner.records.lock().expect("session lock");
-            let Some(ids) = records.by_room.get(room) else {
-                return Page::default();
-            };
-
-            let wanted: Vec<Located> = ids
-                .iter()
-                .rev()
-                .skip(offset)
-                .take(limit)
-                .filter_map(|id| records.locate(id, &self.inner.directory))
-                .collect();
-
-            (ids.len(), wanted)
+        let records = self.inner.records.lock().expect("session lock");
+        let mut page = Page {
+            sessions: listing
+                .entries
+                .into_iter()
+                .filter_map(|(id, stored)| records.resident(&id).or(stored))
+                .collect(),
+            total: listing.total,
         };
 
-        Page {
-            sessions: wanted.into_iter().filter_map(Located::read).collect(),
-            total,
+        if offset == 0
+            && let Some(live) = records.live.get(room)
+            && !page.sessions.iter().any(|session| session.id == live.id)
+        {
+            page.sessions.insert(0, live.clone());
+            page.sessions.truncate(limit.max(1));
         }
+
+        Ok(page)
     }
 
-    /// One meeting by id.
-    pub fn get(&self, id: &str) -> Option<Session> {
-        let located = {
-            let records = self.inner.records.lock().expect("session lock");
-            records.locate(id, &self.inner.directory)?
-        };
+    /// One meeting by id, whichever node held it.
+    ///
+    /// **Blocking**, for the same reason [`SessionStore::of_room`] is.
+    pub fn get(&self, id: &str) -> Result<Option<Session>, StoreError> {
+        if let Some(session) = self
+            .inner
+            .records
+            .lock()
+            .expect("session lock")
+            .resident(id)
+        {
+            return Ok(Some(session));
+        }
 
-        located.read()
+        self.inner.sink.fetch(id)
+    }
+
+    /// Writes down a stretch of recorded audio, and the work that follows it.
+    ///
+    /// Idempotent on `(meeting, participant, segment)`: a recorder that was
+    /// restarted and writes the same segment down again under a new id lands on
+    /// the row it already wrote. The id that comes back is the one the store
+    /// holds, which is the one to use from then on.
+    ///
+    /// **Blocking**, and only Postgres does it: see [`SessionStore::files`].
+    pub fn note_recording(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError> {
+        self.inner.sink.note_recording(recording, now_ms)
+    }
+
+    /// Everything recorded during one meeting, by participant and then by
+    /// segment.
+    pub fn recordings(&self, meeting: &str) -> Result<Vec<Recording>, StoreError> {
+        self.inner.sink.recordings(meeting)
+    }
+
+    /// What is happening to one recording: two rows, one per stage.
+    pub fn work(&self, recording: &str) -> Result<Vec<Work>, StoreError> {
+        self.inner.sink.work(recording)
+    }
+
+    /// The same for every recording of one meeting, in one query rather than
+    /// one per recording -- a ten-person meeting has at least ten recordings,
+    /// and a backoffice opening it should cost two round trips and not eleven.
+    pub fn meeting_work(&self, meeting: &str) -> Result<Vec<Work>, StoreError> {
+        self.inner.sink.meeting_work(meeting)
+    }
+
+    /// Takes work out of the queue for this node.
+    ///
+    /// Several processes poll this and no two of them get the same row; a claim
+    /// that stops being renewed goes back into the queue. See the
+    /// implementation on the database for how, and the tests in
+    /// `tests/postgres.rs` for the proof against a real one.
+    pub fn claim(&self, stage: Stage, now_ms: i64, limit: usize) -> Result<Vec<Claim>, StoreError> {
+        self.inner.sink.claim(stage, now_ms, limit)
+    }
+
+    /// Says this node is still working on a claim it holds. `false` means the
+    /// claim has already gone to somebody else, and whatever is being done
+    /// should stop.
+    pub fn renew(&self, recording: &str, stage: Stage, now_ms: i64) -> Result<bool, StoreError> {
+        self.inner.sink.renew(recording, stage, now_ms)
+    }
+
+    /// The file is in the object store. This finishes the upload and makes the
+    /// announcement possible, in one transaction, so there is no moment in
+    /// which a file is up and nothing is going to say so.
+    ///
+    /// It does not check that the caller still holds the claim, and that is
+    /// deliberate: what it records is that the file is in the object store,
+    /// which is true whoever put it there. A claimant whose lease ran out while
+    /// it was finishing writes down something correct rather than losing the
+    /// upload it just did.
+    pub fn uploaded(
+        &self,
+        recording: &str,
+        object_key: &str,
+        bytes: Option<u64>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .sink
+            .uploaded(recording, object_key, bytes, now_ms)
+    }
+
+    /// Somebody has been told the recording is ready.
+    pub fn announced(&self, recording: &str, now_ms: i64) -> Result<(), StoreError> {
+        self.inner.sink.announced(recording, now_ms)
+    }
+
+    /// Gives a claim back with a reason and a time to try again. Work that has
+    /// used up its attempts is left alone instead.
+    ///
+    /// **Only the node still holding the claim can give it back**, exactly as
+    /// only the holder can renew it. A claimant whose lease ran out while it
+    /// was working is not holding anything any more: by the time it comes back
+    /// to say it failed, the row may have been claimed, finished and marked
+    /// done by somebody else, and an unconditional put-back would undo that --
+    /// a `done` announcement returned to the queue and emitted a second time,
+    /// or a live claimant's lease cleared out from under it while it is still
+    /// uploading. `false` means the claim had already gone and nothing was
+    /// changed.
+    pub fn postpone(
+        &self,
+        recording: &str,
+        stage: Stage,
+        error: &str,
+        due_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.inner.sink.postpone(recording, stage, error, due_at_ms)
+    }
+
+    /// Recording work nobody is going to move: given up on, or overdue by so
+    /// far that whoever it is waiting for is not coming.
+    ///
+    /// On `/healthz`, and the one number that makes a stranded upload visible.
+    /// It is refreshed on the store's own slow clock, not on demand.
+    pub fn stuck(&self) -> u64 {
+        self.inner.sink.stuck()
     }
 }
 
@@ -892,89 +1234,7 @@ impl Drop for SessionStore {
     }
 }
 
-/// A record and where to get it: already in memory, or in a file.
-enum Located {
-    Resident(Session),
-    OnDisk(PathBuf),
-}
-
-impl Located {
-    fn read(self) -> Option<Session> {
-        match self {
-            Self::Resident(session) => Some(session),
-            Self::OnDisk(path) => match read_record(&path) {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        %error,
-                        "a session record this server has indexed could not be read back"
-                    );
-                    None
-                }
-            },
-        }
-    }
-}
-
-impl Indexed {
-    fn path(&self, directory: &Path, id: &str) -> PathBuf {
-        match &self.file {
-            Some(file) => directory.join(file.as_ref()),
-            None => directory.join(format!("{id}.json")),
-        }
-    }
-}
-
 impl Records {
-    /// Files a record found on disk under the id inside it.
-    fn index_record(&mut self, header: &Header, path: &Path) {
-        let expected = format!("{}.json", header.id);
-        let file = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| *name != expected)
-            .map(|name| {
-                tracing::warn!(
-                    path = %path.display(),
-                    id = %header.id,
-                    "a session record is in a file that is not named after it; it is filed under \
-                     the id inside it and read back out of the file it is in"
-                );
-                Box::from(name.as_str())
-            });
-
-        self.by_room
-            .entry(header.room.clone())
-            .or_default()
-            .push(header.id.clone());
-        self.index.insert(
-            header.id.clone(),
-            Indexed {
-                room: Arc::from(header.room.as_str()),
-                started_at_ms: header.started_at_ms,
-                file,
-            },
-        );
-    }
-
-    /// Files a meeting that has just started.
-    fn start(&mut self, session: Session) {
-        self.by_room
-            .entry(session.room.clone())
-            .or_default()
-            .push(session.id.clone());
-        self.index.insert(
-            session.id.clone(),
-            Indexed {
-                room: Arc::from(session.room.as_str()),
-                started_at_ms: session.started_at_ms,
-                file: None,
-            },
-        );
-        self.live.insert(session.room.clone(), session);
-    }
-
     /// The moment no arrival time in this room's next meeting may precede.
     fn floor_of(&self, room: &str) -> i64 {
         self.last_ended_ms.get(room).copied().unwrap_or(i64::MIN)
@@ -988,42 +1248,16 @@ impl Records {
         *entry = (*entry).max(ended_at_ms);
     }
 
-    /// Where to get a record from, if this server has one.
-    fn locate(&self, id: &str, directory: &Path) -> Option<Located> {
-        if let Some(queued) = self.queued.get(id) {
-            return Some(Located::Resident(queued.session.clone()));
-        }
-        if let Some(session) = self.unwritten.get(id) {
-            return Some(Located::Resident(session.clone()));
-        }
-
-        let indexed = self.index.get(id)?;
-        if let Some(session) = self.live.get(indexed.room.as_ref())
-            && session.id == id
-        {
-            return Some(Located::Resident(session.clone()));
-        }
-
-        Some(Located::OnDisk(indexed.path(directory, id)))
-    }
-
-    /// Puts every room's meetings back into the order they happened in.
+    /// The copy of a record this node is carrying, if it is carrying one.
     ///
-    /// Insertion order is already that order while the server runs, because a
-    /// room holds one meeting at a time and each is inserted as it starts. It
-    /// is not that order after a load, where the records arrive in whatever
-    /// order the directory listed them -- so this runs once, at the end of a
-    /// load, rather than on every insert.
-    fn sort(&mut self) {
-        let started: HashMap<String, i64> = self
-            .index
-            .iter()
-            .map(|(id, indexed)| (id.clone(), indexed.started_at_ms))
-            .collect();
-
-        for ids in self.by_room.values_mut() {
-            ids.sort_by_key(|id| (started.get(id).copied().unwrap_or(0), id.clone()));
+    /// A record that is owed to the store still answers, or a backoffice
+    /// polling for the end of a meeting would see it un-end for a moment.
+    fn resident(&self, id: &str) -> Option<Session> {
+        if let Some(queued) = self.queued.get(id) {
+            return Some(queued.session.clone());
         }
+
+        self.live.values().find(|session| session.id == id).cloned()
     }
 
     fn finish(&mut self, room: &str, at_ms: i64, ending: Ending) -> Option<Session> {
@@ -1041,116 +1275,176 @@ impl Records {
         Some(session)
     }
 
-    /// Owes this record to the disk, replacing whatever edit of it was owed.
+    /// Owes this record to the store, replacing whatever edit of it was owed.
+    ///
+    /// The attempts are reset with the edit: this is a different record from
+    /// the one that failed, and making it wait out the old one's backoff would
+    /// mean a meeting that ends during an outage takes a further half minute to
+    /// be written down after the store comes back.
     fn queue(&mut self, session: Session) {
         self.next_version += 1;
         let version = self.next_version;
 
+        self.queued.insert(
+            session.id.clone(),
+            Queued {
+                version,
+                session,
+                attempts: 0,
+                due_at_ms: i64::MIN,
+            },
+        );
+    }
+
+    /// Whether anything is due to be written now.
+    fn has_due(&self, now_ms: i64) -> bool {
         self.queued
-            .insert(session.id.clone(), Queued { version, session });
+            .values()
+            .any(|queued| now_ms >= queued.due_at_ms)
     }
 }
 
-/// The writer: the one place in this crate that waits for a disk.
-///
-/// Whole-file rewrite rather than an appended line, so that the file on disk is
-/// the record and not a log that has to be replayed to become one: whoever
-/// finds this directory in two years reads a meeting with `cat`. A record is a
-/// few hundred bytes and a meeting produces a few dozen writes, so the cost of
-/// rewriting it is not worth an append format nobody but this crate could read.
+/// The writer: the one place in this crate that waits for a store.
 ///
 /// Nothing here holds the records lock across a write. It takes the lock to
 /// pick up what is owed, drops it, writes, and takes it again to strike off
-/// what it wrote -- which is what keeps a busy disk out of the way of somebody
+/// what it wrote -- which is what keeps a busy store out of the way of somebody
 /// joining a room. A record is left in the queue until it is written, so a
 /// reader is never told a meeting has no record because it is mid-flight.
 fn write_queued(inner: &Arc<Inner>) {
-    loop {
-        let batch: Vec<(u64, Session)> = {
-            let mut records = inner.records.lock().expect("session lock");
-            while records.queued.is_empty() && !records.closing {
-                records = inner.work.wait(records).expect("session lock");
-            }
-            if records.queued.is_empty() {
-                return;
-            }
+    let tick_every = inner.sink.tick_every();
+    // Due immediately, so a store that has to connect to say it is healthy does
+    // so at boot rather than a heartbeat later -- `/healthz` saying `down` for
+    // the first ten seconds of every process is a graph nobody can read.
+    let mut ticked = Instant::now()
+        .checked_sub(tick_every)
+        .unwrap_or_else(Instant::now);
 
+    loop {
+        let closing = {
+            let mut records = inner.records.lock().expect("session lock");
+            if !records.closing && !records.has_due(now_ms()) {
+                let (guard, _) = inner
+                    .work
+                    .wait_timeout(records, WRITER_TICK)
+                    .expect("session lock");
+                records = guard;
+            }
+            records.closing
+        };
+
+        let batch: Vec<(u64, Session)> = {
+            let records = inner.records.lock().expect("session lock");
+            let now = now_ms();
             records
                 .queued
                 .values()
+                // On the way out, everything goes, whatever it is waiting for.
+                // This is the last chance any of it has.
+                .filter(|queued| closing || now >= queued.due_at_ms)
                 .map(|queued| (queued.version, queued.session.clone()))
                 .collect()
         };
 
-        let written: Vec<(u64, Session, io::Result<()>)> = batch
-            .into_iter()
-            .map(|(version, session)| {
-                let outcome = write_record(&inner.directory, &session);
-                (version, session, outcome)
-            })
-            .collect();
+        if !batch.is_empty() {
+            let written: Vec<(u64, Session, Result<(), StoreError>)> = batch
+                .into_iter()
+                .map(|(version, session)| {
+                    let outcome = inner.sink.persist(&session, now_ms());
+                    (version, session, outcome)
+                })
+                .collect();
 
-        {
-            let mut records = inner.records.lock().expect("session lock");
-            for (version, session, outcome) in written {
-                // Only if nothing has edited the record since: a meeting that
-                // moved on while its older self was being written is still
-                // owed to the disk.
-                if records
-                    .queued
-                    .get(&session.id)
-                    .is_some_and(|queued| queued.version == version)
-                {
-                    records.queued.remove(&session.id);
-                }
-
-                match outcome {
-                    Ok(()) => {
-                        records.unwritten.remove(&session.id);
-                    }
-                    // Logged, counted, and the meeting carries on. Nobody's
-                    // call is failed because the disk was full; the
-                    // consequence is that this record will not survive the
-                    // process, which is what the counter on `/healthz` is for.
-                    Err(error) => {
-                        tracing::error!(
-                            session = %session.id,
-                            room = %session.room,
-                            directory = %inner.directory.display(),
-                            %error,
-                            "a session record could not be written; this meeting will not survive \
-                             a restart"
-                        );
-                        records.unwritten.insert(session.id.clone(), session);
-                    }
-                }
-            }
+            settle(inner, written);
+            inner.written.notify_all();
         }
 
-        inner.written.notify_all();
+        if closing {
+            let left = inner.records.lock().expect("session lock").queued.len();
+            if left > 0 {
+                tracing::error!(
+                    sessions = left,
+                    store = %inner.sink.describe(),
+                    "this server is stopping and could not write these meetings down; they are \
+                     lost"
+                );
+            }
+            return;
+        }
+
+        if ticked.elapsed() >= tick_every {
+            ticked = Instant::now();
+            let live: Vec<String> = inner
+                .records
+                .lock()
+                .expect("session lock")
+                .live
+                .values()
+                .map(|session| session.id.clone())
+                .collect();
+            inner.sink.tick(&live, now_ms());
+        }
     }
 }
 
-/// What the loader reads out of a record without reading the record.
-///
-/// Everything the index needs and nothing else: the attendance list of every
-/// meeting ever held is what makes a load expensive, and it is not looked at
-/// until somebody asks for that meeting.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Header {
-    id: String,
-    room: String,
-    started_at_ms: i64,
-    #[serde(default)]
-    ended_at_ms: Option<i64>,
+/// Strikes off what was written and puts back what was not.
+fn settle(inner: &Arc<Inner>, written: Vec<(u64, Session, Result<(), StoreError>)>) {
+    let mut records = inner.records.lock().expect("session lock");
+    let now = now_ms();
+
+    for (version, session, outcome) in written {
+        // Only if nothing has edited the record since: a meeting that moved on
+        // while its older self was being written is still owed to the store.
+        let Some(queued) = records.queued.get_mut(&session.id) else {
+            continue;
+        };
+        if queued.version != version {
+            continue;
+        }
+
+        match outcome {
+            Ok(()) => {
+                records.queued.remove(&session.id);
+            }
+            // Logged, counted, and the meeting carries on. Nobody's call is
+            // failed because a store was: the record stays here, keeps
+            // answering reads, and is tried again -- and the number of records
+            // in this state is on `/healthz` as the thing to alert on.
+            Err(error) => {
+                let wait = RETRY_AFTER
+                    .saturating_mul(1 << queued.attempts.min(5))
+                    .min(RETRY_AT_MOST);
+                queued.attempts = queued.attempts.saturating_add(1);
+                queued.due_at_ms = now + wait.as_millis() as i64;
+
+                let attempts = queued.attempts;
+                if attempts == 1 {
+                    tracing::error!(
+                        session = %session.id,
+                        room = %session.room,
+                        store = %inner.sink.describe(),
+                        %error,
+                        "a meeting record could not be written; it is kept in memory and tried \
+                         again, and it will not survive a restart until it lands"
+                    );
+                }
+            }
+        }
+    }
 }
 
-fn is_record(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .is_some_and(|extension| extension == "json")
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn generate_id() -> String {
+    format!(
+        "{SESSION_ID_PREFIX}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    )
 }
 
 /// Whether this is an id this server could have minted.
@@ -1170,48 +1464,9 @@ fn is_id(id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric())
 }
 
-fn read_header(path: &Path) -> io::Result<Header> {
-    let body = std::fs::read(path)?;
-    serde_json::from_slice(&body).map_err(io::Error::other)
-}
-
-fn read_record(path: &Path) -> io::Result<Session> {
-    let body = std::fs::read(path)?;
-    serde_json::from_slice(&body).map_err(io::Error::other)
-}
-
-fn write_record(directory: &Path, session: &Session) -> io::Result<()> {
-    use std::io::Write as _;
-
-    let body = serde_json::to_vec_pretty(session).map_err(io::Error::other)?;
-    let final_path = directory.join(format!("{}.json", session.id));
-    let pending_path = directory.join(format!("{}.json{PENDING_SUFFIX}", session.id));
-
-    let mut file = std::fs::File::create(&pending_path)?;
-    file.write_all(&body)?;
-    file.write_all(b"\n")?;
-    // Flushed before the rename, so the record is either the old one or the
-    // new one and never the first half of the new one. What is not done here
-    // is flushing the directory itself: a power cut can still lose the rename,
-    // and the cost of not losing it is an fsync of the directory on every
-    // arrival.
-    file.sync_all()?;
-    drop(file);
-
-    std::fs::rename(&pending_path, &final_path)
-}
-
-fn generate_id() -> String {
-    format!(
-        "{SESSION_ID_PREFIX}{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn member(sid: &str, identity: &str, joined_at_ms: i64) -> Member {
         Member {
@@ -1219,7 +1474,15 @@ mod tests {
             identity: identity.to_owned(),
             name: identity.to_owned(),
             kind: Kind::Standard,
+            account_id: None,
             joined_at_ms,
+        }
+    }
+
+    fn signed_in(sid: &str, identity: &str, account: &str, joined_at_ms: i64) -> Member {
+        Member {
+            account_id: Some(account.to_owned()),
+            ..member(sid, identity, joined_at_ms)
         }
     }
 
@@ -1235,16 +1498,23 @@ mod tests {
     }
 
     fn store(directory: &tempfile::TempDir) -> SessionStore {
-        SessionStore::open(directory.path()).expect("the session records open")
+        SessionStore::files(directory.path()).expect("the session records open")
     }
 
     /// Everything a room has held, which is what `of_room` used to hand back
     /// in one piece.
     fn history(store: &SessionStore, room: &str) -> Vec<Session> {
-        store.of_room(room, 0, MAX_PAGE).sessions
+        store
+            .of_room(room, 0, MAX_PAGE)
+            .expect("the store answers")
+            .sessions
     }
 
-    /// The reason these records are on a disk at all. A consumer that was down
+    fn read(store: &SessionStore, id: &str) -> Option<Session> {
+        store.get(id).expect("the store answers")
+    }
+
+    /// The reason these records are kept at all. A consumer that was down
     /// when a meeting ended has to be able to come back and ask what it
     /// missed, and it cannot ask a process that has been restarted since.
     #[test]
@@ -1262,8 +1532,7 @@ mod tests {
         };
 
         let store = store(&directory);
-        let session = store
-            .get(&id)
+        let session = read(&store, &id)
             .expect("a meeting held by the last process is not there to be asked about");
 
         assert_eq!(session.room, "demo");
@@ -1303,7 +1572,7 @@ mod tests {
             store.live("demo").is_none(),
             "a meeting held by a process that is gone was reported as the one happening now"
         );
-        let session = store.get(&id).expect("the record is kept");
+        let session = read(&store, &id).expect("the record is kept");
         assert_eq!(
             session.ended_at_ms,
             Some(4_000),
@@ -1371,7 +1640,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = SessionStore::open(directory.path())
+        let store = SessionStore::files(directory.path())
             .expect("one unreadable file took every other meeting on this server with it");
 
         assert_eq!(
@@ -1379,12 +1648,12 @@ mod tests {
             1,
             "a file that is not a record was read back as a meeting"
         );
-        assert!(store.get(&id).is_some());
+        assert!(read(&store, &id).is_some());
     }
 
     /// The store is told the whole roster on every change, so it is told the
     /// same roster many times. Writing a record each time would turn a quiet
-    /// room into a stream of identical files.
+    /// room into a stream of identical writes.
     #[test]
     fn a_roster_that_has_not_moved_changes_nothing() {
         let directory = directory();
@@ -1426,7 +1695,7 @@ mod tests {
                     i64::MIN,
                 )],
             };
-            write_record(directory.path(), &session).unwrap();
+            files::write_record(directory.path(), &session).unwrap();
         }
 
         let store = store(&directory);
@@ -1437,7 +1706,7 @@ mod tests {
              happening now"
         );
         for id in ["SE_first0000000", "SE_second000000"] {
-            let session = store.get(id).expect("the record is kept");
+            let session = read(&store, id).expect("the record is kept");
             assert_eq!(
                 session.ended_by,
                 Some(Ending::Restart),
@@ -1575,6 +1844,10 @@ mod tests {
                 store.note("standup", &[], 0, 0, at + 1_000);
                 store.expire(at + 1_000);
             }
+            assert!(
+                store.flush(Duration::from_secs(30)),
+                "the records did not reach the disk"
+            );
         }
 
         let store = store(&directory);
@@ -1584,19 +1857,20 @@ mod tests {
             store.resident(),
             0,
             "{} finished meetings are being held in memory; nothing is running, nothing is owed \
-             to the disk, and this is the number that grows for every meeting the server ever \
+             to the store, and this is the number that grows for every meeting the server ever \
              holds",
             store.resident()
         );
 
         let newest = store
             .of_room("standup", 0, 1)
+            .expect("the store answers")
             .sessions
             .pop()
             .expect("the newest meeting");
         assert!(
-            store.get(&newest.id).is_some(),
-            "a meeting that is only on disk cannot be read back by id"
+            read(&store, &newest.id).is_some(),
+            "a meeting that is only in the store cannot be read back by id"
         );
         assert_eq!(
             store.resident(),
@@ -1619,8 +1893,9 @@ mod tests {
             store.note("standup", &[], 0, 0, at + 1_000);
             store.expire(at + 1_000);
         }
+        assert!(store.flush(Duration::from_secs(30)));
 
-        let first = store.of_room("standup", 0, 10);
+        let first = store.of_room("standup", 0, 10).expect("the store answers");
         assert_eq!(
             first.sessions.len(),
             10,
@@ -1635,11 +1910,11 @@ mod tests {
             "the page does not start at the newest meeting"
         );
 
-        let second = store.of_room("standup", 10, 10);
+        let second = store.of_room("standup", 10, 10).expect("the store answers");
         assert_eq!(second.sessions.len(), 10);
         assert_eq!(second.sessions[0].started_at_ms, 141_000);
 
-        let last = store.of_room("standup", 20, 10);
+        let last = store.of_room("standup", 20, 10).expect("the store answers");
         assert_eq!(
             last.sessions.len(),
             5,
@@ -1647,65 +1922,13 @@ mod tests {
         );
 
         assert_eq!(
-            store.of_room("standup", 0, MAX_PAGE + 500).sessions.len(),
+            store
+                .of_room("standup", 0, MAX_PAGE + 500)
+                .expect("the store answers")
+                .sessions
+                .len(),
             25,
             "a caller asking for more than the cap got more than the cap"
-        );
-    }
-
-    /// Finding H. The record used to be flushed to the disk on the thread that
-    /// was letting somebody into a room, under a lock every other room's
-    /// arrivals also needed -- so a busy disk delayed joining, everywhere at
-    /// once.
-    ///
-    /// Measured against this machine's own `sync_all` rather than a fixed
-    /// number of milliseconds, because the whole question is "how many disk
-    /// flushes did the caller wait for" and the answer has to mean the same
-    /// thing on an SSD and on a loaded CI box. On a filesystem where a flush
-    /// is free this proves nothing -- and on one where it is free there was
-    /// nothing to prove.
-    #[test]
-    fn recording_a_membership_change_does_not_wait_for_a_disk() {
-        let directory = directory();
-        let store = store(&directory);
-        let changes = 200;
-
-        let one_flush = {
-            let probe = directory.path().join("probe");
-            let began = Instant::now();
-            for round in 0..10 {
-                let session = Session {
-                    id: format!("SE_probe{round:07}"),
-                    room: "probe".to_owned(),
-                    started_at_ms: 0,
-                    ended_at_ms: Some(0),
-                    ended_by: Some(Ending::Closed),
-                    participants: Vec::new(),
-                };
-                std::fs::create_dir_all(&probe).unwrap();
-                write_record(&probe, &session).unwrap();
-            }
-            began.elapsed() / 10
-        };
-
-        let began = Instant::now();
-        for index in 0..changes {
-            let sid = format!("PA_{index}");
-            store.note(
-                "demo",
-                &[member("PA_anchor", "anchor", 0), member(&sid, "alice", 0)],
-                0,
-                90_000,
-                index as i64,
-            );
-        }
-        let spent = began.elapsed();
-
-        assert!(
-            spent < one_flush * 20,
-            "{changes} membership changes took {spent:?}, which is more than twenty flushes of \
-             this filesystem ({one_flush:?} each): somebody joining a room is waiting for a disk \
-             again, and waiting for it under a lock every other room needs"
         );
     }
 
@@ -1713,7 +1936,7 @@ mod tests {
     /// dropped has written everything it was owed, so a planned stop loses
     /// nothing.
     #[test]
-    fn a_planned_stop_leaves_nothing_owed_to_the_disk() {
+    fn a_planned_stop_leaves_nothing_owed_to_the_store() {
         let directory = directory();
         let store = store(&directory);
 
@@ -1721,8 +1944,11 @@ mod tests {
         let id = store.live("demo").expect("a meeting").id;
         store.close("demo", 2_000);
 
-        store.flush();
-        assert_eq!(store.owed(), 0, "a flush returned with records still owed");
+        assert!(
+            store.flush(Duration::from_secs(30)),
+            "a flush returned with records still owed"
+        );
+        assert_eq!(store.owed(), 0);
 
         let path = directory.path().join(format!("{id}.json"));
         let written: Session =
@@ -1735,10 +1961,10 @@ mod tests {
         );
     }
 
-    /// A record that is owed to the disk still answers, or a backoffice
+    /// A record that is owed to the store still answers, or a backoffice
     /// polling for the end of a meeting would see it un-end for a moment.
     #[test]
-    fn a_record_answers_before_it_reaches_the_disk() {
+    fn a_record_answers_before_it_reaches_the_store() {
         let directory = directory();
         let store = store(&directory);
 
@@ -1746,9 +1972,9 @@ mod tests {
         let session = store.close("demo", 2_000).expect("the meeting ended");
 
         assert_eq!(
-            store.get(&session.id).map(|record| record.ended_at_ms),
+            read(&store, &session.id).map(|record| record.ended_at_ms),
             Some(Some(2_000)),
-            "a meeting that has ended reads as still running until its file lands"
+            "a meeting that has ended reads as still running until its record lands"
         );
         assert_eq!(history(&store, "demo").len(), 1);
     }
@@ -1766,5 +1992,245 @@ mod tests {
                 "`{hostile}` would be joined onto the records directory and opened"
             );
         }
+    }
+
+    /// The account arrives in a token, is carried on the participant, and is
+    /// answerable from the meeting.
+    #[test]
+    fn the_meeting_says_whose_it_was() {
+        let directory = directory();
+        let store = store(&directory);
+
+        store.note(
+            "demo",
+            &[
+                signed_in("PA_1", "alice", "AC_alice", 1_000),
+                signed_in("PA_2", "alice#2", "AC_alice", 1_000),
+                member("PA_3", "guest", 1_000),
+                recorder("PA_scribe", "scribe", 1_000),
+            ],
+            0,
+            0,
+            1_000,
+        );
+
+        let session = store.live("demo").expect("a meeting");
+        assert_eq!(
+            session.account_ids(),
+            vec!["AC_alice"],
+            "one person with two tabs is two stretches and one account, and a guest and a \
+             recorder are neither"
+        );
+        assert_eq!(
+            session
+                .participants
+                .iter()
+                .filter(|attendance| attendance.account_id.is_none())
+                .count(),
+            2,
+            "a token with no account has to be recorded as having none rather than being refused \
+             or given somebody else's"
+        );
+    }
+
+    /// A directory is not a work queue and does not pretend to be one. The
+    /// refusal names what it cannot do so that a deployment that wanted
+    /// recordings finds out at the first recording rather than at the first
+    /// missing one.
+    #[test]
+    fn a_directory_of_files_refuses_to_be_a_work_queue() {
+        let directory = directory();
+        let store = store(&directory);
+
+        assert!(matches!(
+            store.claim(Stage::Upload, 0, 10),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            store.recordings("SE_000000000000"),
+            Err(StoreError::Unsupported(_))
+        ));
+    }
+
+    /// A store that answers slowly, for a test that needs one to be stuck.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        entered: usize,
+        open: bool,
+    }
+
+    impl Gate {
+        fn hold(&self) {
+            let mut state = self.state.lock().expect("gate");
+            state.entered += 1;
+            self.changed.notify_all();
+            while !state.open {
+                state = self.changed.wait(state).expect("gate");
+            }
+        }
+
+        fn wait_until_held(&self) {
+            let mut state = self.state.lock().expect("gate");
+            while state.entered == 0 {
+                state = self.changed.wait(state).expect("gate");
+            }
+        }
+
+        fn open(&self) {
+            let mut state = self.state.lock().expect("gate");
+            state.open = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct Stuck(Arc<Gate>);
+
+    impl Sink for Stuck {
+        fn describe(&self) -> String {
+            "stuck".to_owned()
+        }
+
+        fn healthy(&self) -> bool {
+            false
+        }
+
+        fn count(&self) -> usize {
+            0
+        }
+
+        fn persist(&self, _session: &Session, _now_ms: i64) -> Result<(), StoreError> {
+            self.0.hold();
+            Ok(())
+        }
+
+        fn fetch(&self, _id: &str) -> Result<Option<Session>, StoreError> {
+            Ok(None)
+        }
+
+        fn page(&self, _room: &str, _offset: usize, _limit: usize) -> Result<Listing, StoreError> {
+            Ok(Listing {
+                entries: Vec::new(),
+                total: 0,
+            })
+        }
+    }
+
+    /// Finding H, stated so that it cannot come back. The record used to be
+    /// flushed to a disk on the thread that was letting somebody into a room,
+    /// under a lock every other room's arrivals also needed -- so a busy disk
+    /// delayed joining, everywhere at once. A database at the end of a network
+    /// is that failure again with a longer tail.
+    ///
+    /// The store here is not slow, it is stopped: the first write is inside it
+    /// and will not come out until this test says so. Two hundred membership
+    /// changes then have to be as fast as memory, because there is nothing else
+    /// they could be waiting for.
+    #[test]
+    fn recording_a_membership_change_never_waits_for_the_store() {
+        let gate = Arc::new(Gate::default());
+        let store = SessionStore::around(Arc::new(Stuck(Arc::clone(&gate))), Records::default());
+
+        store.note("demo", &[member("PA_anchor", "anchor", 0)], 0, 90_000, 0);
+        gate.wait_until_held();
+
+        let began = Instant::now();
+        for index in 0..200i64 {
+            let sid = format!("PA_{index}");
+            store.note(
+                "demo",
+                &[member("PA_anchor", "anchor", 0), member(&sid, "alice", 0)],
+                0,
+                90_000,
+                index,
+            );
+        }
+        let spent = began.elapsed();
+
+        assert!(
+            spent < Duration::from_secs(1),
+            "200 membership changes took {spent:?} while the store was stopped dead, so somebody \
+             joining a room is waiting on the store again -- and waiting under a lock every other \
+             room needs"
+        );
+        assert!(
+            store.owed() > 0,
+            "the store is stopped and nothing is owed to it, so this test is not testing what it \
+             says it is"
+        );
+
+        gate.open();
+        assert!(store.flush(Duration::from_secs(30)));
+    }
+
+    struct Refuses;
+
+    impl Sink for Refuses {
+        fn describe(&self) -> String {
+            "refuses".to_owned()
+        }
+
+        fn healthy(&self) -> bool {
+            false
+        }
+
+        fn count(&self) -> usize {
+            0
+        }
+
+        fn persist(&self, _session: &Session, _now_ms: i64) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("on purpose".to_owned()))
+        }
+
+        fn fetch(&self, _id: &str) -> Result<Option<Session>, StoreError> {
+            Err(StoreError::Unavailable("on purpose".to_owned()))
+        }
+
+        fn page(&self, _room: &str, _offset: usize, _limit: usize) -> Result<Listing, StoreError> {
+            Err(StoreError::Unavailable("on purpose".to_owned()))
+        }
+    }
+
+    /// A store that is away costs the records and never the meeting. This is
+    /// the whole answer to "what happens when Postgres is down mid-call":
+    /// people carry on talking, the record is held in memory and retried, and
+    /// the number of records in that state is the thing on `/healthz` worth an
+    /// alert.
+    #[test]
+    fn a_store_that_is_away_costs_records_and_not_calls() {
+        let store = SessionStore::around(Arc::new(Refuses), Records::default());
+
+        let started = store
+            .note("demo", &[member("PA_1", "alice", 1_000)], 0, 0, 1_000)
+            .expect("the meeting started even though the store is away");
+
+        let waited = Instant::now();
+        while store.unwritten() == 0 {
+            assert!(
+                waited.elapsed() < Duration::from_secs(5),
+                "the writer never even tried to write the record"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            read(&store, &started.id).map(|session| session.id),
+            Some(started.id.clone()),
+            "a meeting whose record could not be written stopped being answerable, so the API \
+             says a meeting that is happening does not exist"
+        );
+        assert!(
+            !store.flush(Duration::from_millis(50)),
+            "a flush against a store that is refusing everything claimed to have written it all"
+        );
+        assert_eq!(
+            store.live("demo").map(|session| session.id),
+            Some(started.id)
+        );
     }
 }

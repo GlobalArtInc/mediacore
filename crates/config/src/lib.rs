@@ -28,6 +28,17 @@ pub const DEFAULT_EVENT_TIMEOUT_MS: u32 = 5_000;
 pub const DEFAULT_EVENT_BACKOFF_MS: u32 = 1_000;
 pub const DEFAULT_EVENT_MAX_BACKOFF_MS: u32 = 30_000;
 pub const DEFAULT_KAFKA_TOPIC: &str = "mediacore";
+pub const DEFAULT_SESSION_CONNECTIONS: u32 = 4;
+pub const DEFAULT_SESSION_TIMEOUT_MS: u32 = 10_000;
+pub const DEFAULT_SESSION_LEASE_MS: u32 = 30_000;
+pub const DEFAULT_SESSION_ATTEMPTS: u32 = 5;
+pub const DEFAULT_RECORDING_MAX_SEGMENT_MB: u32 = 256;
+pub const DEFAULT_RECORDING_REORDER_HOLD_MS: u32 = 100;
+pub const DEFAULT_RECORDING_QUEUE: u32 = 8_192;
+pub const DEFAULT_RECORDING_POLL_MS: u32 = 2_000;
+pub const DEFAULT_RECORDING_BATCH: u32 = 4;
+pub const DEFAULT_RECORDING_REGION: &str = "us-east-1";
+pub const DEFAULT_RECORDING_S3_TIMEOUT_MS: u32 = 300_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -43,6 +54,7 @@ pub struct Config {
     pub video: VideoConfig,
     pub twirp: TwirpConfig,
     pub sessions: SessionConfig,
+    pub recording: RecordingConfig,
     pub events: EventConfig,
 }
 
@@ -137,10 +149,25 @@ pub struct KafkaConfig {
 }
 
 /// Where the record of what happened in a room is kept.
+///
+/// **Which store is chosen, and how.** Naming a database in `postgres.url` is
+/// what selects it; leaving it empty leaves the server on the directory of
+/// files it has always used. One setting rather than a `store:` switch beside
+/// a url, because a switch and a url can disagree -- a deployment that sets one
+/// and forgets the other gets a server that quietly records into the wrong
+/// place, and there is no version of that mistake worth being able to make.
+///
+/// A deployment that runs **more than one server process** has to name a
+/// database. Three processes cannot share a directory: each holds its own index
+/// of it, they overwrite each other's records, and a node that dies takes its
+/// unfinished meetings out of reach of the ones still up. So does a deployment
+/// that wants **recordings**, whose upload queue is a thing several processes
+/// poll and which a directory therefore refuses to be.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
-    /// The directory holding one JSON file per meeting.
+    /// The directory holding one JSON file per meeting, when no database is
+    /// named.
     ///
     /// Created at start if it is not there, and the server refuses to start if
     /// it cannot be created or read. That is deliberate: a server that answers
@@ -154,13 +181,382 @@ pub struct SessionConfig {
     /// the container; a path inside the image is a path whose contents go with
     /// the next release.
     pub directory: PathBuf,
+    pub postgres: PostgresConfig,
+}
+
+/// The database the meeting records and the recording queue live in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PostgresConfig {
+    /// A libpq connection string or URI, or empty for no database at all.
+    ///
+    /// It carries a password in every deployment that has one, so it is never
+    /// logged: what the server prints is the host, port and database name it
+    /// parsed out of it.
+    ///
+    /// **The database being down does not stop this server starting**, and does
+    /// not stop it carrying calls. Nothing on the media path goes near it. What
+    /// an outage costs is the records held during it, which are kept in memory
+    /// and written when it comes back -- see `unwritten_sessions=` on
+    /// `/healthz`.
+    ///
+    /// **The schema is this server's to create.** It applies whatever
+    /// migrations the database has not got on its first connection, under a
+    /// lock the cluster shares, so three nodes starting at once is safe and an
+    /// upgrade is "start the new binary".
+    pub url: String,
+
+    /// How many connections this node opens, which is also how many statements
+    /// it can have in flight. One thread each.
+    ///
+    /// Small on purpose. Every one of them is a backend process on the database
+    /// and this server asks very little of it: a few statements per meeting, and
+    /// a page of history whenever somebody opens a backoffice.
+    pub connections: u32,
+
+    /// The cap on one connection attempt and on one statement. A query that has
+    /// wedged holds one of the connections above this long and no longer.
+    pub timeout_ms: u32,
+
+    /// How long a meeting or a claim is believed without being renewed.
+    ///
+    /// The one number that decides how quickly a dead node's work comes back to
+    /// the other two, and it is a trade in both directions: too long and a
+    /// meeting that ended when a pod was killed sits open until this elapses;
+    /// too short and a node that is merely busy has its meetings closed under
+    /// it and its uploads taken away mid-flight. It is renewed three times per
+    /// lease, so it has to be comfortably more than a statement timeout.
+    pub lease_ms: u32,
+
+    /// How many times one recording's upload or announcement is handed out
+    /// before it is left alone.
+    ///
+    /// Spent on the claim rather than on the result, so a file whose upload
+    /// kills whatever tries it is dropped after this many nodes have died on it
+    /// rather than going round the cluster for ever.
+    pub attempts: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             directory: PathBuf::from("sessions"),
+            postgres: PostgresConfig::default(),
         }
+    }
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            connections: DEFAULT_SESSION_CONNECTIONS,
+            timeout_ms: DEFAULT_SESSION_TIMEOUT_MS,
+            lease_ms: DEFAULT_SESSION_LEASE_MS,
+            attempts: DEFAULT_SESSION_ATTEMPTS,
+        }
+    }
+}
+
+impl SessionConfig {
+    /// Whether a database was named, which is what decides which store is
+    /// built.
+    pub fn in_postgres(&self) -> bool {
+        !self.postgres.url.trim().is_empty()
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if !self.in_postgres() {
+            anyhow::ensure!(
+                !self.directory.as_os_str().is_empty(),
+                "sessions.directory must name a directory when sessions.postgres.url is empty; \
+                 there is nowhere else for a meeting record to go"
+            );
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            self.postgres.connections > 0,
+            "sessions.postgres.connections must be at least 1; a database with no connection to \
+             it is a database that is never written to"
+        );
+        anyhow::ensure!(
+            self.postgres.timeout_ms > 0,
+            "sessions.postgres.timeout_ms must not be zero; a statement with no time to complete \
+             in never completes"
+        );
+        anyhow::ensure!(
+            self.postgres.attempts > 0,
+            "sessions.postgres.attempts must be at least 1; the first offer is an attempt, and \
+             zero of them is a recording that is never uploaded"
+        );
+        // The lease is renewed three times over its length, so a lease shorter
+        // than three statement timeouts can expire while the node holding it is
+        // waiting on the very statement that would have renewed it -- and its
+        // meetings would then be closed under people who are still talking.
+        anyhow::ensure!(
+            self.postgres.lease_ms >= self.postgres.timeout_ms.saturating_mul(3),
+            "sessions.postgres.lease_ms ({}) must be at least three times \
+             sessions.postgres.timeout_ms ({}), or a node that is merely slow will have its \
+             meetings closed under it by one that is not",
+            self.postgres.lease_ms,
+            self.postgres.timeout_ms
+        );
+
+        Ok(())
+    }
+}
+
+/// Whether meetings are recorded, where the audio goes, and where it goes
+/// afterwards.
+///
+/// `enabled` is the **default for rooms, not a master switch**. A room says
+/// otherwise in its metadata -- `{"sessionPolicy": {"record": true}}` -- and
+/// what it says wins, so a deployment can record nothing by default and one
+/// room by name, or the other way round.
+///
+/// There is deliberately **no minimum-participants setting here**. Whether a
+/// meeting is happening is already decided once, by `room.min_humans`, which
+/// goes down to one; recording follows the meeting and has no second threshold
+/// of its own. That is not a simplification, it is the bug next door: a
+/// conference service whose recorder insisted on two people never recorded the
+/// meeting room where everybody sits together and joins from one account, and
+/// those meetings were simply missing afterwards with nothing to say why.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingConfig {
+    /// Record a room's meetings unless the room says otherwise.
+    pub enabled: bool,
+
+    /// Where the audio is written while a meeting is happening.
+    ///
+    /// One process per directory, exactly like `sessions.directory`: two
+    /// sharing one would each finish the other's live recordings at startup. It
+    /// must be a volume that outlives the container -- a path inside the image
+    /// is a path whose contents go with the next release, and what would go
+    /// with them is every recording not yet uploaded.
+    pub directory: PathBuf,
+
+    /// How large one file may become before the recorder starts the next
+    /// segment of the same participant.
+    ///
+    /// A ceiling, not a target. Opus at the bitrate a browser sends is a few
+    /// megabytes an hour, so an ordinary meeting never reaches this; what it
+    /// bounds is the meeting nobody ever leaves and the publisher sending far
+    /// more than it should. Each segment is a whole file, uploaded as one
+    /// object, with its own offset into the meeting.
+    pub max_segment_mb: u32,
+
+    /// How long a packet is held so that ones behind it can catch up.
+    ///
+    /// Not a jitter buffer: nobody is listening to this in real time. It is
+    /// long enough to undo an ordinary reordering and short enough that the
+    /// file on the disk is never far behind the meeting. A packet that arrives
+    /// after its place has gone past is dropped, and the hole it leaves is the
+    /// right length, because the clock in the file is the sender's.
+    pub reorder_hold_ms: u32,
+
+    /// How many packets may wait between the media path and the writer thread
+    /// before new ones are dropped rather than queued.
+    ///
+    /// The bound exists so that a disk that has stopped costs audio and not
+    /// meetings: without it a wedged filesystem would grow this queue until the
+    /// process was killed for memory, and a server that is killed is a server
+    /// that has dropped every call it was carrying.
+    pub queue: u32,
+
+    /// How often this node asks for uploads and announcements to do.
+    pub poll_interval_ms: u32,
+
+    /// How many of them it takes at once, which is also how many uploads may be
+    /// in flight.
+    pub batch: u32,
+
+    /// Keep the local file after the object store has it.
+    ///
+    /// Off, because a node's disk is not a second copy anybody agreed to pay
+    /// for: a server that keeps every recording fills its volume and then stops
+    /// recording, which is the failure that costs meetings rather than bytes.
+    /// Turn it on when the volume is large and somebody wants a local copy.
+    pub keep_local: bool,
+
+    pub s3: S3Config,
+}
+
+/// The object store finished recordings are uploaded to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// The endpoint, scheme included: `https://s3.eu-central-1.amazonaws.com`,
+    /// or whatever a MinIO or Ceph deployment answers on.
+    pub endpoint: String,
+    /// The region the signature is scoped to. An object store that has no
+    /// regions still wants one in the signature; anything consistent will do.
+    pub region: String,
+    pub bucket: String,
+    /// The credentials, in the config file beside the api keys.
+    ///
+    /// `secret_access_key` is never logged, exactly as an api key and a
+    /// database password are not: what a log line says about the object store
+    /// is its endpoint and its bucket.
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// `<endpoint>/<bucket>/<key>` rather than `<bucket>.<endpoint>/<key>`.
+    ///
+    /// On, because the deployments this is built for run their own object store
+    /// and both MinIO and Ceph want path style. Amazon's own S3 wants the other
+    /// one for buckets made since 2020: set this to false there.
+    pub path_style: bool,
+    /// Put in front of every key, so one bucket can hold this server's
+    /// recordings beside something else's.
+    pub prefix: String,
+
+    /// How long one `PUT` of a whole recording may take, from the first
+    /// connection attempt to the last byte of the answer.
+    ///
+    /// **A total deadline and not an idle one.** A segment is at most
+    /// `max_segment_mb`, and the whole of it has to go up inside this or the
+    /// upload fails and is retried -- `sessions.postgres.attempts` times, after
+    /// which the recording is `failed` with the audio still on the node's disk
+    /// and nothing announced. So it is a number about a bucket and a link, and
+    /// it used to be `sessions.postgres.timeout_ms`, which is a number about
+    /// how long one SQL statement may hold a connection. Ten seconds is a
+    /// perfectly good statement timeout and asks an ordinary two-hour
+    /// participant's thirty megabytes to move at 24 Mbit/s.
+    ///
+    /// The default gives `max_segment_mb` a megabyte a second, which is the
+    /// slowest link worth calling a link, and [`RecordingConfig::validate`]
+    /// refuses a pairing that does not.
+    pub timeout_ms: u32,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("recordings"),
+            max_segment_mb: DEFAULT_RECORDING_MAX_SEGMENT_MB,
+            reorder_hold_ms: DEFAULT_RECORDING_REORDER_HOLD_MS,
+            queue: DEFAULT_RECORDING_QUEUE,
+            poll_interval_ms: DEFAULT_RECORDING_POLL_MS,
+            batch: DEFAULT_RECORDING_BATCH,
+            keep_local: false,
+            s3: S3Config::default(),
+        }
+    }
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            region: DEFAULT_RECORDING_REGION.to_owned(),
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            path_style: true,
+            prefix: String::new(),
+            timeout_ms: DEFAULT_RECORDING_S3_TIMEOUT_MS,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// Whether this build of the configuration can record anything at all.
+    ///
+    /// An object store is what makes the difference, not `enabled`: a room
+    /// whose metadata asks to be recorded on a server with no bucket has to be
+    /// refused loudly at startup rather than silently not recorded, which is
+    /// why this and [`RecordingConfig::validate`] are two different questions.
+    pub fn possible(&self) -> bool {
+        !self.s3.bucket.trim().is_empty()
+    }
+
+    pub fn max_segment_bytes(&self) -> u64 {
+        u64::from(self.max_segment_mb) * 1024 * 1024
+    }
+
+    pub fn reorder_hold(&self) -> Duration {
+        Duration::from_millis(self.reorder_hold_ms.into())
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms.into())
+    }
+
+    /// How long one upload may take, whole.
+    pub fn s3_timeout(&self) -> Duration {
+        Duration::from_millis(self.s3.timeout_ms.into())
+    }
+
+    fn validate(&self, sessions: &SessionConfig) -> anyhow::Result<()> {
+        if !self.enabled && !self.possible() {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            !self.s3.endpoint.trim().is_empty(),
+            "recording.s3.endpoint must name an object store; there is nowhere else for a \
+             finished recording to go, and a server that recorded for a day and could not upload \
+             any of it would only fill its disk"
+        );
+        anyhow::ensure!(
+            !self.s3.bucket.trim().is_empty(),
+            "recording.s3.bucket must be set"
+        );
+        anyhow::ensure!(
+            !self.s3.access_key_id.trim().is_empty()
+                && !self.s3.secret_access_key.trim().is_empty(),
+            "recording.s3 needs an access_key_id and a secret_access_key; every request to an \
+             object store is signed, and an unsigned one is refused"
+        );
+        anyhow::ensure!(
+            !self.directory.as_os_str().is_empty(),
+            "recording.directory must name a directory; audio is written there while a meeting is \
+             happening and uploaded when it ends"
+        );
+        anyhow::ensure!(
+            self.queue > 0,
+            "recording.queue must be at least 1; a queue with no room in it is a recorder that \
+             drops every packet"
+        );
+        anyhow::ensure!(
+            self.batch > 0,
+            "recording.batch must be at least 1; taking no work is never uploading anything"
+        );
+        anyhow::ensure!(
+            self.max_segment_mb > 0,
+            "recording.max_segment_mb must be at least 1"
+        );
+        // The two numbers are one decision and were never related to each
+        // other before: a ceiling on how large one object may be, and a total
+        // deadline for putting one object into a bucket. A megabyte a second is
+        // the slowest link worth calling a link, and a pairing that does not
+        // clear even that is a deployment whose largest recordings will fail
+        // every attempt and be given up on with the audio still on the disk --
+        // which is discovered weeks later, by somebody asking for a recording.
+        anyhow::ensure!(
+            u64::from(self.s3.timeout_ms) >= u64::from(self.max_segment_mb) * 1_000,
+            "recording.s3.timeout_ms ({}) is not enough time to put a recording.max_segment_mb \
+             ({} MB) object into the bucket at even a megabyte a second. It is a total deadline \
+             for the whole PUT, so a segment that cannot make it fails every attempt and is given \
+             up on with the audio still on this node's disk: raise the timeout or lower the \
+             segment ceiling",
+            self.s3.timeout_ms,
+            self.max_segment_mb
+        );
+        // The upload queue is a table several processes poll, and a directory
+        // of files cannot be one -- see `sessions.postgres.url`. Refused here
+        // rather than at the first recording, because "we have been meeting for
+        // a week and there are no recordings" is a discovery nobody should make
+        // from a log line at boot.
+        anyhow::ensure!(
+            sessions.in_postgres(),
+            "recording needs sessions.postgres.url: a recording's upload is a row several \
+             processes claim, and a directory of one JSON file per meeting cannot be a queue"
+        );
+
+        Ok(())
     }
 }
 
@@ -365,6 +761,7 @@ impl Default for Config {
             video: VideoConfig::default(),
             twirp: TwirpConfig::default(),
             sessions: SessionConfig::default(),
+            recording: RecordingConfig::default(),
             events: EventConfig::default(),
         }
     }
@@ -540,11 +937,8 @@ impl Config {
             !self.bind_addresses.is_empty(),
             "at least one bind address is required"
         );
-        anyhow::ensure!(
-            !self.sessions.directory.as_os_str().is_empty(),
-            "sessions.directory must name a directory; there is nowhere else for a meeting record \
-             to go"
-        );
+        self.sessions.validate()?;
+        self.recording.validate(&self.sessions)?;
         self.rtc.validate()?;
         self.video.bwe.validate()?;
         self.events.validate(&self.keys)?;
@@ -637,6 +1031,125 @@ mod tests {
         assert!(config.node_id.starts_with("ND_"));
     }
 
+    /// A store of files cannot be an upload queue, and a server that has to
+    /// find that out at the first recording has already held a week of
+    /// meetings.
+    #[test]
+    fn recording_without_a_database_is_refused_at_startup() {
+        let refused = Config::parse(
+            "keys:\n  k: s\nrecording:\n  enabled: true\n  s3:\n    endpoint: \
+             http://minio:9000\n    bucket: meetings\n    access_key_id: k\n    \
+             secret_access_key: s\n",
+        )
+        .expect_err("a recorder with nowhere to queue its uploads must not start");
+
+        assert!(
+            refused.to_string().contains("sessions.postgres.url"),
+            "the refusal has to name the setting that would fix it: {refused}"
+        );
+    }
+
+    /// The object store's deadline is its own number, and it is related to the
+    /// size ceiling it has to carry.
+    ///
+    /// It used to be `sessions.postgres.timeout_ms` -- how long one SQL
+    /// statement may hold a connection -- doing duty as a total deadline for a
+    /// whole `PUT`. Ten seconds is a fine statement timeout and asks an
+    /// ordinary two-hour participant's thirty megabytes to move at 24 Mbit/s;
+    /// past that the upload fails every attempt and the recording is given up
+    /// on with the audio still on the node's disk and nothing announced.
+    #[test]
+    fn an_upload_has_its_own_deadline_and_it_has_to_fit_the_segment_it_carries() {
+        let config = Config::parse(
+            "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\n    timeout_ms: \
+             10000\n    lease_ms: 30000\nrecording:\n  enabled: true\n  s3:\n    endpoint: \
+             http://minio:9000\n    bucket: meetings\n    access_key_id: k\n    \
+             secret_access_key: s\n",
+        )
+        .expect("a recording deployment with the defaults");
+
+        assert_eq!(
+            config.recording.s3_timeout(),
+            Duration::from_millis(u64::from(DEFAULT_RECORDING_S3_TIMEOUT_MS)),
+            "an upload's deadline has to come from recording.s3.timeout_ms"
+        );
+        assert_ne!(
+            config.recording.s3_timeout(),
+            Duration::from_millis(u64::from(config.sessions.postgres.timeout_ms)),
+            "the upload deadline is still the database's statement timeout, which is a number \
+             about how long a query may hold a connection and has nothing to say about how long a \
+             quarter-gigabyte object takes to reach a bucket"
+        );
+
+        let refused = Config::parse(
+            "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
+             enabled: true\n  max_segment_mb: 1024\n  s3:\n    endpoint: http://minio:9000\n    \
+             bucket: meetings\n    access_key_id: k\n    secret_access_key: s\n    timeout_ms: \
+             10000\n",
+        )
+        .expect_err(
+            "a segment ceiling the upload deadline cannot carry at even a megabyte a second has \
+             to be refused at startup, not discovered weeks later by somebody asking for a \
+             recording",
+        );
+
+        assert!(
+            refused.to_string().contains("recording.s3.timeout_ms"),
+            "the refusal has to name the setting that would fix it: {refused}"
+        );
+    }
+
+    #[test]
+    fn recording_without_a_bucket_is_refused_at_startup() {
+        let refused = Config::parse(
+            "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
+             enabled: true\n",
+        )
+        .expect_err("a recorder with nowhere to upload to must not start");
+
+        assert!(
+            refused.to_string().contains("recording.s3.endpoint"),
+            "{refused}"
+        );
+    }
+
+    /// A bucket named without `enabled` is a deployment that records the rooms
+    /// that ask for it, so it is checked as hard as one that records
+    /// everything.
+    #[test]
+    fn a_bucket_named_without_the_default_switch_is_still_a_recording_deployment() {
+        let refused = Config::parse(
+            "keys:\n  k: s\nrecording:\n  s3:\n    endpoint: http://minio:9000\n    bucket: \
+             meetings\n    access_key_id: k\n    secret_access_key: s\n",
+        )
+        .expect_err("a bucket with no database behind it must not start either");
+
+        assert!(
+            refused.to_string().contains("sessions.postgres.url"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_records_nothing_needs_none_of_it() {
+        let config = Config::parse("keys:\n  k: s\n").expect("a server with no recording");
+
+        assert!(!config.recording.enabled);
+        assert!(
+            !config.recording.possible(),
+            "no bucket is no recording, and a deployment that never asked for it must not be \
+             refused for not configuring it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_recording_setting_is_a_refusal_and_not_a_silent_default() {
+        let refused = Config::parse("keys:\n  k: s\nrecording:\n  enabld: true\n")
+            .expect_err("a typo in a setting name has to be a refusal");
+
+        assert!(refused.to_string().contains("enabld"), "{refused}");
+    }
+
     #[test]
     fn the_session_policy_is_off_until_a_room_asks_for_one() {
         let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
@@ -647,6 +1160,11 @@ mod tests {
         );
         assert_eq!(config.room.end_grace, DEFAULT_END_GRACE_SECONDS);
         assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
+        assert!(
+            !config.sessions.in_postgres(),
+            "the sample names a database, so copying it points somebody's meetings at a server \
+             they did not choose -- and the single process the sample describes does not need one"
+        );
     }
 
     #[test]
@@ -779,7 +1297,8 @@ mod tests {
         );
         assert!(
             Config::parse(
-                "keys:\n  key1: secret1\nevents:\n  webhooks:\n    urls:\n      - https://example.test/hook\n"
+                "keys:\n  key1: secret1\nevents:\n  webhooks:\n    urls:\n \
+                 - https://example.test/hook\n"
             )
             .is_err(),
             "endpoints with no signing key named at all were accepted"
@@ -978,6 +1497,52 @@ mod tests {
         );
     }
 
+    /// The url is the switch. There is nothing else to set and nothing that
+    /// can disagree with it.
+    #[test]
+    fn naming_a_database_is_what_chooses_the_database() {
+        let files = Config::parse("keys:\n  devkey: devsecret\n").expect("a config with no store");
+        assert!(!files.sessions.in_postgres());
+
+        let database = Config::parse(
+            "keys:\n  devkey: devsecret\nsessions:\n  postgres:\n    url: \
+             postgres://mediacore@db/mediacore\n",
+        )
+        .expect("a config that names a database");
+        assert!(database.sessions.in_postgres());
+        assert_eq!(
+            database.sessions.postgres.connections, DEFAULT_SESSION_CONNECTIONS,
+            "naming a database made a deployment spell out everything else about it as well"
+        );
+    }
+
+    /// A lease shorter than three statement timeouts can run out while the node
+    /// holding it is waiting on the very statement that would have renewed it,
+    /// and its meetings would then be closed under people who are still
+    /// talking. Refused at startup, where it is a number somebody chose, rather
+    /// than at three in the morning, where it is an outage.
+    #[test]
+    fn a_lease_that_cannot_outlive_a_statement_is_refused() {
+        let refusal = Config::parse(
+            "keys:\n  devkey: devsecret\nsessions:\n  postgres:\n    url: \
+             postgres://mediacore@db/mediacore\n    timeout_ms: 10000\n    lease_ms: 15000\n",
+        )
+        .expect_err("a lease shorter than three statement timeouts was accepted");
+
+        assert!(
+            refusal.to_string().contains("lease_ms"),
+            "the refusal has to name the setting somebody has to change, and it says: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_still_required_when_no_database_is_named() {
+        let refusal = Config::parse("keys:\n  devkey: devsecret\nsessions:\n  directory: \"\"\n")
+            .expect_err("a server with nowhere at all to put a meeting record started");
+
+        assert!(refusal.to_string().contains("sessions.directory"));
+    }
+
     #[test]
     fn the_shipped_sample_is_a_config_this_server_parses() {
         let config = Config::parse(include_str!("../../../config-sample.yaml"))
@@ -989,6 +1554,11 @@ mod tests {
             "the sample must not ship a policy that ends rooms nobody asked it to end"
         );
         assert_eq!(config.room.duplicate_identity, DuplicateIdentity::Suffix);
+        assert!(
+            !config.sessions.in_postgres(),
+            "the sample names a database, so copying it points somebody's meetings at a server \
+             they did not choose -- and the single process the sample describes does not need one"
+        );
         assert!(
             !config.events.has_destinations(),
             "the sample ships a destination, so copying it starts posting somebody's meetings to \

@@ -22,6 +22,15 @@ pub struct PublisherSession {
     queued_candidates: Vec<String>,
     cid_by_mid: HashMap<String, String>,
     sid_by_mid: HashMap<String, String>,
+    /// The recorder's way into each media section carrying audio that is being
+    /// recorded, by mid.
+    ///
+    /// Owned by this session and by nothing else, which is the point: finding a
+    /// tap for an arriving packet is a lookup in a map this task alone touches,
+    /// with no lock anybody else can be holding. Dropping one ends its
+    /// recording, so unpublishing a track or losing the transport closes the
+    /// file without anything having to say so.
+    taps: HashMap<String, mediacore_recording::Tap>,
     dirty: HashSet<String>,
 }
 
@@ -35,6 +44,7 @@ impl PublisherSession {
             queued_candidates: Vec::new(),
             cid_by_mid: HashMap::new(),
             sid_by_mid: HashMap::new(),
+            taps: HashMap::new(),
             dirty: HashSet::new(),
         }
     }
@@ -148,6 +158,27 @@ impl PublisherSession {
                     rtp.carried_mid_extension,
                 );
 
+                // The recorder's whole share of the media path: a lookup in a
+                // map this task owns and a push into a queue with a bound on
+                // it. No lock that anything else can hold, no allocation of the
+                // payload -- it arrives behind an `Arc` and stays there -- and
+                // nothing that can wait. Everything after this point happens on
+                // the recorder's own thread; see `crates/recording`.
+                //
+                // The extended sequence number and timestamp rather than the
+                // sixteen- and thirty-two-bit ones off the wire: an hour into a
+                // meeting both have wrapped, and undoing that here would be a
+                // second place to get roll-over wrong.
+                if let Some(tap) = self.taps.get(&*rtp.mid) {
+                    tap.packet(
+                        *rtp.packet.seq_no,
+                        rtp.packet.time.numer(),
+                        rtp.packet.time.denom(),
+                        Arc::clone(&rtp.packet.payload),
+                        rtp.packet.timestamp,
+                    );
+                }
+
                 if let Some(track_sid) = track_sid {
                     let effects = state.router.forward(&track_sid, &rtp);
 
@@ -254,6 +285,10 @@ impl PublisherSession {
             state.router.remove_source(track_sid);
         }
 
+        // Every recording of this publisher is closed here, which is what makes
+        // a transport that simply went away cost the last packets and not the
+        // file.
+        self.taps.clear();
         self.events = None;
         self.task = None;
         state.publishers.remove(participant_sid);
@@ -400,6 +435,10 @@ impl PublisherSession {
 
     fn unpublish_mid(&mut self, state: &AppState, joined: &Joined, mid: &str) {
         self.cid_by_mid.remove(mid);
+        // Dropping the tap closes the file and hands the recording to the
+        // upload queue. A participant who stops publishing halfway through a
+        // meeting has their audio in the object store before the meeting ends.
+        self.taps.remove(mid);
 
         let Some(track_sid) = self.sid_by_mid.remove(mid) else {
             return;
@@ -450,6 +489,17 @@ impl PublisherSession {
             .set_track_mime_type(&track.sid, &mime_type);
         self.sid_by_mid.insert(mid.clone(), track.sid.clone());
 
+        // Only if there is not one already. A renegotiation that re-announces
+        // a media section must not replace the tap on it: replacing one drops
+        // it, and dropping one closes the file and starts the next segment, so
+        // a publisher that renegotiates every few minutes would come out as a
+        // pile of fragments with nothing wrong with any of them.
+        if !self.taps.contains_key(&mid)
+            && let Some(tap) = open_tap(state, joined, &track, &mime_type)
+        {
+            self.taps.insert(mid.clone(), tap);
+        }
+
         if let Some(handle) = self.handle.clone() {
             let layers = LayerMap::build(&track.layers, &info.rids);
 
@@ -479,6 +529,59 @@ impl PublisherSession {
 
         announce(joined);
     }
+}
+
+/// Starts recording one published track, when there is anything to record it
+/// with and it is the kind of track worth recording.
+///
+/// **Opus only, and microphones only.** Opus because that is what goes into the
+/// file: the packets are written through untouched, so a track negotiated as
+/// anything else has nothing this server could put in an Ogg Opus stream
+/// without decoding it, which is the one thing it will not do. Microphones
+/// because a recording is of a person speaking -- screen-share audio is
+/// content, not a voice, and putting the sound of a shared video into
+/// somebody's own recording would put it into their transcript as their words.
+///
+/// A track published into a room that is not recorded gets no tap at all, so
+/// the media path for such a room is exactly what it was before any of this
+/// existed.
+///
+/// This is a filter and not the decision. Whether a meeting is recorded was
+/// decided once, when it began, by the same setting -- see
+/// [`mediacore_room::Room::records`], which says what a room whose policy
+/// changes mid-meeting gets and why that is left alone. A tap opened for a
+/// meeting the recorder was never told about discards every packet and says so
+/// when the track ends.
+fn open_tap(
+    state: &AppState,
+    joined: &Joined,
+    track: &mediacore_room::PublishedTrack,
+    mime_type: &str,
+) -> Option<mediacore_recording::Tap> {
+    let recording = state.recording.as_ref()?;
+
+    if track.kind != mediacore_room::TrackKind::Audio
+        || !mime_type.eq_ignore_ascii_case("audio/opus")
+    {
+        return None;
+    }
+    if !matches!(
+        track.source,
+        mediacore::TrackSource::Microphone | mediacore::TrackSource::Unknown
+    ) {
+        return None;
+    }
+    if !joined.room.records() {
+        return None;
+    }
+
+    Some(recording.recorder.track(mediacore_recording::TrackSpec {
+        room: joined.room.name.clone(),
+        participant: joined.participant.sid.clone(),
+        identity: joined.participant.identity.clone(),
+        account_id: joined.participant.account_id.clone(),
+        track: track.sid.clone(),
+    }))
 }
 
 fn unpublish(state: &AppState, joined: &Joined, track_sid: &str) {

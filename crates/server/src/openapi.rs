@@ -61,6 +61,11 @@ const SESSIONS_TAG: &str = "Sessions";
 const SESSION_SCHEMA: &str = "session.Session";
 const ATTENDANCE_SCHEMA: &str = "session.Attendance";
 
+/// One recording made during a meeting, and one of the two pieces of work that
+/// follow it. Hand-written for the same reason the two above are.
+const RECORDING_SCHEMA: &str = "session.Recording";
+const WORK_SCHEMA: &str = "session.RecordingWork";
+
 /// Twirp's error body, the shape every one of these methods fails in.
 const ERROR_SCHEMA: &str = "twirp.Error";
 
@@ -128,6 +133,8 @@ fn build() -> Value {
     components.insert(ERROR_SCHEMA.to_owned(), error_schema());
     components.insert(SESSION_SCHEMA.to_owned(), session_schema());
     components.insert(ATTENDANCE_SCHEMA.to_owned(), attendance_schema());
+    components.insert(RECORDING_SCHEMA.to_owned(), recording_schema());
+    components.insert(WORK_SCHEMA.to_owned(), work_schema());
 
     json!({
         "openapi": OPENAPI_VERSION,
@@ -665,6 +672,16 @@ fn session_answer(answer: Answer) -> Value {
             "required": ["session"],
             "properties": { "session": session },
         }),
+        Answer::Recordings => json!({
+            "type": "object",
+            "required": ["recordings"],
+            "properties": {
+                "recordings": {
+                    "type": "array",
+                    "items": { "$ref": format!("#/components/schemas/{RECORDING_SCHEMA}") },
+                },
+            },
+        }),
     }
 }
 
@@ -677,6 +694,9 @@ fn session_answer_description(answer: Answer) -> &'static str {
             "The meeting running now, or `null`. No meeting is an answer and not a                             failure, so this is 200 either way."
         }
         Answer::One => "The meeting.",
+        Answer::Recordings => {
+            "Every recording made during the meeting, by participant and then by segment.                          An empty list for a meeting that was not recorded, which is an answer and not                          a failure."
+        }
     }
 }
 
@@ -754,11 +774,141 @@ fn attendance_schema() -> Value {
                 "description":
                     "When they arrived. Can be earlier than `startedAtMs`: the first person into                      a room with a floor of two was waiting for the second.",
             },
+            "accountId": {
+                "type": "string",
+                "nullable": true,
+                "description":
+                    "Who the platform that issued the token says this is, as opposed to \
+                     `identity`, which is only what one room calls them. Null when the token \
+                     named no account, which a recorder, an agent and a guest legitimately do \
+                     not.",
+            },
             "leftAtMs": {
                 "type": "integer",
                 "format": "int64",
                 "nullable": true,
                 "description": "When they left, or null while they are still here.",
+            },
+        },
+    })
+}
+
+fn recording_schema() -> Value {
+    json!({
+        "type": "object",
+        "title": "Recording",
+        "description":
+            "One stretch of one participant's audio and the object it is in. Ogg with Opus              inside it, exactly as it came off the wire -- nothing in this server decodes or              re-encodes audio, so what is in the object is what the browser produced. More              than one segment for the same participant means they left and came back, or they              talked for long enough that the file was rolled over.",
+        "required": [
+            "id", "meeting", "participant", "segment", "sampleRate", "channels",
+            "startedAtMs", "offsetMs", "work"
+        ],
+        "properties": {
+            "id": { "type": "string", "description": "`RE_` and twelve hex digits." },
+            "meeting": {
+                "type": "string",
+                "description":
+                    "The meeting this belongs to, never the room: a room holds another meeting                      tomorrow and this is not a recording of that one.",
+            },
+            "participant": {
+                "type": "string",
+                "description":
+                    "The participant's sid, which is what the meeting's attendance list is keyed                      by, so a recording can be lined up with the stretch it was made during.",
+            },
+            "accountId": {
+                "type": "string",
+                "nullable": true,
+                "description":
+                    "The platform account behind that participant, copied off the attendance row                      when the recording started so that it survives the meeting record being                      pruned. Null for a recorder, an agent or a guest.",
+            },
+            "segment": {
+                "type": "integer",
+                "description": "Which file of this participant's this is, from zero.",
+            },
+            "localPath": {
+                "type": "string",
+                "description":
+                    "Where the file is on the node that made it. Of use to an operator and to                      nobody else; it is gone once the object store has the file.",
+            },
+            "node": {
+                "type": "string",
+                "nullable": true,
+                "description":
+                    "Which node's disk that is. The upload is offered only to that node, because                      `localPath` means nothing anywhere else.",
+            },
+            "objectKey": {
+                "type": "string",
+                "nullable": true,
+                "description":
+                    "Where it is in the bucket, once it is there. Null until the upload finishes;                      `work` says why.",
+            },
+            "bytes": { "type": "integer", "format": "int64", "nullable": true },
+            "sampleRate": { "type": "integer", "description": "48000, always: Opus decodes at 48 kHz." },
+            "channels": { "type": "integer", "description": "1 or 2, read from the audio itself." },
+            "startedAtMs": { "type": "integer", "format": "int64" },
+            "endedAtMs": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description":
+                    "Where the sound stops, which is `startedAtMs` plus `durationMs` -- not when                      the file happened to be closed. The two differ for somebody who stopped                      sending long before the meeting ended.",
+            },
+            "offsetMs": {
+                "type": "integer",
+                "format": "int64",
+                "description":
+                    "Where this file starts inside the meeting, in milliseconds from the moment                      the meeting did. This is what lines several participants' files up against                      one another without every reader fetching the meeting and subtracting.",
+            },
+            "durationMs": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description":
+                    "How long the audio is, **silences included**. An Opus sender stops sending                      while nobody is talking, so a participant who said nothing for two minutes                      has two minutes more of recording, not two minutes less: the length comes                      from their own sender's clock and not from the bytes written. Null while the                      file is still being written.",
+            },
+            "work": {
+                "type": "array",
+                "items": { "$ref": format!("#/components/schemas/{WORK_SCHEMA}") },
+                "description": "The two things that have to happen to this file, in order.",
+            },
+        },
+    })
+}
+
+fn work_schema() -> Value {
+    json!({
+        "type": "object",
+        "title": "RecordingWork",
+        "description":
+            "One of the two stages a finished recording goes through. They are separate              because they fail differently: an object store that is full and a consumer that is              not listening are two outages, and a recording that went up but was not announced              must not be uploaded again to get the announcement retried.",
+        "required": ["recording", "stage", "state", "attempts", "dueAtMs"],
+        "properties": {
+            "recording": { "type": "string" },
+            "stage": {
+                "type": "string",
+                "enum": ["upload", "announce"],
+                "description":
+                    "`upload`: put the file in the object store. `announce`: say it is there.",
+            },
+            "state": {
+                "type": "string",
+                "enum": ["blocked", "waiting", "claimed", "done", "failed"],
+                "description":
+                    "`blocked`: not yet possible -- the file is still being written, or the                      upload it follows has not finished. `waiting`: due. `claimed`: a node is doing                      it. `done`. `failed`: tried as often as this deployment allows and never                      finished; `lastError` says what went wrong and an operator who has fixed the                      cause moves it back by hand.",
+            },
+            "attempts": {
+                "type": "integer",
+                "description":
+                    "How many times this has been handed out. Counted on the claim and not on the                      result, which is what stops a recording that kills whatever tries it going                      round the cluster for ever.",
+            },
+            "dueAtMs": { "type": "integer", "format": "int64" },
+            "claimedBy": { "type": "string", "nullable": true },
+            "claimEndsAtMs": { "type": "integer", "format": "int64", "nullable": true },
+            "doneAtMs": { "type": "integer", "format": "int64", "nullable": true },
+            "lastError": {
+                "type": "string",
+                "nullable": true,
+                "description": "What went wrong the last time somebody tried.",
             },
         },
     })

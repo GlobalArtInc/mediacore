@@ -1,9 +1,16 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use clap::Parser;
 use mediacore_config::Config;
 use mediacore_server::{http, state::AppState};
 use tracing_subscriber::EnvFilter;
+
+/// How long a planned stop waits for the meeting records to land.
+///
+/// Long enough for a database that is merely busy and short enough that a
+/// database that is gone does not hold a deployment open.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "mediacore", version, about = "Selective forwarding unit")]
@@ -39,8 +46,19 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown())
         .await?;
 
-    sessions.flush();
-    tracing::info!("every meeting record is on the disk");
+    // Bounded, because the store may be a database that is down, and "wait
+    // until it lands" would then be "never shut down". A server that will not
+    // stop is a worse problem than a handful of meetings whose last minute is
+    // missing from the record.
+    if sessions.flush(SHUTDOWN_FLUSH) {
+        tracing::info!("every meeting record is in the store");
+    } else {
+        tracing::error!(
+            owed = sessions.owed(),
+            "the session store did not take these meetings before this server stopped; they are \
+             lost"
+        );
+    }
 
     Ok(())
 }

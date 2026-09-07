@@ -147,6 +147,12 @@ impl Error {
         Self::new(Code::Unimplemented, message)
     }
 
+    /// The server is fine and something it depends on is not. Distinct from
+    /// `internal` on purpose: this one is worth retrying and that one is not.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(Code::Unavailable, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(Code::Internal, message)
     }

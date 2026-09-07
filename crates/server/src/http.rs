@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::Router;
@@ -27,7 +28,8 @@ pub fn router(state: AppState) -> Router {
         // them and nothing to be compatible with. See `sessions.rs`.
         .route(sessions::ROOM_SESSIONS_PATH, get(sessions::of_room))
         .route(sessions::ROOM_SESSION_PATH, get(sessions::current))
-        .route(sessions::SESSION_PATH, get(sessions::one));
+        .route(sessions::SESSION_PATH, get(sessions::one))
+        .route(sessions::SESSION_RECORDINGS_PATH, get(sessions::recordings));
 
     // The compatibility route, on by default. It is the same handler, so it
     // answers the same method set with the same grants and the same error
@@ -82,13 +84,26 @@ async fn healthz(State(state): State<AppState>) -> String {
     let sessions = state.registry.sessions();
 
     let delivery = state.delivery.as_ref();
+    let recording = state.recording.as_ref();
+
+    // Where the meetings go, and whether it answered the last time anybody
+    // asked it anything: `files:/var/lib/...`, `postgres:host:5432/db:up`, or
+    // the same with `:down`. A server whose database is away carries calls
+    // perfectly well and records nothing, and this is the field that says which
+    // of those is happening.
+    let store = format!(
+        "{}:{}",
+        sessions.describe(),
+        if sessions.healthy() { "up" } else { "down" }
+    );
 
     format!(
         "rooms={} participants={participants} publishers={} rtp_packets={} rtp_bytes={} \
          tracks={} subscriptions={} forwarded_packets={} forwarded_bytes={} bwe={} \
-         allocated_subscribers={} sessions={} live_sessions={} resident_sessions={} \
-         owed_sessions={} unwritten_sessions={} events={} owed_events={} \
-         undelivered_events={} unwritten_events={} ice={}",
+         allocated_subscribers={} session_store={} sessions={} live_sessions={} \
+         resident_sessions={} owed_sessions={} unwritten_sessions={} events={} owed_events={} \
+         undelivered_events={} unwritten_events={} recording={} unwritten_recordings={} \
+         dropped_audio_packets={} abandoned_recordings={} stuck_recording_work={} ice={}",
         rooms.len(),
         state.publishers.count(),
         media.rtp_packets,
@@ -103,23 +118,31 @@ async fn healthz(State(state): State<AppState>) -> String {
             "off"
         },
         state.bandwidth.count(),
+        store,
+        // How many meetings the store holds. Against a database this is the
+        // whole cluster's, and it is a recent answer rather than a fresh one:
+        // it is a `count(*)`, and scraping health must not be a reason to walk
+        // the table.
         sessions.count(),
+        // Running on this node. Against a database the cluster may be holding
+        // more.
         sessions.live_count(),
         // What the history costs in memory. `sessions` grows for every meeting
         // this server has ever held; this one is meant not to, and an operator
         // watching it climb beside a flat `live_sessions` is watching a leak.
         sessions.resident(),
-        // Records recorded and not yet on the disk. It rises while a burst of
-        // arrivals outruns the disk and falls again; one that stays up is a
-        // disk that cannot keep pace with the meetings held on top of it, and
+        // Records recorded and not yet in the store. It rises while a burst of
+        // arrivals outruns the store and falls again; one that stays up is a
+        // store that cannot keep pace with the meetings held on top of it, and
         // what a crash would cost is however long it stays up.
         sessions.owed(),
         // Not decoration. Every other number here goes up when the server is
         // working; this one goes up when a meeting has been held and will not
         // be there to look up tomorrow, and there is nowhere else an operator
         // would see that. It comes back down if a later write of the same
-        // record lands, so a disk that hiccuped once is not reported for ever
-        // as a meeting that is going to be lost.
+        // record lands, so a store that hiccuped once is not reported for ever
+        // as a meeting that is going to be lost. It is what a database outage
+        // looks like from outside: calls carry on, this climbs.
         sessions.unwritten(),
         state.events.emitted(),
         // Events promised to somebody and not yet taken by them. A number that
@@ -135,6 +158,45 @@ async fn healthz(State(state): State<AppState>) -> String {
         // Outbox records that could not be written: events that are being
         // attempted now and will not be retried after a restart.
         delivery.map_or(0, |delivery| delivery.unwritten()),
+        // Whether this node can record at all, and whether it still can. `off`
+        // is a deployment that means to record and has a configuration problem,
+        // which is otherwise discovered a week later when somebody asks for a
+        // recording. `stopped` is worse and is the one to alert on: the one
+        // thread that writes files is gone, so this node is holding meetings
+        // and recording none of them. Nothing restarts it -- what it was
+        // writing is on the disk for the next start to finish, and the answer
+        // is to restart the process.
+        match recording {
+            None => "off",
+            Some(recording) if recording.recorder.alive() => "on",
+            Some(_) => "stopped",
+        },
+        // Recordings finished on this node and not yet written into the record
+        // store. Above zero means the store is away: the audio and everything
+        // that describes it are on this node's disk, and what the outage costs
+        // is the delay before the object store gets them.
+        recording.map_or(0, |recording| recording.owed.load(Ordering::Relaxed)),
+        // The alertable one. Audio this node threw away because the queue
+        // between the media path and the writer was full, which means the disk
+        // could not keep up with the meetings on top of it. It is bounded on
+        // purpose -- a wedged disk must cost recording and never the calls --
+        // and this is the number that says what the bound cost.
+        recording.map_or(0, |recording| recording.dropped()),
+        // Recordings the writer gave up on because something in them made it
+        // panic. What reaches that thread came off the network from somebody
+        // else's encoder, so anything above zero says a publisher sent
+        // something this server could not handle -- and that it cost one
+        // recording rather than every recording on the node, which is what it
+        // used to cost.
+        recording.map_or(0, |recording| recording.abandoned()),
+        // Recording work in the shared queue that nobody is going to move:
+        // given up on, or waiting for a node that has not come back. The
+        // commonest cause is an upload whose node is gone for good -- the file
+        // is on a disk nobody has, so no other node can do the work -- and
+        // without this it is invisible: the row is not `failed`, it is not
+        // claimed, and every node walks past it for ever. Cluster-wide, and a
+        // recent answer rather than a fresh one.
+        sessions.stuck(),
         state.media.local_addr()
     )
 }

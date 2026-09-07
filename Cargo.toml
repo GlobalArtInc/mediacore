@@ -14,6 +14,7 @@ mediacore-client = { path = "crates/client" }
 mediacore-config = { path = "crates/config" }
 mediacore-events = { path = "crates/events" }
 mediacore-proto = { path = "crates/proto" }
+mediacore-recording = { path = "crates/recording" }
 mediacore-room = { path = "crates/room" }
 mediacore-session = { path = "crates/session" }
 mediacore-sfu = { path = "crates/sfu" }
@@ -28,6 +29,7 @@ futures-util = "0.3"
 hmac = "0.12"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 pbjson = "0.9"
+postgres = "0.19"
 pbjson-build = "0.9"
 pbjson-types = "0.9"
 prost = "0.14"
@@ -50,7 +52,7 @@ rand = "0.9"
 # machine's trust store and in no bundle; `system-proxy`, because a host that
 # reaches the outside through one says so in the environment and nothing else
 # here would read it.
-reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls-native-roots", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls-native-roots", "stream", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order, so a JSON object is written in the order it was built rather
 # than alphabetically. It is the OpenAPI document at /swagger that needs it:
@@ -66,7 +68,7 @@ tempfile = "3"
 thiserror = "2"
 tokio-tungstenite = "0.29"
 tower-http = { version = "0.7", features = ["cors", "set-header"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

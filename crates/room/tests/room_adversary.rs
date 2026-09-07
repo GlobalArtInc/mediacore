@@ -29,7 +29,7 @@ impl Deref for Harness {
 
 fn registry(defaults: RoomDefaults) -> Harness {
     let records = tempfile::TempDir::new().expect("a directory for session records");
-    let sessions = SessionStore::open(records.path()).expect("an empty session store opens");
+    let sessions = SessionStore::files(records.path()).expect("an empty session store opens");
 
     Harness {
         registry: Registry::new(defaults, Arc::new(sessions), Arc::new(Bus::new())),
@@ -152,7 +152,7 @@ fn switching_the_session_policy_off_calls_the_countdown_off() {
 
     // The backoffice decides the meeting is open ended after all and sends
     // `{"sessionPolicy":{"minHumans":0}}` through UpdateRoomMetadata.
-    registry.set_session_policy(&room, Some(0), None);
+    registry.set_session_policy(&room, Some(0), None, None);
     assert_eq!(room.settings().min_humans, 0);
     assert_eq!(
         room.session_ends_at_ms(),

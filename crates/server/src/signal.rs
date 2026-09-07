@@ -90,6 +90,10 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
     let spec = ParticipantSpec {
         identity: requested.clone(),
         name: claims.display_name().to_owned(),
+        // Read once, here, where the token is already parsed. Everything
+        // downstream -- the roster, the meeting record, a recording -- takes it
+        // from the participant rather than parsing the token again.
+        account_id: claims.account_id().map(str::to_owned),
         metadata: claims.metadata.clone(),
         attributes: claims.attributes.clone(),
         permission: permission_from(&claims.video),

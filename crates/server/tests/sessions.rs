@@ -562,6 +562,48 @@ async fn a_meeting_a_token_may_not_read_is_a_meeting_that_does_not_exist() {
     );
 }
 
+/// The recordings of a meeting are the meeting's, and the same token reads
+/// both or neither.
+///
+/// The list is what a consumer that missed a `recording_ready` event asks
+/// instead, so it has to be a read anybody who may read the meeting can make --
+/// and a read nobody else can, including as a way of finding out that an id is
+/// real.
+#[tokio::test]
+async fn a_meetings_recordings_are_read_by_whoever_may_read_the_meeting() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+
+    let id = get(addr, &room_path("session"), Some(&lister()))
+        .await
+        .session()["id"]
+        .as_str()
+        .expect("a meeting is running")
+        .to_owned();
+    let path = format!("/api/sessions/{id}/recordings");
+
+    let own = get(addr, &path, Some(&admin(ROOM))).await;
+    assert_eq!(own.status, 200);
+    assert_eq!(
+        own.json()["recordings"],
+        serde_json::json!([]),
+        "this server keeps its meetings in a directory, so it cannot record and has nothing to \
+         list -- and `nothing was recorded` is an answer rather than a failure, or a backoffice \
+         showing every meeting would have to special-case a deployment that records nothing"
+    );
+
+    let stranger = get(addr, &path, Some(&admin("payroll"))).await;
+    assert_eq!(
+        stranger.status, 404,
+        "a token scoped to another room was told this meeting is real, which is all it needs to \
+         walk the id space"
+    );
+    assert_eq!(stranger.code(), "not_found");
+
+    let anonymous = get(addr, &path, None).await;
+    assert_eq!(anonymous.status, 401);
+}
+
 /// The page at `/swagger` lists these endpoints out of `sessions::ENDPOINTS`.
 /// A row in that table that this server does not serve is a documented
 /// endpoint that answers 404, which is worse than an undocumented one.
@@ -599,6 +641,16 @@ async fn every_endpoint_the_page_lists_is_one_this_server_answers() {
             Answer::Perhaps | Answer::One => assert!(
                 answer.json().get("session").is_some(),
                 "`{path}` is documented as returning a `session` and returned {}",
+                answer.json()
+            ),
+            // Empty here, because this server keeps its meetings in a
+            // directory and a directory cannot be an upload queue. "Nothing was
+            // recorded" is the answer to what a meeting recorded, and a
+            // backoffice that shows every meeting must not have to special-case
+            // a 501 for the ones held on a deployment that records nothing.
+            Answer::Recordings => assert!(
+                answer.json()["recordings"].is_array(),
+                "`{path}` is documented as returning a list of recordings and returned {}",
                 answer.json()
             ),
         }

@@ -21,6 +21,27 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+
+    # The session store's queue -- two nodes reaching for the same recording,
+    # and what becomes of one whose claimant died -- is tested against a real
+    # server or it is not tested at all: `FOR UPDATE SKIP LOCKED` is the thing
+    # under test and a mock of it proves nothing. `crates/session/tests/postgres.rs`
+    # makes a database per test against this and drops it afterwards, and it
+    # fails the build if this service is missing rather than skipping quietly.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: mediacore
+          POSTGRES_PASSWORD: mediacore
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mediacore"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,4 +72,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        env:
+          MEDIACORE_TEST_POSTGRES: postgres://mediacore:mediacore@127.0.0.1:5432/postgres
         run: cargo test --workspace

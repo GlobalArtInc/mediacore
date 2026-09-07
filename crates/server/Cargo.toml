@@ -25,6 +25,7 @@ mediacore-auth.workspace = true
 mediacore-config.workspace = true
 mediacore-events.workspace = true
 mediacore-proto.workspace = true
+mediacore-recording.workspace = true
 mediacore-room.workspace = true
 mediacore-session.workspace = true
 mediacore-sfu.workspace = true

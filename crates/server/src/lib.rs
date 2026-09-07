@@ -7,6 +7,7 @@ pub mod media;
 pub mod openapi;
 pub mod peer;
 pub mod publisher;
+pub mod recording;
 pub mod rooms;
 pub mod sessions;
 pub mod signal;

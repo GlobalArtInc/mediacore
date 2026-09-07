@@ -76,6 +76,14 @@ impl VideoGrant {
     }
 }
 
+/// Where an issuer that cannot mint a claim of its own puts the account.
+///
+/// LiveKit's server SDKs build the token for you and offer no way to add a
+/// top-level claim, but every one of them can set `attributes`. An issuer using
+/// one of those has nowhere else to put an account id, so this is read as well
+/// as [`Claims::account_id`] -- the same spelling, one level down.
+pub const ACCOUNT_ATTRIBUTE: &str = "accountId";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Claims {
     pub exp: u64,
@@ -96,6 +104,20 @@ pub struct Claims {
     pub sha256: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// Who the platform that issued this token says this is.
+    ///
+    /// `sub` is what this server calls somebody and is only unique inside one
+    /// room -- two people can be `alice` in two rooms, and one person's second
+    /// tab becomes `alice#2`. This is the account behind them: the same string
+    /// wherever they go, and the thing a recording, a bill or a history hangs
+    /// off. Nothing here checks it or gives it a shape; it is the issuer's
+    /// identifier and this server carries it.
+    #[serde(
+        default,
+        rename = "accountId",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub account_id: String,
 }
 
 impl Claims {
@@ -109,6 +131,31 @@ impl Claims {
         } else {
             &self.name
         }
+    }
+
+    /// The platform account this token was minted for, if it names one.
+    ///
+    /// Read here, once, so that everything downstream -- the roster, the
+    /// meeting record, a recording -- gets it from one place and cannot
+    /// disagree about where it came from. Two places to write it and one place
+    /// to read it: the claim first, and the attribute of the same name for an
+    /// issuer whose SDK will not mint a claim.
+    ///
+    /// `None` when the token carries neither, which is not an error: a
+    /// recorder, an agent and a guest all legitimately have no account, and a
+    /// meeting they were at legitimately happened. What that costs is spelled
+    /// out on `mediacore_session::Member::account_id`.
+    pub fn account_id(&self) -> Option<&str> {
+        [
+            self.account_id.as_str(),
+            self.attributes
+                .get(ACCOUNT_ATTRIBUTE)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ]
+        .into_iter()
+        .map(str::trim)
+        .find(|account| !account.is_empty())
     }
 }
 
@@ -277,6 +324,45 @@ mod tests {
             matches!(verify_join(&token, &keys()), Err(AuthError::NoRoomGrant)),
             "a token with nobody on it must still not be allowed into a room"
         );
+    }
+
+    #[test]
+    fn an_account_comes_out_of_the_claim_or_out_of_the_attributes() {
+        let mut claims = join_claims(now() + 600);
+        assert_eq!(
+            claims.account_id(),
+            None,
+            "a token that names no account has to read as naming none, not as naming an empty one"
+        );
+
+        claims
+            .attributes
+            .insert(ACCOUNT_ATTRIBUTE.to_owned(), "  AC_7  ".to_owned());
+        assert_eq!(
+            claims.account_id(),
+            Some("AC_7"),
+            "an issuer using a LiveKit server SDK has nowhere but the attributes to put this, so \
+             refusing to look there means it can never set it at all"
+        );
+
+        claims.account_id = "AC_1".to_owned();
+        assert_eq!(
+            claims.account_id(),
+            Some("AC_1"),
+            "the claim is the issuer's own field and the attribute is the fallback; reading the \
+             fallback first would let a participant who can set their own attributes overrule it"
+        );
+    }
+
+    #[test]
+    fn an_account_survives_a_round_trip_through_a_token() {
+        let mut claims = join_claims(now() + 600);
+        claims.account_id = "AC_1".to_owned();
+
+        let token = issue("secret-with-enough-length", &claims).unwrap();
+        let verified = verify_join(&token, &keys()).unwrap();
+
+        assert_eq!(verified.account_id(), Some("AC_1"));
     }
 
     #[test]

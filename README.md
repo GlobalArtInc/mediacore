@@ -20,6 +20,7 @@ subscriber gets is the one its own link can carry.
 | M3 | Subscriber transport, packet forwarding | done |
 | M4 | Simulcast, layer selection, dynacast | done |
 | M5 | Bandwidth estimation, allocation and pacing | done, off by default |
+| M5.5 | Meeting records, events, audio recording and upload | done, recording off by default |
 | M6 | Data channels, permissions, own SDKs | not started |
 | M7 | Node registry, signal relay, TURN, drain | not started |
 | M8 | Metrics, load and interop testing | not started |
@@ -81,9 +82,10 @@ held in it. A room created over the API outlives its meetings and holds one afte
 that exists only because somebody walked in goes when they leave — while what happened in it does
 not. A session starts when a room reaches the number of people it needs and ends when it falls below
 and the grace period runs out, and its record carries an id, the room, a start, an end and everybody
-who was there with the times they arrived and left. `GET /api/rooms/<room>/sessions`,
-`GET /api/rooms/<room>/session` and `GET /api/sessions/<id>` answer for it; see
-[Sessions](#sessions).
+who was there with the times they arrived and left and the platform account each of them signed in
+with. `GET /api/rooms/<room>/sessions`,
+`GET /api/rooms/<room>/session`, `GET /api/sessions/<id>` and
+`GET /api/sessions/<id>/recordings` answer for it; see [Sessions](#sessions).
 
 None of that waits for an operator to opt in. With `room.min_humans: 0` — the default, and what the
 deployment runs — the policy is off and the floor is one person, so a meeting is still one stretch of
@@ -92,16 +94,19 @@ applies to it, which is what makes somebody whose network blinked one meeting wi
 than two; `end_grace: 0` ends a meeting the instant its room empties, for a deployment that would
 rather have that.
 
-Records are on disk, one JSON file per meeting under `sessions.directory`, written as the meeting
-goes on rather than emitted once it is over. An event is a notification that state changed and never
+Records are kept where `sessions` says: one JSON file per meeting in a directory, which is right for
+one server process, or in Postgres, which is what a deployment with more than one needs and what any
+deployment that records anything needs. Either way they are written as the meeting goes on rather
+than emitted once it is over. An event is a notification that state changed and never
 the only copy of the fact, so a consumer that was down at half past six has to be able to come back
 and ask what it missed — and records that live in memory die with the process and take that guarantee
 with them. What a restart costs is the *end* of a meeting that was still running: nobody observed it,
 so the record is closed at the last arrival or departure written into it and says
 `"endedBy": "restart"` rather than pretending to a time it does not know.
 
-**And it can be heard about as it happens.** Six events — `room_started`, `room_finished`,
-`participant_joined`, `participant_left`, `session_started` and `session_finished` — go to whoever
+**And it can be heard about as it happens.** Seven events — `room_started`, `room_finished`,
+`participant_joined`, `participant_left`, `session_started`, `session_finished` and
+`recording_ready` — go to whoever
 has asked to be told: an emitter inside the process, webhooks in LiveKit's shape and with LiveKit's
 signing, and a Kafka topic behind a Cargo feature that is off by default. An event is written down
 before it is attempted and struck off only once every destination has taken it, so an endpoint that
@@ -109,6 +114,19 @@ is away for two minutes costs latency rather than two minutes of events. Nothing
 on the path somebody joining a room walks: emitting opens no file, makes no request and waits for
 nothing. Nothing is configured by default, either — with no endpoint and no broker there is no
 outbox, no task and no cost. See [Events](#events).
+
+**A meeting can be recorded, one file per participant, without decoding anything.** The Opus packets
+are already here — this is the SFU — so they go into an Ogg container as they are and into object
+storage as they are: no decoder, no encoder, no resampler, no mixing. The length of a recording comes
+from the sender's own clock rather than from the audio written, so a participant who said nothing for
+two minutes has a recording two minutes *longer* and not two minutes shorter, and a transcript
+aligned against it lands on the right second. Audio is written to a local disk while the meeting runs
+and uploaded whole when a file is finished; then a `recording_ready` event says where the object is,
+and `GET /api/sessions/<id>/recordings` says the same thing to anybody who missed it. Off by default,
+per room when it is on, and it needs a database and a bucket. See [Recording](#recording).
+
+Nothing about it is on the path a packet arrives on: the media path's whole share is a map lookup and
+a bounded queue push, and everything slow happens on a thread and a task that no call can wait for.
 
 One person can be in a room twice. `livekit-client` keys its remote participants by identity
 throughout, so two participants sharing one identity are invisible to every client, ours included;
@@ -625,7 +643,7 @@ and there is none yet.
 ### Sessions
 
 A **session** is one meeting; a **room** is the place it happened in, which outlives it and holds the
-next one — so `/sessions` is plural on purpose. These three are plain `GET`s and not Twirp: LiveKit
+next one — so `/sessions` is plural on purpose. These four are plain `GET`s and not Twirp: LiveKit
 has no session record, so there is no generated client anywhere that would call them and nothing to
 be compatible with. They are on the `/swagger` page all the same, under **Sessions**, because that
 page is where somebody integrating against this server looks.
@@ -635,6 +653,7 @@ page is where somebody integrating against this server looks.
 | `GET /api/rooms/<room>/sessions` | `{"sessions": [ … ], "total": n}`, newest first, one page at a time; an empty list for a room that has never held one. |
 | `GET /api/rooms/<room>/session` | `{"session": { … }}` or `{"session": null}`. No meeting in progress is an answer and not a failure, so it is 200 either way and a poller has one case to handle. |
 | `GET /api/sessions/<id>` | `{"session": { … }}`, or `not_found` (404). |
+| `GET /api/sessions/<id>/recordings` | `{"recordings": [ … ]}` — the audio recorded during that meeting and where it is. An empty list for a meeting that was not recorded. |
 
 They read the record rather than the registry, so a room that no longer exists still answers for the
 meetings it held.
@@ -670,9 +689,9 @@ $ curl -s -H "Authorization: Bearer $TOKEN" \
   "endedBy": "grace",
   "participants": [
     {"sid": "PA_a1b2c3d4e5f6", "identity": "alice", "name": "Alice", "kind": "standard",
-     "joinedAtMs": 1757155188000, "leftAtMs": 1757156650000},
+     "accountId": "AC_9271", "joinedAtMs": 1757155188000, "leftAtMs": 1757156650000},
     {"sid": "PA_9f8e7d6c5b4a", "identity": "bob", "name": "Bob", "kind": "standard",
-     "joinedAtMs": 1757155200000, "leftAtMs": 1757156650000}
+     "accountId": null, "joinedAtMs": 1757155200000, "leftAtMs": 1757156650000}
   ]
 }]}
 ```
@@ -685,6 +704,24 @@ under `alice` and `alice#2`. `kind` is `standard`, `egress` or `agent`, and only
 towards the number of people a room needs — a recorder in the room does not make a meeting, and it is
 in the record anyway, because "was this meeting recorded" is a question somebody asks a month later.
 
+`accountId` is who the platform that issued the token says this is, as opposed to `identity`, which
+is what one room calls them: two people can both be `alice` in two rooms, and one person's second tab
+becomes `alice#2`, while the account is the same string wherever they go and is what a recording, a
+bill or a history hangs off. It comes out of the join token — the `accountId` claim, or an attribute
+of that name for an issuer whose SDK will not mint a custom claim, read once where the token is
+already parsed. It is **not** on the wire to other participants: everybody in the room learns an
+identity, a name and whatever metadata the room chose to publish, and who the platform bills is none
+of their business.
+
+It is `null` when the token carried none, and nothing is refused over that. A recorder and an agent
+have no account by their nature; a guest let in by a token that names nobody has none either, and
+both are legitimate participants in a meeting that legitimately happened. Refusing the join instead
+would mean a platform that forgot one claim could not hold meetings at all, and defaulting it to the
+identity would put a room-scoped name into a field everything downstream treats as an account and
+bills against. So it is `null`, everything that groups by account leaves them out, and the demo front
+end shows the shape of it: sign in and the token carries the provider's subject, type a name into the
+box and it carries nothing.
+
 `joinedAtMs` can be earlier than `startedAtMs`: the first person into a room with a floor of two was
 waiting for the second, and how long they waited is worth knowing. It is never earlier than the
 previous meeting in that room ended, however long ago the connection actually arrived — a recorder
@@ -694,52 +731,329 @@ first. One `sid`'s stretches never overlap, in one record or across two, so addi
 thing it looks like it is. `endedAtMs` can be later than the
 last `leftAtMs` by the length of the grace period, which is the window in which the meeting was still
 theirs to come back to. `endedBy` is `grace` when nobody came back before it ran out — the ordinary
-end — `closed` when the room was deleted under it, and `restart` when the server was still holding
-the meeting when it stopped, in which case `endedAtMs` is the last moment the record knows about, a
-lower bound and never a guess above it.
+end — `closed` when the room was deleted under it, and `restart` when nobody watched this meeting
+end: the server holding it stopped, and either found the record unfinished on its next start or, in a
+deployment with more than one, stopped saying it was alive and had the meeting closed by a node that
+still was. `endedAtMs` is then the last moment the record knows about, a lower bound and never a
+guess above it.
 
-**Where they live.**
+**Where they live: a directory, or a database.**
 
 ```yaml
 sessions:
-  directory: /var/lib/mediacore/sessions
+  directory: /var/lib/mediacore/sessions     # one process
+  postgres:
+    url: postgres://mediacore@db/mediacore   # more than one, or any recording at all
 ```
 
-One file per meeting, named by its id, rewritten in place as the meeting goes on: flushed and then
-renamed over itself, so a reader — including the next start of this server — never sees half of one.
-The directory is created at start and the server refuses to start if it cannot be, because a server
-that answers with an empty list because it never managed to open its own directory is a failure
-nobody discovers until they are asked what happened last week. There is no setting that turns
-recording off. Nothing deletes a record either, and that is why the layout is one self-describing
-file per meeting rather than a database: `find /var/lib/mediacore/sessions -mtime +90 -delete` is a
-real answer for whoever wants a retention policy, and it costs nothing to whoever does not. In a
-container the directory belongs on a volume — `deploy/docker-compose.yml` mounts one — or the history
-ends at the last release.
+Naming a database is what selects it; leaving `postgres.url` empty leaves the server on the directory
+it has always used. One setting rather than a `store:` switch beside a url, because a switch and a
+url can disagree — a deployment that sets one and forgets the other gets a server that quietly
+records into the wrong place, and there is no version of that mistake worth being able to make.
+`/healthz` says which it got: `session_store=files:/var/lib/mediacore/sessions:up`, or
+`session_store=postgres:db:5432/mediacore:up`.
+
+**The directory**, unchanged: one file per meeting, named by its id, rewritten in place as the
+meeting goes on — flushed and then renamed over itself, so a reader, including the next start of this
+server, never sees half of one. It is created at start and the server refuses to start if it cannot
+be, because a server that answers with an empty list because it never managed to open its own
+directory is a failure nobody discovers until they are asked what happened last week. Nothing deletes
+a record, and that is why the layout is one self-describing file per meeting: `find
+/var/lib/mediacore/sessions -mtime +90 -delete` is a real answer for whoever wants a retention policy
+and costs nothing to whoever does not.
+
+**It is right for exactly one server process.** Three cannot share a directory — each holds its own
+index of it and they overwrite each other's records — and, worse, a node that dies takes its
+unfinished meetings out of reach of the two still up: nothing else can close them, and nothing else
+can pick up the recordings they left half-done. So a deployment running more than one process names a
+database, and so does any deployment that records anything, because the upload queue is a thing
+several processes poll and a directory refuses to be one (`this session store cannot hand out work`,
+`501`).
+
+**The database is this server's to create.** There is no migration tool in this workspace and adding
+one for four tables would mean a build-time database or a second binary in the image, a directory of
+files that has to travel with the release, and a second way of being wrong about which version is
+deployed. So the migrations are in the binary, in order, in `crates/session/src/schema.rs`.
+**Upgrading is starting the new binary**: on its first connection it takes a Postgres advisory lock,
+reads `mediacore_schema`, applies whatever it has not got — each in its own transaction — and lets
+go. The other nodes do the same a moment later, find nothing to do and carry on, so three
+simultaneous starts are safe; and the lock is released by Postgres itself if the node holding it
+dies, so a crash mid-upgrade leaves the lock free and the half-applied step rolled back with its
+transaction. There is no down migration and no way to ask for one: going back a release means going
+back to a database from before the upgrade, which is the honest answer for a schema nobody is going
+to reverse correctly under pressure. Every table is prefixed `mediacore_`, so this can be a database
+something else also uses.
+
+**A database that is down does not stop this server.** Not at startup and not mid-call. Nothing on
+the media path goes anywhere near the session store, so refusing to carry calls over a database
+outage would be turning an outage that costs records into one that costs meetings. What actually
+happens: the store queues what it is told, one line a minute says the database is not answering
+(never the connection string — it carries a password), `/healthz` shows
+`session_store=postgres:db:5432/mediacore:down` with `unwritten_sessions=` climbing beside it, and
+everything queued is written when it comes back, oldest edit discarded and newest kept. The two
+endpoints that read history answer `unavailable` (503) meanwhile; `GET /api/rooms/<room>/session`
+keeps working throughout, because the meeting happening now is in memory on the node holding it. The
+one thing that *does* stop the server is a url that is not a url, or one asking for `sslmode=require`
+— TLS to Postgres is not implemented, the database is expected to be on a trusted network, and both
+of those are typos in a config file rather than outages.
+
+**What replaces "close everything unfinished at startup".** A single process could assume that a
+record left open was left open by a process that is gone. Three cannot: a node that made that
+assumption would close the meetings its two colleagues are still holding. So a meeting row carries
+the node holding it and a heartbeat, renewed three times per `lease_ms` while the meeting runs, and
+any node may close a meeting whose heartbeat has stopped — at the last moment that record knows
+about, `endedBy: "restart"`, exactly as the directory does on its next start. The lease is the one
+number that decides how long a dead node's meeting keeps looking live, and it is a trade in both
+directions: too short and a node that is merely busy has its meetings closed under it.
 
 **Written by a thread of its own, and what that costs.** A membership change is recorded in memory
-and handed to a writer thread; nobody joining a room ever waits for a disk. What a *crash* costs on
-top of the usual is a freshness window the width of that hand-off: a record may come back missing its
-last few arrivals and departures, and a meeting that began inside the window may be missing
-altogether. It never comes back saying something that did not happen — each file is written whole,
-flushed and renamed, so a record on disk is always a state the meeting really passed through — and a
-`SIGINT` waits for the queue, so a planned stop loses nothing. The trade is deliberate and this way
-round: the flush used to happen on the thread that was letting somebody into a room, under a lock
-shared by every room on the server, so one busy disk delayed joining everywhere at once. Freshness
-measured in milliseconds is worth less than that.
+and handed to a writer thread; nobody joining a room ever waits for a disk or for a database. What a
+*crash* costs on top of the usual is a freshness window the width of that hand-off: a record may come
+back missing its last few arrivals and departures, and a meeting that began inside the window may be
+missing altogether. It never comes back saying something that did not happen — each write is whole —
+and a `SIGINT` waits up to ten seconds for the queue, so a planned stop loses nothing. The trade is
+deliberate and this way round: the flush used to happen on the thread that was letting somebody into
+a room, under a lock shared by every room on the server, so one busy disk delayed joining everywhere
+at once. A database at the end of a network is that failure again with a longer tail.
+`recording_a_membership_change_never_waits_for_the_store` is the regression test, and it does not
+measure anything: it stops the store dead inside its first write and asserts that two hundred
+membership changes still go through.
 
-**What it costs in memory.** An index of every meeting — id, room, start — and the full record only
-of the meetings running, the ones waiting to be written, and the ones the disk refused. A record
-nobody is at is read back from its file when somebody asks for it, so a server two years into a
-deployment holds a few hundred thousand short strings rather than a few hundred thousand records.
+**What it costs in memory.** The record only of the meetings running on this node and the ones
+waiting to be written. A meeting nobody is at is asked for when somebody asks for it, so a server two
+years into a deployment holds neither two years of files nor two years of rows.
 
-`/healthz` carries `sessions=`, `live_sessions=`, `resident_sessions=`, `owed_sessions=` and
-`unwritten_sessions=`. The last is the one worth an alert: a record that could not be written is
-still served from memory until the process ends and is gone after that, and there is nowhere else an
-operator would find out — it comes back down if a later write of the same record lands, so a disk
-that hiccuped once is not reported for ever as a meeting that is going to be lost. `owed_sessions=`
-is the freshness window: records recorded and not yet on the disk, normally zero, and however long it
-stays up is what a crash would cost. `resident_sessions=` is the memory bound above, and an operator
-watching it climb beside a flat `live_sessions=` is watching a leak.
+`/healthz` carries `session_store=`, `sessions=`, `live_sessions=`, `resident_sessions=`,
+`owed_sessions=` and `unwritten_sessions=`. The last is the one worth an alert: a record that could
+not be written is still served from memory and is retried, and there is nowhere else an operator
+would find out — it comes back down when a write lands, so a store that hiccuped once is not reported
+for ever as a meeting that is going to be lost. `owed_sessions=` is the freshness window, normally
+zero, and however long it stays up is what a crash would cost. `resident_sessions=` is the memory
+bound above, and an operator watching it climb beside a flat `live_sessions=` is watching a leak.
+Against a database, `sessions=` is the whole cluster's count and is a recent answer rather than a
+fresh one — it is a `count(*)`, and scraping health must not be a reason to walk the table — while
+`live_sessions=` is this node's.
+
+### Recordings, and the queue behind them
+
+mediacore's job here is three steps and it stops there: **record the audio, upload it when the
+meeting ends, announce that it is ready**. What anybody does with the announcement — transcribe it,
+bill for it, keep it for seven years — is somebody else's service.
+
+**Nothing is decoded.** The audio arrives as Opus, in RTP packets, with the sender's own timestamps
+on them; it is written into an Ogg container as Opus and uploaded as Opus. No decoder, no encoder, no
+resampler, no mixing: the bytes in the bucket are the bytes the browser produced. That is not a
+shortcut, it is the advantage of being the SFU. A recorder that joins the meeting as a bot cannot do
+it — what an SDK hands a bot is decoded audio, so the bot has to re-encode it, and every recording it
+makes has been through a decoder and an encoder for no reason but where the bot was standing.
+
+**Silence is the thing this gets right.** An Opus sender stops sending while nobody is talking; every
+browser does it, and it is most of a meeting. A recorder that measured a recording by the audio it
+wrote would produce a file shorter than the meeting by however long its participant was quiet, and
+every later word in it would be early by that much, compounding across the meeting — so a transcript
+aligned against such a file drifts, and the drift is invisible. Here the length comes from the
+**sender's clock**: the RTP timestamps drive the Ogg granule positions, and a participant who said
+nothing for two minutes has a recording two minutes *longer*, not shorter.
+
+**Moving the granule is not enough on its own**, and that is worth knowing because it looks as though
+it is. A demuxer does not read a position off every page — it works out where each packet starts by
+adding up the durations of the packets before it, and uses the last granule for the total. A file
+with a granule jump and no packets to account for it therefore *reports* two minutes and hands a
+decoder two seconds with the words pushed together, which is the same misalignment arriving through
+the back door. `ffprobe` says 122 seconds and `ffmpeg -f wav` gives you 2. So the silence is written
+down, as a constant three-byte Opus frame per twenty milliseconds — nothing is encoded and nothing is
+analysed, a sender that says nothing is saying "silence", and this writes that down at the length its
+own clock gives. Decoded, those frames come out at −91 dB, which is the sixteen-bit floor. The cost
+is about 225 bytes per second of silence.
+
+The check that keeps it honest is in every recording test: the durations of the packets in the file
+have to add up to exactly what the file's granule claims. A file where they do not is a file that
+lies to a decoder, and that is not visible from the length alone.
+
+The same arithmetic covers packets that never arrive: the next packet carries its own timestamp, so a
+loss becomes a hole of exactly its own length, filled the same way, and everything after it stays
+where it belongs. Packets that arrive out of order are put back in order in a hundred-millisecond
+buffer before anything is written, because Ogg gives no way to insert a packet into a page that is
+already on the disk; one that turns up after its place has gone past is counted and dropped rather
+than written backwards.
+
+**A timestamp is a number somebody else chose**, and everything above is arithmetic on it. The
+extended timestamp that reaches the recorder is whatever the publisher's encoder said, run through
+str0m's roll-over extension — which reads a step of more than half the 32-bit range as a wrap
+*backwards* and answers with a number near `u64::MAX`, so two packets are enough to produce one. So
+the writer treats it the way it treats any other input from a stranger. A timestamp that goes
+**backwards** inside an open file is refused, because a granule position that decreases is a
+malformed stream and the row beside it would claim a length no decoder agrees with. A timestamp that
+jumps **further forward than the silence that track may still be charged for** closes the file where
+it is, and the next packet begins a new segment with a clock of its own — the same shape as a rejoin,
+with the gap in the offsets rather than as hours of nothing on the disk. The silence budget is four
+hours *per track and not per gap*, which is the difference between bounding one packet and bounding a
+publisher: a ceiling on a single gap bounds nothing at fifty packets a second, and the version before
+this one could be made to write three megabytes and a tenth of a second of writer time per packet,
+for as long as the sender cared to keep sending. And a participant may only produce so many files in
+one meeting, because every file is a row, an object and an event.
+
+Whatever gets past all of that, a panic on the writer thread costs the track it happened in and not
+the node: the track is dropped, the count goes onto `/healthz` as `abandoned_recordings=`, and every
+other recording on the process carries on. That thread is shared by every recording on the node, and
+one publisher must not be able to stop it — which it could, until the arithmetic above overflowed a
+`u64` and took it down in silence.
+
+**Local while the call runs, object storage when it ends.** Appending a page to a local file is
+microseconds; a `PUT` can stall for seconds and has no business near a live call. A file is complete
+when its participant stops publishing — which for most people is the end of the meeting and for
+somebody who left early is earlier, and earlier is better: their audio is safe sooner and the disk
+empties sooner. Then it goes up as one whole object, and only then is anything announced.
+
+**What the media path pays for all this.** A hash-map lookup in a map the publisher's own task owns,
+an atomic increment, and a push into a queue with a bound on it. No lock anything else can hold, no
+allocation of the payload — it arrives behind an `Arc` and stays there — and nothing that can wait.
+Everything after that is a thread of its own and a task of its own. The queue's bound is deliberate:
+if the disk stops, packets are dropped and counted rather than piling up until the process is killed
+for memory, because a node that cannot write is a node that loses recording and must not become one
+that loses meetings. What it drops shows up honestly, as a gap of the right length, because the clock
+in the file is the sender's and not ours. `dropped_audio_packets=` on `/healthz` is the number that
+says it happened. Two tests guard it: one wedges the writer permanently and pushes a thousand packets
+past the bound, and one records nine people through an object store that accepts connections and
+never answers.
+
+**Which tracks.** Opus microphones, and only while a meeting is running. Opus because the packets are
+written through untouched and there is nothing else this server could put in an Ogg Opus stream
+without decoding it. Microphones because a recording is of a person speaking: screen-share audio is
+content, and putting the sound of a shared video into somebody's own file would put it into their
+transcript as their words. Only while a meeting is running, because the first person into a room with
+a floor of two is not in a meeting yet, and what they say while they wait belongs to no record.
+
+**Whether a room is recorded** is a room's own setting, in the metadata beside the rest of its session
+policy: `{"sessionPolicy": {"minHumans": 1, "record": true}}`. `recording.enabled` is what a room that
+says nothing means, so a deployment can record nothing by default and one room by name, or the other
+way round. There is deliberately **no minimum-participants rule for recording**: whether a meeting is
+happening is decided once, by `min_humans`, which goes down to one, and recording follows the meeting.
+A meeting room where everybody sits together and joins from one account has one human in it and is
+recorded like any other. A threshold that could not be set to one is a threshold that loses meetings,
+which is exactly what happened to the conference service next door — its meeting room's meetings
+simply did not appear, with nothing to say why.
+
+**A file that grows very large** becomes several. At `recording.max_segment_mb` the recorder closes
+the file and opens the next segment of the same participant, each a whole Ogg file with its own offset
+into the meeting and its own object. It is a ceiling and not a target: Opus at the bitrate a browser
+sends is a few megabytes an hour, so a full day of one participant is tens of megabytes and an
+ordinary meeting never comes near it. What it bounds is the meeting nobody ever leaves and the
+publisher sending far more than it should.
+
+**What a node finds on its disk when it comes back.** Everything it was writing, and enough beside it
+to finish the job. Each recording carries a small JSON sidecar naming the meeting, the participant and
+the rest of the row, written when the file opens and rewritten when it closes — so nothing about
+recording touches the database while a meeting is happening, and a database that is away costs a delay
+and not a recording. On the next start the directory is walked: a half-written file is cut back to its
+last whole page and closed (no decoding — the last good page's granule position is how much audio it
+holds), the node writes its own name onto the row so the upload is offered to a process that can
+actually see the file, and the lot goes into the queue. Telling the store twice is telling it once,
+because a recording is keyed on `(meeting, participant, segment)`.
+
+The directory belongs to **one process**, exactly like `sessions.directory` and for the same reason:
+two sharing it would each finish the other's live recordings at startup. What several nodes share is
+the database and the bucket.
+
+A recording is one stretch of one participant's audio and one file: `(meeting, participant, segment)`
+names it exactly once, so a recorder that was restarted and writes the same segment down again under
+a new id lands on the row it already wrote rather than beside it. The row carries where the file is
+on the node that made it, the object key once it has one, its size, its sample rate and channels, and
+its start and end both absolutely and as an offset into the meeting — the absolute times answer "when
+was this said" and the offset answers "how far into the recording of that meeting is it", which is
+what lines several participants' files up without every reader having to fetch the meeting and
+subtract. **The audio is never in the database**; a row names a file.
+
+Beside each recording are two rows of work, `upload` and `announce`, which exist from the moment the
+recording does — so "what is happening to this file" is always two rows and never a missing one. They
+are separate because they fail differently: an object store that is full and a consumer that is not
+listening are two outages, and a recording that went up but was not announced must not be uploaded
+again to get the announcement retried. Each carries its attempts, when it is next due, when it was
+finished, and what went wrong the last time. The order is enforced rather than hoped for: `upload` is
+blocked until the file is closed, because a half-written file in an object store is worse than a late
+one — nothing downstream can tell it is half a file — and `announce` is blocked until the upload
+finishes, in the same transaction that finishes it, so there is no moment in which a file is up and
+nothing is going to say so.
+
+**How two pollers do not take the same row.** The claim picks rows with `SELECT … FOR UPDATE SKIP
+LOCKED`, so the second poller does not queue behind the first's locks and does not see the rows it
+holds — it walks past them and takes the next ones. Both come back with work, neither comes back with
+the other's, and neither waits.
+
+**The upload goes to the node with the file; the announcement goes to anybody.** `localPath` names a
+file on one node's disk and means nothing anywhere else, so the `upload` stage is offered only to the
+node named on the recording — otherwise every wrong node would spend an attempt discovering the file
+is not there, and after enough of those a perfectly intact recording is `failed`. The announcement
+needs no file, so it is offered to whoever is up, which is what makes a node dying between the two
+cost nothing. The node on a recording is whoever last wrote the row down and not whoever first did:
+the default node id is random per start, so a process that restarts is a different node as far as the
+database is concerned, and the startup scan re-writing its own files is what adopts them back.
+
+**What becomes of a claim whose holder died.** Nothing, until the lease runs out; then the row is due
+again and the next poller to ask gets it. The claim is a time and not a flag, so there is nothing to
+release and therefore nothing that has to be released by the process that is gone. The attempt it
+spent is *not* given back, and that is the point: after `sessions.postgres.attempts` claimants have
+died on one recording it is left alone with `failed` and the last thing anybody said about it, rather
+than going round the cluster for ever taking a node with it each time.
+
+**A claim has an owner and a lifetime, and every operation on it respects both.** Each stage renews
+its claim while it runs — the announcement as well as the upload, because announcing is not a
+function call: it reads the meeting out of the store to find the room's name and the participant's
+identity, so it is slow exactly when the store is slow, which is exactly when a lease runs out under
+it. A claim is given back only by the node still holding it: a claimant whose lease expired inside a
+slow upload is holding nothing by the time it comes back to say it failed, and an unconditional
+put-back would return a *finished* announcement to the queue to be emitted again, or clear a live
+claimant's lease while it is still uploading. And a node never starts a second copy of work it is
+already doing, which the database cannot tell apart from a node that crashed and came back under the
+same name.
+
+**Work nobody can pick up is visible.** An upload is offered only to the node whose disk holds the
+file, so a node that never comes back leaves a row that is not `failed`, is not claimed, and that
+every other node walks past — with the announcement behind it blocked for ever. It stays that way on
+purpose: no other node can do the work, so handing it round would only spend its attempts and end in
+`failed` with the audio still on a disk nobody has. What it does not do is stay quiet. The store
+counts such rows, `/healthz` carries them as `stuck_recording_work=`, and a line a minute says how an
+operator frees one — clearing `node` on the recording offers it to whoever asks, and that one
+honestly reports the file is not there.
+
+**Which of these tests touch real SQL, plainly.** Everything in `crates/session/src/lib.rs` runs
+against memory or a temporary directory: where a meeting begins and ends, one connection never being
+in two meetings at once, the join path never waiting on the store, a store that is away costing
+records and not calls. None of it executes a line of SQL. Everything in
+`crates/session/tests/postgres.rs` runs against a real Postgres and nothing else: the schema arriving
+on an empty database and a second node finding nothing to do, a meeting written by one node and read
+by another, a participant who joins twice coming back as two stretches, a meeting whose node stopped
+being closed by the node that is still up, a meeting whose node is still here *not* being closed
+under it, two claimants never taking the same row, a claim whose holder disappeared coming back and
+then being left alone, a claim that has gone not being given back by the node that lost it, the two
+stages in order, an upload offered only to the node whose disk holds the file while the announcement
+is offered to anybody, an upload waiting on a node that never came back being counted rather than
+sitting there in silence, a node that comes back under a new name adopting its own recordings, and a
+room's history paged out of SQL. `FOR UPDATE SKIP LOCKED` is the thing under test there, and a mock
+of it would prove nothing about it.
+
+**And which of the recording tests touch anything at all.** Everything in `crates/recording` runs
+against a temporary directory and, for the object store, an HTTP server the test starts and drives
+into whichever state it wants — refusing twice and then working, or accepting the connection and
+never answering. Nothing there needs a bucket or a database: what those tests are about is the ladder
+on top of the queue, not the queue, and the queue's own promises are held against real SQL where they
+mean something.
+
+```
+MEDIACORE_TEST_POSTGRES=postgres://mediacore:mediacore@127.0.0.1:5432/postgres \
+    cargo test -p mediacore-session
+```
+
+Each test makes a database of its own and drops it afterwards, so they do not see each other's
+meetings and can run at the same time. Without the variable they do nothing and say so — and because
+a test that quietly does nothing is how a queue ends up untested, one of them fails the build when
+the variable is missing on CI. The workflow starts a Postgres service for exactly that reason.
+
+The signature that goes on every upload has a known-answer test in `crates/recording/src/s3.rs`,
+against AWS's own published `ListUsers` example and checked independently with `openssl` before it
+was written down. It is the only thing standing between a hand-written SigV4 and a deployment that
+records for a day and cannot upload any of it, so it asserts the exact bytes rather than that
+something plausible came out.
 
 ### The page at `/swagger`
 
@@ -819,7 +1133,7 @@ what an event is — and the answer to that is not a cleverer delivery, it is th
 under `/api/rooms/<room>/sessions` and the room is still in `ListRooms` when the consumer comes back.
 Everything below is built on being allowed to fail, loudly, without losing anything.
 
-Six names. Four are LiveKit's, spelled the way LiveKit spells them:
+Seven names. Four are LiveKit's, spelled the way LiveKit spells them:
 
 | Event | When |
 |---|---|
@@ -829,12 +1143,39 @@ Six names. Four are LiveKit's, spelled the way LiveKit spells them:
 | `participant_left` | somebody is not, with LiveKit's `disconnectReason` on the participant |
 | `session_started` | a meeting began: the room reached the number of people it needs |
 | `session_finished` | a meeting ended: nobody came back before the grace period ran out, or the room was taken away under it |
+| `recording_ready` | one participant's audio from one meeting is in the object store and can be fetched |
 
-The last two are for the thing LiveKit has no concept of. A room is a place and a session is the
+The last three are for things LiveKit has no concept of. A room is a place and a session is the
 meeting held in it, so `room_started` fires when the place is made — which for a room created the
 night before is not remotely when the meeting began. A hidden participant produces its events like
 anybody else: a recorder is invisible to the people in the room on purpose, and not to whoever is
 billing for the recording.
+
+`recording_ready` is deliberately not called `recording_finished`. What it says is not that a
+recorder stopped, it is that **an object exists**: the file is closed when the participant stops
+publishing and the object appears when the upload finishes, minutes apart, and a consumer that
+fetched on the first of those would find nothing there. It carries the bucket and key, which meeting
+and which participant, and where the audio sits inside the meeting — enough to fetch the object and
+line it up without a call back to this server. It is **at least once**: a node that emits it and stops
+before marking the row done has it emitted again by whoever claims the row next, which is the right
+way round, because a duplicate costs a consumer one repeated fetch and a loss costs it a recording it
+never hears about.
+
+```json
+{"event":"recording_ready",
+ "id":"EV_7b2c9f10ad33","createdAt":"1757156802",
+ "recording":{
+   "id":"RE_4c1de9f0aa21","session":"SE_3f9a1c04b7de","room":"standup",
+   "participant":"PA_a1b2c3d4e5f6","identity":"alice","accountId":"AC_9271","segment":0,
+   "bucket":"meetings","objectKey":"SE_3f9a1c04b7de/PA_a1b2c3d4e5f6-0.ogg",
+   "bytes":6291456,"contentType":"audio/ogg","sampleRate":48000,"channels":1,
+   "startedAtMs":1757155200000,"endedAtMs":1757156740000,
+   "offsetMs":0,"durationMs":1540000}}
+```
+
+Everything in it is also at `GET /api/sessions/<id>/recordings`, which is what a consumer that was
+down when this was sent asks instead. That is the rule this whole subsystem is built on and it is not
+negotiable: an event notifies, and it is never the only copy of a fact.
 
 ### The shape on the wire
 
@@ -1032,6 +1373,76 @@ climbs while one is away; `undelivered_events` is how many nobody will ever get,
 an alert; `unwritten_events` is outbox records that could not be written, which is durability lost
 rather than delivery lost.
 
+## Recording
+
+```yaml
+sessions:
+  postgres:
+    url: postgres://mediacore:secret@postgres/mediacore
+
+recording:
+  enabled: false
+  directory: /var/lib/mediacore/recordings
+  max_segment_mb: 256
+  reorder_hold_ms: 100
+  queue: 8192
+  poll_interval_ms: 2000
+  batch: 4
+  keep_local: false
+  s3:
+    endpoint: https://objects.internal:9000
+    region: us-east-1
+    bucket: meetings
+    access_key_id: mediacore
+    secret_access_key: secret
+    path_style: true
+    prefix: ""
+    timeout_ms: 300000
+```
+
+`s3.timeout_ms` is a **total** deadline for one `PUT` — from the first connection attempt to the last
+byte of the answer — so it is a number about `max_segment_mb` and about the link to the bucket, and
+the server refuses to start unless it gives the segment ceiling at least a megabyte a second. It used
+to be `sessions.postgres.timeout_ms`, which is a number about how long one SQL statement may hold a
+connection: ten seconds of it asked an ordinary two-hour participant's thirty megabytes to move at
+24 Mbit/s, and a segment that could not make it failed every attempt and was given up on with the
+audio still on the node's disk.
+
+`enabled` is what a room that says nothing about recording means, not a master switch: a room asks
+for itself with `{"sessionPolicy": {"record": true}}` in its metadata, beside `minHumans`, and what
+the room says wins. The two live together because they are one decision — recording follows the
+meeting, and `minHumans` is the only threshold there is.
+
+Recording needs `sessions.postgres.url`: an upload is a row several processes claim, and a directory
+of one JSON file per meeting cannot be a queue. Naming a bucket without a database behind it, or
+`enabled: true` without either, is refused at startup rather than discovered a week later when
+somebody asks for a recording. `directory` belongs on a volume for the same reason the sessions
+directory does, and more sharply: what would go with the container is every recording not yet
+uploaded.
+
+An object goes to `<prefix>/<session id>/<participant sid>-<segment>.ogg` — Ogg with Opus inside it,
+`audio/ogg`, exactly as it came off the wire. The key is a function of the row and the row carries the
+key, so an object can be found from a row and a row from an object without asking anything in
+between. Requests are signed with SigV4 and streamed off the disk rather than read into memory;
+there is no multipart, because a single `PUT` takes five gigabytes and a recording is never within
+two orders of magnitude of that.
+
+`/healthz` carries five more fields. `recording` is `on`, `off` or `stopped`. `off` is a deployment
+that means to record and has a configuration problem, and it is the sort otherwise discovered a week
+later; `stopped` is worse and is the one to alert on, because it means the one thread that writes
+files is gone and this node is holding meetings and recording none of them. `unwritten_recordings` is
+how many finished recordings this node has not yet managed to write into the record store, which
+climbs while the database is away and costs a delay rather than a recording, since the audio and its
+sidecar are on the disk. `dropped_audio_packets` is audio thrown away because the queue between the
+media path and the writer was full, which means the disk could not keep up with the meetings on top
+of it — or that the writer is gone, which is why a packet that cannot be handed over is counted here
+rather than quietly returned. `abandoned_recordings` is recordings the writer gave up on because
+something in them made it panic: what reaches that thread came off the network from somebody else's
+encoder, so anything above zero says a publisher sent something this server could not handle, and
+that it cost one recording rather than every recording on the node. `stuck_recording_work` is
+cluster-wide rather than this node's: work in the shared queue that has been given up on, or is
+waiting for a node that has not come back.
+
 ## Running
 
 ```
@@ -1055,9 +1466,15 @@ starts from and any of them can be overridden per room by whoever creates it.
 only clock the registry has, and both timeouts and the session policy are enforced from it, so
 turning it up is turning off the only thing that ends a room by itself.
 
-`sessions.directory` is where the record of every meeting is kept, one JSON file per meeting. It is
-created at start, the server refuses to start if it cannot be, and there is no value that turns
-recording off; in a container it belongs on a volume. See [Sessions](#sessions).
+`sessions` is where the record of every meeting is kept, and naming `postgres.url` is what chooses
+between the two stores: empty and it is `directory`, one JSON file per meeting, created at start with
+the server refusing to start if it cannot be, and in a container belonging on a volume; set and it is
+a database every server process shares, whose schema this server creates and migrates itself and
+whose being down stops neither startup nor a call. `postgres.connections`, `timeout_ms`, `lease_ms`
+and `attempts` are how many connections a node opens, the cap on one statement, how long a node's
+meetings and upload claims are believed without a heartbeat, and how many times one recording's
+upload is handed out before it is left alone. There is no value that turns recording a meeting off.
+See [Sessions](#sessions).
 
 The `events` block is who is told what happens as it happens: `webhooks.urls` and `kafka.brokers` are
 the destinations, `directory` is the outbox that holds what has been promised and not yet taken, and
@@ -1142,7 +1559,8 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/auth` | access tokens and grants |
 | `crates/config` | YAML configuration |
 | `crates/room` | rooms and their lifecycle, participants, tracks, subscription intent, signalling fan-out |
-| `crates/session` | the record of what happened in a room: one meeting per file on disk, and the store that keeps them |
+| `crates/session` | the record of what happened in a room, in a directory or in Postgres: where a meeting begins and ends, the recordings hanging off one, and the queue of work that follows them |
+| `crates/recording` | the audio itself: Opus packets into an Ogg container without decoding them, the writer thread, what a crash leaves on the disk, and the upload to object storage |
 | `crates/events` | announcing what happened: the in-process emitter, the outbox, the webhook and Kafka deliveries |
 | `crates/transport` | ICE, DTLS-SRTP, RTP intake and egress, one task per peer connection |
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
@@ -1151,8 +1569,10 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/front` | the browser front end: one page, an audio room, a token endpoint, and an optional OpenID Connect sign-in |
 
 `crates/session` knows nothing about rooms — it is handed a roster and works out what that means for
-a meeting — which is why the dependency runs from `crates/room` to it and never back. It is also
-where *when a meeting begins and ends* is decided, once: a room that armed a second countdown on a
+a meeting — which is why the dependency runs from `crates/room` to it and never back. It has two
+stores under one front door, a directory and a database, and the reason they are one type is that the
+thing worth having only once lives above them: *when a meeting begins and ends* is decided in memory,
+in `SessionStore::note`, whichever store the records end up in. It is decided once: a room that armed a second countdown on a
 second condition disagreed with it, and the shape of that disagreement was a record closed under
 people still sitting in the room, so `Room::session_ends_at_ms` reads the store's deadline rather
 than keeping one. Every change to a room's membership or its policy is handed over under the registry

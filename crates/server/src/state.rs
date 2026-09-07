@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use mediacore_config::{BweConfig, Config, DuplicateIdentity};
 use mediacore_events::{Bus, Delivery};
 use mediacore_proto::mediacore;
 use mediacore_room::{Registry, RoomDefaults};
-use mediacore_session::SessionStore;
+use mediacore_session::{PostgresSettings, SessionStore};
 
 use mediacore_sfu::SelectorConfig;
 use mediacore_transport::{Bitrate, BweSettings};
@@ -16,6 +17,7 @@ use crate::events;
 use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
+use crate::recording::Recording;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +35,11 @@ pub struct AppState {
     /// this process has asked to be told anything. Owned here for the same
     /// reason the caretaker is: the last clone going takes the tasks with it.
     pub delivery: Option<Arc<Delivery>>,
+    /// The recorder, the writer thread behind it and the task that uploads what
+    /// it produces, or `None` when this deployment records nothing. Held here
+    /// so that the media path can find a track's tap without a lookup through
+    /// the registry, and so that the last clone going takes the tasks with it.
+    pub recording: Option<Arc<Recording>>,
     /// The registry's clock, held here so that it lives exactly as long as the
     /// server does. Nothing reads it; dropping the last `AppState` stops it.
     _caretaker: Arc<Caretaker>,
@@ -57,19 +64,26 @@ impl AppState {
     /// week; a server that emits into an outbox it could not open is the same
     /// failure again, discovered during the outage the outbox was for.
     ///
+    /// A database that is *down* is the one thing here that does not fail the
+    /// start. It is not a mistake anybody made, it is an outage -- and nothing
+    /// on the media path goes anywhere near the session store, so a server that
+    /// refused to carry calls over it would be turning an outage that costs
+    /// records into one that costs meetings. See
+    /// [`mediacore_session::SessionStore::postgres`].
+    ///
     /// The order matters in one place: the delivery machinery registers as a
     /// listener before the registry exists, so there is no window in which a
     /// room announces something nobody is queued to hear.
     pub fn with_media(config: Config, media: MediaEngine) -> anyhow::Result<Self> {
-        let sessions = SessionStore::open(&config.sessions.directory).with_context(|| {
-            format!(
-                "opening the session records in {}",
-                config.sessions.directory.display()
-            )
-        })?;
+        let sessions = Arc::new(open_sessions(&config)?);
+        tracing::info!(store = %sessions.describe(), "meeting records are kept here");
 
         let events = Arc::new(Bus::new());
         let delivery = events::start(&config, &events)?;
+        // Before the registry, for the same reason the delivery machinery is:
+        // it listens for meetings starting, and a listener registered after the
+        // registry exists could miss the first one.
+        let pending = crate::recording::prepare(&config, &events)?;
 
         let registry = Registry::new(
             RoomDefaults {
@@ -79,13 +93,19 @@ impl AppState {
                 max_participants: config.room.max_participants,
                 min_humans: config.room.min_humans,
                 end_grace: config.room.end_grace,
+                record: config.recording.enabled,
                 duplicate_identity: duplicate_identity(config.room.duplicate_identity),
             },
-            Arc::new(sessions),
+            Arc::clone(&sessions),
             Arc::clone(&events),
         );
 
         let registry = Arc::new(registry);
+        let recording = pending.map(|pending| {
+            Arc::new(crate::recording::start(
+                pending, &registry, &sessions, &events,
+            ))
+        });
         let caretaker = Caretaker::start(Arc::clone(&registry), config.room.sweep_interval());
 
         Ok(Self {
@@ -97,6 +117,7 @@ impl AppState {
             bandwidth: Arc::new(Subscribers::default()),
             events,
             delivery,
+            recording,
             _caretaker: Arc::new(caretaker),
         })
     }
@@ -117,6 +138,39 @@ impl AppState {
             upgrade_hold: self.config.video.layer_upgrade_hold(),
         }
     }
+}
+
+/// Builds whichever store the config named.
+///
+/// The url decides: with one, the records go to a database every process
+/// shares; without one, to a directory this process owns. There is no third
+/// choice and no switch to disagree with -- see
+/// [`mediacore_config::SessionConfig`].
+fn open_sessions(config: &Config) -> anyhow::Result<SessionStore> {
+    let settings = &config.sessions;
+
+    if settings.in_postgres() {
+        return SessionStore::postgres(PostgresSettings {
+            url: settings.postgres.url.clone(),
+            // The node id is on every meeting this server holds and every piece
+            // of work it claims, which is what makes "who was holding this when
+            // it stopped" a question with an answer.
+            node: config.node_id.clone(),
+            connections: settings.postgres.connections as usize,
+            timeout: Duration::from_millis(settings.postgres.timeout_ms.into()),
+            lease: Duration::from_millis(settings.postgres.lease_ms.into()),
+            attempts: settings.postgres.attempts,
+        })
+        .map_err(anyhow::Error::msg)
+        .context("the session database");
+    }
+
+    SessionStore::files(&settings.directory).with_context(|| {
+        format!(
+            "opening the session records in {}",
+            settings.directory.display()
+        )
+    })
 }
 
 fn duplicate_identity(setting: DuplicateIdentity) -> mediacore_room::DuplicateIdentity {

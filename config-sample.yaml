@@ -57,24 +57,209 @@ room:
   sweep_interval_ms: 1000
 
 sessions:
-  # Where the record of every meeting is kept: one JSON file per meeting, named
-  # by its session id. A meeting is one stretch of a room being occupied, and a
-  # room holds many of them one after another, so the record outlives the room
-  # — including a room that only ever existed because somebody walked into it
-  # and went away with them. Read back at /api/rooms/<room>/sessions,
-  # /api/rooms/<room>/session and /api/sessions/<id>.
+  # Where the record of every meeting is kept. A meeting is one stretch of a
+  # room being occupied, and a room holds many of them one after another, so
+  # the record outlives the room — including a room that only ever existed
+  # because somebody walked into it and went away with them. Read back at
+  # /api/rooms/<room>/sessions, /api/rooms/<room>/session and
+  # /api/sessions/<id>.
   #
   # There is no setting that turns this off. Records are written as the meeting
   # goes on rather than emitted when it ends, because a consumer that was down
   # at half past six has to be able to come back and ask what it missed.
   #
-  # The directory is created at start and the server refuses to start if it
-  # cannot be. Relative paths are relative to the working directory, which is
-  # right for a checkout and wrong for a container: in a container name a path
-  # on a volume, or the records go with the next release. Nothing here deletes
-  # a record — one small file per meeting, pruned with `find -mtime +90
-  # -delete` by whoever wants them pruned.
+  # WHICH STORE. Naming a database in postgres.url below selects it; leaving it
+  # empty leaves this server on the directory of files. One setting rather than
+  # a switch beside a url, because a switch and a url can disagree and there is
+  # no version of that mistake worth being able to make.
+  #
+  # A deployment running MORE THAN ONE server process has to name a database.
+  # Three processes cannot share a directory: each holds its own index of it,
+  # they overwrite each other's records, and a node that dies takes its
+  # unfinished meetings out of reach of the ones still up. So does a deployment
+  # that wants RECORDINGS, whose upload queue is a thing several processes poll
+  # and which a directory therefore refuses to be.
+
+  # One JSON file per meeting, named by its session id, when no database is
+  # named. Created at start, and the server refuses to start if it cannot be.
+  # Relative paths are relative to the working directory, which is right for a
+  # checkout and wrong for a container: in a container name a path on a volume,
+  # or the records go with the next release. Nothing here deletes a record —
+  # one small file per meeting, pruned with `find -mtime +90 -delete` by
+  # whoever wants them pruned.
   directory: sessions
+
+  postgres:
+    # A libpq connection string, or empty for no database at all. It carries a
+    # password in every deployment that has one and is never logged: what the
+    # server prints is the host, port and database it parsed out of it.
+    #
+    # THE DATABASE BEING DOWN DOES NOT STOP THIS SERVER. Not at startup and not
+    # mid-call: nothing on the media path goes near this. What an outage costs
+    # is the records held during it, which are kept in memory and written when
+    # it comes back — watch unwritten_sessions= on /healthz, and
+    # session_store=postgres:host:5432/db:down beside it.
+    #
+    # THE SCHEMA IS THIS SERVER'S TO CREATE. It applies whatever migrations the
+    # database has not got on its first connection, under a lock the cluster
+    # shares, so three nodes starting at once is safe and an upgrade is "start
+    # the new binary". Every table is prefixed mediacore_, so this can be a
+    # database something else also uses.
+    #
+    # TLS is not implemented: put the database on a trusted network — the same
+    # cluster, which is where it belongs — and leave sslmode out of the url. A
+    # url asking for sslmode=require is refused at startup rather than failing
+    # obscurely at the first connection.
+    url: ""
+
+    # How many connections this node opens, which is also how many statements
+    # it can have in flight. One thread each. Small on purpose: this server
+    # asks very little of a database — a few statements per meeting, and a page
+    # of history whenever somebody opens a backoffice.
+    connections: 4
+
+    # The cap on one connection attempt and on one statement. A query that has
+    # wedged holds one of the connections above this long and no longer.
+    timeout_ms: 10000
+
+    # How long a meeting or an upload claim is believed without being renewed,
+    # and so how quickly a dead node's work comes back to the others. A trade
+    # in both directions: too long and a meeting that ended when a pod was
+    # killed sits open until this elapses; too short and a node that is merely
+    # busy has its meetings closed under it and its uploads taken away
+    # mid-flight. Renewed three times per lease, so it has to be comfortably
+    # more than timeout_ms — the server refuses to start if it is not at least
+    # three times it.
+    lease_ms: 30000
+
+    # How many times one recording's upload or announcement is handed out
+    # before it is left alone. Spent on the claim rather than on the result, so
+    # a file whose upload kills whatever tries it is dropped after this many
+    # nodes have died on it rather than going round the cluster for ever.
+    attempts: 5
+
+recording:
+  # RECORD THE AUDIO, UPLOAD IT WHEN THE MEETING ENDS, ANNOUNCE THAT IT IS
+  # THERE. Three steps, and this server stops there: what anybody does with the
+  # announcement — transcribe it, bill for it, keep it for seven years — is
+  # another service's business.
+  #
+  # NOTHING IS DECODED. The audio arrives as Opus with the sender's own
+  # timestamps on it, is written into an Ogg container as Opus and uploaded as
+  # Opus. No decoder, no encoder, no resampler, no mixing: the bytes in the
+  # bucket are the bytes the browser produced. A recorder outside an SFU cannot
+  # do this — an SDK hands a bot decoded audio and the bot has to re-encode it
+  # — and we are the SFU.
+  #
+  # SILENCE IS KEPT. An Opus sender stops sending while nobody is talking, and
+  # that is most of a meeting. The length of a recording here comes from the
+  # sender's clock and not from the bytes written, so a participant who said
+  # nothing for two minutes has two minutes MORE of recording, not two minutes
+  # less — and a transcript aligned against it lands on the right second.
+  #
+  # This needs sessions.postgres.url: an upload is a row several processes
+  # claim, and a directory of files cannot be a queue. The server refuses to
+  # start otherwise rather than record for a week and upload nothing.
+
+  # Record a room's meetings unless the room says otherwise. THIS IS A DEFAULT,
+  # NOT A MASTER SWITCH: a room overrides it in its metadata with
+  # {"sessionPolicy": {"record": true}}, so a deployment can record nothing by
+  # default and one room by name, or the other way round.
+  #
+  # There is deliberately NO MINIMUM-PARTICIPANTS SETTING here. Whether a
+  # meeting is happening is already decided once, by room.min_humans, which
+  # goes down to one; recording follows the meeting and has no second threshold
+  # of its own. A meeting room where everybody sits together and joins from one
+  # account sets minHumans to 1 and is recorded like any other.
+  enabled: false
+
+  # Where the audio is written while a meeting is happening. Appending a page
+  # to a local file is microseconds; a PUT to object storage can stall for
+  # seconds and has no business near a live call, so nothing goes to the bucket
+  # until a file is finished.
+  #
+  # ONE PROCESS PER DIRECTORY, exactly like sessions.directory: two sharing one
+  # would each finish the other's live recordings at startup. It must be a
+  # volume that outlives the container — a path inside the image is a path
+  # whose contents go with the next release, and what would go with them is
+  # every recording not yet uploaded.
+  directory: recordings
+
+  # How large one file may get before the recorder starts the next segment of
+  # the same participant. A ceiling, not a target: Opus at the bitrate a
+  # browser sends is a few megabytes an hour, so an ordinary meeting never
+  # reaches this. What it bounds is the meeting nobody ever leaves and the
+  # publisher sending far more than it should. Each segment is a whole file
+  # with its own offset into the meeting, uploaded as one object.
+  max_segment_mb: 256
+
+  # How long a packet is held so that ones behind it can catch up. Not a jitter
+  # buffer — nobody is listening to this in real time — just long enough to
+  # undo an ordinary reordering. A packet that arrives after its place has gone
+  # past is dropped, and the hole it leaves is exactly its own length. So is a
+  # packet whose TIMESTAMP goes backwards: a granule position that decreases is
+  # a malformed Ogg stream, and the row beside it would claim a length no
+  # decoder agrees with.
+  reorder_hold_ms: 100
+
+  # How many packets may wait between the media path and the writer thread
+  # before new ones are dropped rather than queued. The bound is why a disk
+  # that has stopped costs audio and not meetings: without it a wedged
+  # filesystem would grow this queue until the process was killed for memory,
+  # and a server that is killed has dropped every call it was carrying. Watch
+  # dropped_audio_packets= on /healthz.
+  queue: 8192
+
+  # How often this node asks for uploads and announcements to do, and how many
+  # it takes at once — which is also how many uploads may be in flight.
+  poll_interval_ms: 2000
+  batch: 4
+
+  # Keep the local file after the object store has it. Off, because a node's
+  # disk is not a second copy anybody agreed to pay for: a server that keeps
+  # every recording fills its volume and then stops recording, which is the
+  # failure that costs meetings rather than bytes.
+  keep_local: false
+
+  s3:
+    # The endpoint, scheme included. MinIO and Ceph answer on their own;
+    # Amazon's is https://s3.<region>.amazonaws.com.
+    endpoint: ""
+
+    # The region the signature is scoped to. An object store with no regions
+    # still wants one in the signature; anything consistent will do.
+    region: us-east-1
+
+    bucket: ""
+
+    # The credentials, beside the api keys above. secret_access_key is never
+    # logged: what a log line says about the object store is its endpoint and
+    # its bucket.
+    access_key_id: ""
+    secret_access_key: ""
+
+    # <endpoint>/<bucket>/<key> rather than <bucket>.<endpoint>/<key>. On,
+    # because the deployments this is built for run their own object store and
+    # both MinIO and Ceph want path style. Amazon's own S3 wants the other one
+    # for buckets made since 2020: set this to false there.
+    path_style: true
+
+    # Put in front of every key, so one bucket can hold this server's
+    # recordings beside something else's. A key is
+    # <prefix>/<session id>/<participant sid>-<segment>.ogg, so an object can
+    # be found from a database row and a row from an object without asking
+    # anything in between.
+    prefix: ""
+
+    # How long one PUT of a whole recording may take. A TOTAL deadline, not an
+    # idle one: the whole of a segment — up to max_segment_mb above — has to be
+    # in the bucket inside this, or the upload fails and is retried
+    # sessions.postgres.attempts times before the recording is given up on with
+    # the audio still on this node's disk and nothing announced. The default
+    # gives max_segment_mb a megabyte a second, which is the slowest link worth
+    # calling a link, and the server refuses to start on a pairing that does not
+    # clear even that.
+    timeout_ms: 300000
 
 events:
   # Who is told what happens, as it happens. Nothing here is on by default: with

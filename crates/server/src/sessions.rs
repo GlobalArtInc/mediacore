@@ -14,11 +14,13 @@
 //! paths, so a refusal here is the same `{"code", "msg"}` object with the same
 //! status mapping as a Twirp error, produced by the same type.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mediacore_auth::Claims;
-use mediacore_session::{DEFAULT_PAGE, MAX_PAGE, Session};
+use mediacore_session::{DEFAULT_PAGE, MAX_PAGE, Recording, Session, StoreError, Work};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -33,6 +35,9 @@ pub const ROOM_SESSION_PATH: &str = "/api/rooms/{room}/session";
 /// One meeting by id, whatever room it was in.
 pub const SESSION_PATH: &str = "/api/sessions/{id}";
 
+/// Everything recorded during one meeting.
+pub const SESSION_RECORDINGS_PATH: &str = "/api/sessions/{id}/recordings";
+
 /// What an endpoint answers with, which is what the page has to describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
@@ -42,6 +47,8 @@ pub enum Answer {
     Perhaps,
     /// `{"session": {...}}`, or a `not_found`.
     One,
+    /// `{"recordings": [...]}`, each with the two pieces of work behind it.
+    Recordings,
 }
 
 /// One endpoint, as this server serves it.
@@ -49,7 +56,7 @@ pub enum Answer {
 /// The same trick as `rooms::METHODS`: the router and the page at `/swagger`
 /// read one table, so an endpoint cannot be documented one way and answer
 /// another. The router takes only the paths from here -- axum wants a handler
-/// per route and the three have different shapes -- so a test walks this table
+/// per route and they have different shapes -- so a test walks this table
 /// and calls every path in it, which is what closes the gap.
 #[derive(Debug, Clone, Copy)]
 pub struct Endpoint {
@@ -62,7 +69,7 @@ pub struct Endpoint {
     pub answer: Answer,
 }
 
-/// The three of them, in the order somebody reads them.
+/// All four, in the order somebody reads them.
 pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         path: ROOM_SESSIONS_PATH,
@@ -107,6 +114,25 @@ pub const ENDPOINTS: &[Endpoint] = &[
              everyone else's meetings.",
         answer: Answer::One,
     },
+    Endpoint {
+        path: SESSION_RECORDINGS_PATH,
+        operation: "ListSessionRecordings",
+        parameter: (
+            "id",
+            "The session id, as `SE_` and twelve hex digits. The same id a \
+             `recording_ready` event carries in its `session` field.",
+        ),
+        summary: "The audio recorded during one meeting, and where it is.",
+        description: "One entry per stretch of one participant's audio: where the object is, how long it \
+             is, and where it sits inside the meeting. **This is what a consumer that missed a \
+             `recording_ready` event asks instead** -- an event notifies, it is never the only \
+             copy of a fact, so nothing that was announced is unavailable to somebody who was not \
+             listening at the time. `objectKey` is null until the upload finishes, and `work` \
+             says why: two rows, `upload` and `announce`, each with its state, how many times it \
+             has been tried and what went wrong the last time. A meeting the caller's token may \
+             not read is answered as one that does not exist, exactly as the meeting itself is.",
+        answer: Answer::Recordings,
+    },
 ];
 
 /// How much of a room's history one call asks for.
@@ -131,34 +157,39 @@ pub async fn of_room(
     Query(window): Query<Window>,
     headers: HeaderMap,
 ) -> Response {
-    answer("ListRoomSessions", || {
-        reading_room(&state, &headers, &room)?;
+    if let Err(error) = reading_room(&state, &headers, &room) {
+        return refused("ListRoomSessions", error);
+    }
 
-        let page = state.registry.sessions().of_room(
-            &room,
-            window.offset.unwrap_or(0),
-            window.limit.unwrap_or(DEFAULT_PAGE).min(MAX_PAGE),
-        );
+    let store = Arc::clone(state.registry.sessions());
+    let offset = window.offset.unwrap_or(0);
+    let limit = window.limit.unwrap_or(DEFAULT_PAGE).min(MAX_PAGE);
 
-        Ok(json(&Sessions {
+    match asked(move || store.of_room(&room, offset, limit)).await {
+        Ok(page) => json(&Sessions {
             sessions: page.sessions,
             total: page.total,
-        }))
-    })
+        }),
+        Err(error) => refused("ListRoomSessions", error),
+    }
 }
 
 /// The meeting running in a room now, if one is.
+///
+/// The only one of the four that asks nothing of the store: the meeting
+/// happening now is in memory, on this node, which is why a poller watching for
+/// a meeting to end gets an answer even while the store is away.
 pub async fn current(
     State(state): State<AppState>,
     Path(room): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    answer("GetRoomSession", || {
-        reading_room(&state, &headers, &room)?;
+    if let Err(error) = reading_room(&state, &headers, &room) {
+        return refused("GetRoomSession", error);
+    }
 
-        Ok(json(&Perhaps {
-            session: state.registry.sessions().live(&room),
-        }))
+    json(&Perhaps {
+        session: state.registry.sessions().live(&room),
     })
 }
 
@@ -173,19 +204,112 @@ pub async fn one(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    answer("GetSession", || {
-        let claims = authenticate(&state, &headers)?;
-        let session = state
-            .registry
-            .sessions()
-            .get(&id)
-            .filter(|session| reads(&claims, &session.room))
-            .ok_or_else(|| Error::not_found(format!("there is no session `{id}`")))?;
+    let claims = match authenticate(&state, &headers) {
+        Ok(claims) => claims,
+        Err(error) => return refused("GetSession", error),
+    };
 
-        Ok(json(&Perhaps {
-            session: Some(session),
-        }))
+    let store = Arc::clone(state.registry.sessions());
+    let wanted = id.clone();
+    let found = asked(move || store.get(&wanted)).await;
+
+    match found {
+        Ok(session) => match session.filter(|session| reads(&claims, &session.room)) {
+            Some(session) => json(&Perhaps {
+                session: Some(session),
+            }),
+            None => refused(
+                "GetSession",
+                Error::not_found(format!("there is no session `{id}`")),
+            ),
+        },
+        Err(error) => refused("GetSession", error),
+    }
+}
+
+/// Everything recorded during one meeting.
+///
+/// Not paged, unlike a room's history: the number of recordings a meeting has
+/// is the number of people who spoke at it, and a meeting with a thousand of
+/// those is not a meeting.
+pub async fn recordings(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&state, &headers) {
+        Ok(claims) => claims,
+        Err(error) => return refused("ListSessionRecordings", error),
+    };
+
+    let store = Arc::clone(state.registry.sessions());
+    let wanted = id.clone();
+    // One trip to the blocking pool for all three reads, and two queries for
+    // the recordings and their work rather than one per recording: a ten-person
+    // meeting has at least ten recordings, and a backoffice opening it should
+    // not cost twenty-one round trips.
+    let found = asked(move || {
+        let Some(session) = store.get(&wanted)? else {
+            return Ok(None);
+        };
+
+        // A store that cannot keep recordings has none, and "none" is the true
+        // answer to what was recorded at this meeting -- so it is an empty list
+        // and not a 501. The refusal matters where somebody tries to *queue*
+        // work on a directory of files; it has no business surfacing on a read
+        // that a backoffice makes about every meeting it shows.
+        Ok(Some((
+            session,
+            allowing_none(store.recordings(&wanted))?,
+            allowing_none(store.meeting_work(&wanted))?,
+        )))
     })
+    .await;
+
+    // Word for word what `one` answers for an id that names nothing, because a
+    // token scoped to another room being told that some id is real but
+    // forbidden is all it needs to walk the id space and learn who met where.
+    let missing = || Error::not_found(format!("there is no session `{id}`"));
+
+    match found {
+        Ok(Some((session, recordings, work))) if reads(&claims, &session.room) => {
+            json(&Recordings {
+                recordings: recordings
+                    .into_iter()
+                    .map(|recording| Made {
+                        work: work
+                            .iter()
+                            .filter(|piece| piece.recording == recording.id)
+                            .cloned()
+                            .collect(),
+                        recording,
+                    })
+                    .collect(),
+            })
+        }
+        Ok(_) => refused("ListSessionRecordings", missing()),
+        Err(error) => refused("ListSessionRecordings", error),
+    }
+}
+
+#[derive(Serialize)]
+struct Recordings {
+    recordings: Vec<Made>,
+}
+
+/// One recording as this endpoint answers with it: the row, and the two pieces
+/// of work behind it flattened onto nothing.
+///
+/// The work is on the recording rather than in a list of its own because the
+/// question it answers is always about one file -- "this one has no object key,
+/// why" -- and pairing them up in the caller is work every caller would do the
+/// same way.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Made {
+    #[serde(flatten)]
+    recording: Recording,
+    work: Vec<Work>,
 }
 
 #[derive(Serialize)]
@@ -202,21 +326,56 @@ struct Perhaps {
     session: Option<Session>,
 }
 
-/// Runs a read and turns a refusal into the same error body the room service
-/// answers with, saying in the log which read it was.
-fn answer(operation: &'static str, read: impl FnOnce() -> Result<Response, Error>) -> Response {
-    match read() {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::info!(
-                %operation,
-                code = error.code.as_str(),
-                message = %error.message,
-                "session read refused"
-            );
-            error.into_response()
-        }
+/// Turns "this store does not keep recordings" into "there are none".
+fn allowing_none<T: Default>(outcome: Result<T, StoreError>) -> Result<T, StoreError> {
+    match outcome {
+        Err(StoreError::Unsupported(_)) => Ok(T::default()),
+        other => other,
     }
+}
+
+/// Runs a read against the store on a thread that is allowed to wait.
+///
+/// The store waits on a disk or on a database. A handler that did that on a
+/// runtime thread would hold up every other request this server is serving --
+/// and against Postgres it would not merely be slow: the blocking client drives
+/// a runtime of its own, and a runtime cannot be started inside a runtime.
+async fn asked<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, Error> {
+    match tokio::task::spawn_blocking(read).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(refusal(error)),
+        Err(error) => Err(Error::internal(format!(
+            "the session read did not finish: {error}"
+        ))),
+    }
+}
+
+/// What a store's refusal looks like to a caller.
+///
+/// A store that is away is `unavailable` and not `internal`, because the two
+/// mean different things to whoever wrote the client: this one is worth trying
+/// again in a minute, and the server is otherwise working -- the meeting the
+/// caller is asking about is very likely still happening.
+fn refusal(error: StoreError) -> Error {
+    match error {
+        StoreError::Unavailable(_) => Error::unavailable(error.to_string()),
+        StoreError::Unsupported(_) => Error::unimplemented(error.to_string()),
+        StoreError::Nonsense(_) => Error::internal(error.to_string()),
+    }
+}
+
+/// Turns a refusal into the same error body the room service answers with,
+/// saying in the log which read it was.
+fn refused(operation: &'static str, error: Error) -> Response {
+    tracing::info!(
+        %operation,
+        code = error.code.as_str(),
+        message = %error.message,
+        "session read refused"
+    );
+    error.into_response()
 }
 
 fn json<T: Serialize>(body: &T) -> Response {
@@ -351,7 +510,13 @@ mod tests {
     fn every_endpoint_on_the_page_is_one_this_module_serves() {
         for endpoint in ENDPOINTS {
             assert!(
-                [ROOM_SESSIONS_PATH, ROOM_SESSION_PATH, SESSION_PATH].contains(&endpoint.path),
+                [
+                    ROOM_SESSIONS_PATH,
+                    ROOM_SESSION_PATH,
+                    SESSION_PATH,
+                    SESSION_RECORDINGS_PATH
+                ]
+                .contains(&endpoint.path),
                 "`{}` is documented at a path this module does not serve",
                 endpoint.path
             );
@@ -367,7 +532,7 @@ mod tests {
 
         assert_eq!(
             ENDPOINTS.len(),
-            3,
+            4,
             "an endpoint was added or removed and the page's table was not told"
         );
     }

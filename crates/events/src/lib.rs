@@ -72,9 +72,9 @@ pub const EVENT_ID_PREFIX: &str = "EV_";
 ///
 /// The first four are LiveKit's own names, spelled the way LiveKit spells
 /// them, because a consumer that already listens to a LiveKit deployment
-/// matches on these strings. The last two are for the concept LiveKit does not
-/// have: a room is a place and a session is the meeting that happened in it,
-/// and `room_started` fires when the place is made, which is not when the
+/// matches on these strings. The last three are for the concepts LiveKit does
+/// not have: a room is a place and a session is the meeting that happened in
+/// it, and `room_started` fires when the place is made, which is not when the
 /// meeting began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +85,15 @@ pub enum Kind {
     ParticipantLeft,
     SessionStarted,
     SessionFinished,
+    /// One participant's audio from one meeting is in the object store and can
+    /// be fetched.
+    ///
+    /// Deliberately not `recording_finished`: what this says is not that a
+    /// recorder stopped, it is that an object exists. The two are minutes apart
+    /// -- the file is closed when the participant stops publishing and the
+    /// object appears when the upload finishes -- and a consumer that fetched
+    /// on the first one would find nothing there.
+    RecordingReady,
 }
 
 impl Kind {
@@ -98,6 +107,7 @@ impl Kind {
             Self::ParticipantLeft => "participant_left",
             Self::SessionStarted => "session_started",
             Self::SessionFinished => "session_finished",
+            Self::RecordingReady => "recording_ready",
         }
     }
 }
@@ -131,6 +141,8 @@ pub struct Event {
     pub participant: Option<mediacore::ParticipantInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<Ready>,
 }
 
 impl Event {
@@ -142,6 +154,7 @@ impl Event {
             room: None,
             participant: None,
             session: None,
+            recording: None,
         }
     }
 
@@ -210,6 +223,14 @@ impl Event {
         }
     }
 
+    /// One recording is in the object store.
+    pub fn recording_ready(recording: Ready) -> Self {
+        Self {
+            recording: Some(recording),
+            ..Self::new(Kind::RecordingReady)
+        }
+    }
+
     /// The name of the room this is about, for a log line and for a Kafka
     /// partition key.
     pub fn room_name(&self) -> &str {
@@ -218,6 +239,9 @@ impl Event {
         }
         if let Some(session) = &self.session {
             return &session.room;
+        }
+        if let Some(recording) = &self.recording {
+            return &recording.room;
         }
 
         ""
@@ -271,6 +295,9 @@ impl Event {
         if let Some(session) = &self.session {
             body.insert("session".to_owned(), encoded(session));
         }
+        if let Some(recording) = &self.recording {
+            body.insert("recording".to_owned(), encoded(recording));
+        }
 
         serde_json::to_vec(&Value::Object(body)).unwrap_or_default()
     }
@@ -284,6 +311,70 @@ impl Event {
 /// -- fail it -- is not a thing it can do.
 fn encoded<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// One participant's audio from one meeting, in the object store.
+///
+/// Written out field by field rather than by embedding the store's own
+/// `Recording`, for two reasons. The row carries `localPath`, which names a
+/// file on one node's disk and is of no use and some risk to anybody outside
+/// this server; and an event is a contract with consumers, so it should not
+/// change every time a column does.
+///
+/// Everything a consumer needs to fetch the object and know what it is: where
+/// it is, which meeting it belongs to, whose voice it is, and where it sits in
+/// the meeting. Everything here is also queryable at
+/// `GET /api/sessions/<id>/recordings`, which is what a consumer that was down
+/// when this was sent asks instead -- an event notifies, it is never the only
+/// copy of a fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ready {
+    /// `RE_` and twelve hex digits.
+    pub id: String,
+    /// The meeting, as `GET /api/sessions/<id>` spells it. Never the room: a
+    /// room holds another meeting tomorrow and this is not a recording of that
+    /// one.
+    pub session: String,
+    /// The room's name, for a consumer that routes by it.
+    pub room: String,
+    /// The participant's sid, which is what the meeting's attendance list is
+    /// keyed by, so this recording can be lined up with the stretch it was made
+    /// during.
+    pub participant: String,
+    /// What the room called them: `alice`, or `alice#2` for a second tab.
+    pub identity: String,
+    /// The platform account behind them, or `null` for a recorder, an agent or
+    /// a guest whose token named nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Which file of this participant's this is, from zero. More than one means
+    /// they left and came back, or they talked for long enough that the file
+    /// was rolled over.
+    pub segment: u32,
+    pub bucket: String,
+    pub object_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// `audio/ogg`, Opus inside it, exactly as it came off the wire -- nothing
+    /// in this server decodes it.
+    pub content_type: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// When the recording started and stopped, on the same clock as the
+    /// meeting.
+    pub started_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    /// Where this file starts inside the meeting, in milliseconds from the
+    /// moment the meeting did. This is what lines several participants' files up
+    /// against one another.
+    pub offset_ms: i64,
+    /// How long the audio is, silences included: a participant who said nothing
+    /// for two minutes has two minutes of file, because the length comes from
+    /// their own sender's clock and not from the bytes written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// Where events are announced, and the only thing the room layer knows about
@@ -522,6 +613,74 @@ mod tests {
             "a meeting outlives its room, so the room's name has to be in the meeting"
         );
         assert!(body.get("room").is_none());
+    }
+
+    fn ready() -> Ready {
+        Ready {
+            id: "RE_0123456789ab".to_owned(),
+            session: "SE_000000000000".to_owned(),
+            room: "standup".to_owned(),
+            participant: "PA_000000000000".to_owned(),
+            identity: "alice".to_owned(),
+            account_id: Some("AC_9271".to_owned()),
+            segment: 0,
+            bucket: "meetings".to_owned(),
+            object_key: "SE_000000000000/PA_000000000000-0.ogg".to_owned(),
+            bytes: Some(6_291_456),
+            content_type: "audio/ogg".to_owned(),
+            sample_rate: 48_000,
+            channels: 1,
+            started_at_ms: 1_757_155_200_000,
+            ended_at_ms: Some(1_757_156_740_000),
+            offset_ms: 0,
+            duration_ms: Some(1_540_000),
+        }
+    }
+
+    /// A consumer has to be able to fetch the object and know what it is
+    /// without calling back, and has to be told the room, which a recording
+    /// row does not carry.
+    #[test]
+    fn a_recording_event_says_where_the_object_is_and_what_it_is_of() {
+        let event = Event::recording_ready(ready());
+        let body: Value = serde_json::from_slice(&event.payload(0)).expect("the payload is json");
+
+        assert_eq!(body["event"], "recording_ready");
+        assert_eq!(body["recording"]["bucket"], "meetings");
+        assert_eq!(
+            body["recording"]["objectKey"],
+            "SE_000000000000/PA_000000000000-0.ogg"
+        );
+        assert_eq!(body["recording"]["session"], "SE_000000000000");
+        assert_eq!(
+            body["recording"]["room"], "standup",
+            "a consumer that routes by room has nothing else to route on: a recording row names \
+             the meeting and the participant's sid and no room at all"
+        );
+        assert_eq!(body["recording"]["identity"], "alice");
+        assert_eq!(body["recording"]["durationMs"], 1_540_000);
+        assert!(
+            body["recording"].get("localPath").is_none(),
+            "the path on one node's disk is of no use outside this server and some risk in it, so \
+             the event is built field by field rather than by handing over the row"
+        );
+        assert!(
+            body["createdAt"]
+                .as_str()
+                .is_some_and(|seconds| seconds.parse::<u64>().is_ok()),
+            "the envelope stays LiveKit's, including a 64-bit field travelling as a quoted \
+             string; a receiver built on protojson refuses a number there"
+        );
+    }
+
+    #[test]
+    fn a_recording_event_names_the_room_it_partitions_by() {
+        assert_eq!(
+            Event::recording_ready(ready()).room_name(),
+            "standup",
+            "a broker partitions on this, and an event with no key goes wherever it likes -- so \
+             one meeting's recordings would arrive out of order with the meeting's own events"
+        );
     }
 
     #[test]

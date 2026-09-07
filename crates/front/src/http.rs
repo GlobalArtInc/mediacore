@@ -490,6 +490,15 @@ async fn token(
         iss: config.api_key.clone(),
         sub: identity.clone(),
         name: name.clone(),
+        // Only for somebody who signed in. The provider's subject is the
+        // account this person has everywhere, as opposed to the identity, which
+        // is what one room calls them -- and a guest who typed a name into the
+        // box has no account at all, which is the ordinary case this field has
+        // to be able to say nothing about.
+        account_id: session
+            .as_ref()
+            .map(|session| session.subject.clone())
+            .unwrap_or_default(),
         video: VideoGrant {
             room_join: Some(true),
             room: room.clone(),

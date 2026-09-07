@@ -93,6 +93,8 @@ pub struct RoomDefaults {
     pub max_participants: u32,
     pub min_humans: u32,
     pub end_grace: u32,
+    /// Whether a room's meetings are recorded when the room does not say.
+    pub record: bool,
     pub duplicate_identity: DuplicateIdentity,
 }
 
@@ -105,6 +107,7 @@ impl Default for RoomDefaults {
             max_participants: 0,
             min_humans: 0,
             end_grace: 90,
+            record: false,
             duplicate_identity: DuplicateIdentity::default(),
         }
     }
@@ -118,6 +121,7 @@ pub struct RoomOptions {
     pub max_participants: Option<u32>,
     pub min_humans: Option<u32>,
     pub end_grace: Option<u32>,
+    pub record: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +132,15 @@ pub struct RoomSettings {
     pub max_participants: u32,
     pub min_humans: u32,
     pub end_grace: u32,
+    /// Whether meetings held in this room are recorded.
+    ///
+    /// Beside `min_humans` rather than anywhere else, because the two are one
+    /// decision: recording follows the meeting, and how many people make a
+    /// meeting is the only threshold there is. A room where everybody sits in
+    /// one place and joins from one account sets `min_humans` to one and is
+    /// recorded like any other -- there is no second minimum that could refuse
+    /// it, which is exactly the rule that lost meetings next door.
+    pub record: bool,
 }
 
 impl RoomSettings {
@@ -143,6 +156,7 @@ impl RoomSettings {
                 .unwrap_or(defaults.max_participants),
             min_humans: options.min_humans.unwrap_or(defaults.min_humans),
             end_grace: options.end_grace.unwrap_or(defaults.end_grace),
+            record: options.record.unwrap_or(defaults.record),
         }
     }
 
@@ -155,6 +169,14 @@ impl RoomSettings {
 pub struct ParticipantSpec {
     pub identity: String,
     pub name: String,
+    /// Who the platform that issued the token says this is, when it said.
+    ///
+    /// Read where the token is parsed and carried from there; nothing in this
+    /// crate looks at it or gives it a shape. It is not part of the profile
+    /// because a profile is what a participant may update about themselves and
+    /// this is not: it is what their token said, and it does not change while
+    /// they are in the room.
+    pub account_id: Option<String>,
     pub metadata: String,
     pub attributes: HashMap<String, String>,
     pub permission: mediacore::ParticipantPermission,
@@ -199,6 +221,13 @@ pub struct Participant {
     /// comparison of what two tokens asked to be called.
     pub requested_identity: String,
     pub kind: ParticipantKind,
+    /// The account behind them, out of their token. `None` when the token
+    /// named none -- a recorder, an agent, or a guest.
+    ///
+    /// Not on the wire. Every other participant learns an identity, a name and
+    /// whatever metadata the room chose to publish; who the platform bills is
+    /// none of their business. It goes into the meeting record and no further.
+    pub account_id: Option<String>,
     pub joined_at_ms: i64,
     profile: Mutex<Profile>,
     version: AtomicU32,
@@ -797,7 +826,12 @@ impl Room {
     /// it, and every decision about a meeting is taken under the registry
     /// lock so that it cannot be taken against a roster that has moved on.
     /// [`Registry::set_session_policy`] is the way in.
-    fn store_session_policy(&self, min_humans: Option<u32>, end_grace: Option<u32>) {
+    fn store_session_policy(
+        &self,
+        min_humans: Option<u32>,
+        end_grace: Option<u32>,
+        record: Option<bool>,
+    ) {
         let mut settings = self.settings.lock().expect("settings lock");
         if let Some(min_humans) = min_humans {
             settings.min_humans = min_humans;
@@ -805,6 +839,37 @@ impl Room {
         if let Some(end_grace) = end_grace {
             settings.end_grace = end_grace;
         }
+        if let Some(record) = record {
+            settings.record = record;
+        }
+    }
+
+    /// Whether meetings held here are recorded.
+    ///
+    /// **Read when a meeting begins, and again whenever a track is published.**
+    /// The first read is the one that decides: it is what binds the meeting to
+    /// the recorder, and a meeting that was not bound records nothing however
+    /// many tracks arrive afterwards. The second is a filter on the media path
+    /// -- a track published into a room that says no gets no tap at all, so
+    /// such a room costs exactly what it cost before recording existed.
+    ///
+    /// So a room whose policy changes while a meeting is running is a room in
+    /// an odd state, and it is worth saying plainly which odd state. Turning
+    /// recording **off** mid-meeting stops taps being opened for tracks
+    /// published after it, while the tracks already being recorded carry on to
+    /// the end of the meeting -- the recording of that meeting is of part of
+    /// it, and nothing in it says which part. Turning it **on** mid-meeting
+    /// opens taps whose packets go nowhere: the recorder was never told the
+    /// meeting began, so every one of them is discarded, and the track says so
+    /// when it ends rather than at the moment somebody changed the setting.
+    ///
+    /// Neither is worth a mechanism to fix. A policy applied to a meeting
+    /// already in progress has no honest answer -- there is no recording of the
+    /// first half to produce -- and the rule that *is* honest is the one this
+    /// server keeps: recording follows the meeting, and a change takes effect
+    /// with the next one.
+    pub fn records(&self) -> bool {
+        self.settings().record
     }
 
     pub fn to_proto(&self) -> mediacore::Room {
@@ -906,6 +971,7 @@ impl Room {
                 identity: participant.identity.clone(),
                 name: participant.name(),
                 kind: participant.kind.to_record(),
+                account_id: participant.account_id.clone(),
                 joined_at_ms: participant.joined_at_ms,
             })
             .collect();
@@ -1546,10 +1612,11 @@ impl Registry {
         room: &Arc<Room>,
         min_humans: Option<u32>,
         end_grace: Option<u32>,
+        record: Option<bool>,
     ) {
         let started = {
             let _rooms = self.rooms.lock().expect("registry lock");
-            room.store_session_policy(min_humans, end_grace);
+            room.store_session_policy(min_humans, end_grace, record);
             room.reassess(now_ms())
         };
 
@@ -1787,6 +1854,7 @@ impl Registry {
                 identity: identity.clone(),
                 requested_identity: spec.identity.clone(),
                 kind: spec.kind,
+                account_id: spec.account_id.clone(),
                 joined_at_ms: now_ms(),
                 profile: Mutex::new(Profile {
                     name: spec.name,
@@ -2149,7 +2217,7 @@ mod tests {
 
     fn registry(defaults: RoomDefaults) -> Harness {
         let records = tempfile::TempDir::new().expect("a directory for session records");
-        let sessions = SessionStore::open(records.path()).expect("an empty session store opens");
+        let sessions = SessionStore::files(records.path()).expect("an empty session store opens");
         let events = Arc::new(Bus::new());
         let listener = events.listen();
 
@@ -3519,7 +3587,16 @@ mod tests {
         registry
             .sessions()
             .of_room(room, 0, mediacore_session::MAX_PAGE)
+            .expect("the session store answers")
             .sessions
+    }
+
+    /// One meeting by id, out of whatever store the registry was given.
+    fn read(registry: &Registry, id: &str) -> Option<mediacore_session::Session> {
+        registry
+            .sessions()
+            .get(id)
+            .expect("the session store answers")
     }
 
     fn attendees(session: &mediacore_session::Session) -> Vec<String> {
@@ -3636,7 +3713,7 @@ mod tests {
 
         assert_eq!(registry.sweep(ends_at).sessions, vec![id.clone()]);
 
-        let session = registry.sessions().get(&id).expect("the record is kept");
+        let session = read(&registry, &id).expect("the record is kept");
         assert_eq!(
             session.ended_at_ms,
             Some(ends_at),
@@ -3754,9 +3831,7 @@ mod tests {
             "no room ended here -- there was no room left to end"
         );
 
-        let record = registry
-            .sessions()
-            .get(&session.id)
+        let record = read(&registry, &session.id)
             .expect("the record of a room that no longer exists is still there to be asked about");
         assert_eq!(record.room, "demo");
         assert!(record.ended_at_ms.is_some());
@@ -3779,7 +3854,7 @@ mod tests {
         let id = registry.sessions().live("demo").expect("a meeting").id;
         assert_eq!(alice.room.settings().min_humans, 0);
 
-        registry.set_session_policy(&alice.room, Some(2), Some(90));
+        registry.set_session_policy(&alice.room, Some(2), Some(90), None);
         let ends_at = alice
             .room
             .session_ends_at_ms()
@@ -3805,7 +3880,7 @@ mod tests {
             "alice's meeting was closed under her and nobody told her"
         );
 
-        let record = registry.sessions().get(&id).expect("the record is kept");
+        let record = read(&registry, &id).expect("the record is kept");
         assert!(
             record
                 .participants
@@ -4012,7 +4087,7 @@ mod tests {
             "the room was deleted and its meeting is still being held open for somebody to come \
              back to a room that is not there"
         );
-        let record = registry.sessions().get(&id).expect("the record survives");
+        let record = read(&registry, &id).expect("the record survives");
         assert_eq!(record.ended_by, Some(mediacore_session::Ending::Closed));
         assert!(
             record
@@ -4625,7 +4700,7 @@ mod tests {
         let bob = registry.join("standup", spec("bob"), bob_tx).unwrap();
         assert_eq!(room.settings().min_humans, 0);
 
-        registry.set_session_policy(&room, Some(2), Some(0));
+        registry.set_session_policy(&room, Some(2), Some(0), None);
         assert!(
             room.session_ends_at_ms().is_none(),
             "the room is full enough, there is nothing to end"
