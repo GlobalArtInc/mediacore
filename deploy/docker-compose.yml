@@ -53,6 +53,12 @@ services:
       # unused until events.webhooks.urls or events.kafka.brokers names
       # somebody. The path matches events.directory in mediacore.yaml.template.
       - events:/var/lib/mediacore/events
+      # Audio being recorded, and recordings not yet uploaded to the bucket.
+      # Outside the image for the sharpest of these reasons: a release during a
+      # meeting would take the meeting's audio with the old container. Empty and
+      # unused until recording is switched on. The path matches
+      # recording.directory in mediacore.yaml.template.
+      - recordings:/var/lib/mediacore/recordings
     ports:
       # Signalling reaches the SFU over the compose network; this mapping is for
       # the operator on the host, not for clients. It is now also the way to
@@ -147,3 +153,4 @@ volumes:
   caddy_config:
   sessions:
   events:
+  recordings:

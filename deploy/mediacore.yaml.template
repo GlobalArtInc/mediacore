@@ -1,6 +1,7 @@
 # Rendered by deploy/start-sfu.sh with envsubst at container start; the result
-# is what mediacore reads. Every ${...} below has to be set, and start-sfu.sh
-# refuses to start if one is empty.
+# is what mediacore reads. start-sfu.sh refuses to start when one of the five
+# required values is empty; the recording ones are optional and render empty,
+# which reads back as "no database, no recording".
 
 port: 7880
 bind_addresses:
@@ -25,33 +26,32 @@ sessions:
   # anything written inside it goes with the old one. docker-compose.yml
   # mounts the `sessions` volume here.
   #
-  # This stack is one SFU process, which is the deployment a directory is right
-  # for. Running more than one, or recording anything at all, means setting
-  # sessions.postgres.url instead and letting this go unused: three processes
-  # cannot share a directory, and the recording upload queue is a thing several
-  # of them poll.
+  # One process keeps meetings in the directory below. More than one process,
+  # or any recording at all, needs the database instead: three processes cannot
+  # share a directory, and the recording upload queue is a thing several of
+  # them poll. Set MEDIACORE_POSTGRES_URL and the directory goes unused.
   directory: /var/lib/mediacore/sessions
+  postgres:
+    url: "${MEDIACORE_POSTGRES_URL}"
 
 recording:
-  # Off in this stack, and it takes more than turning on: recording needs
-  # sessions.postgres.url — an upload is a row several processes claim, and the
-  # directory above cannot be a queue — and it needs somewhere to put the audio.
+  # Recording needs MEDIACORE_POSTGRES_URL above — an upload is a row several
+  # processes claim, and a directory cannot be a queue — and it needs a bucket.
   #
-  # To turn it on: point sessions.postgres.url at a database, set enabled to
-  # true (or leave it false and let individual rooms ask, with
-  # {"sessionPolicy": {"record": true}} in their metadata), fill in the bucket
-  # and its credentials, and mount a volume at recording.directory. The audio is
-  # written there while a meeting is happening and uploaded whole when it ends;
-  # a volume inside the image would take every not-yet-uploaded recording with
-  # the next release.
-  enabled: false
+  # enabled=true records every meeting; false still records the rooms that ask
+  # for it themselves, with {"sessionPolicy": {"record": true}} in their
+  # metadata. Audio is written to the directory below while a meeting is
+  # happening and uploaded whole when it ends, so that directory is a volume:
+  # one inside the image would take every not-yet-uploaded recording with the
+  # next release. docker-compose.yml mounts the `recordings` volume here.
+  enabled: ${MEDIACORE_RECORDING_ENABLED}
   directory: /var/lib/mediacore/recordings
   s3:
-    endpoint: ""
-    region: us-east-1
-    bucket: ""
-    access_key_id: ""
-    secret_access_key: ""
+    endpoint: "${MEDIACORE_S3_ENDPOINT}"
+    region: "${MEDIACORE_S3_REGION}"
+    bucket: "${MEDIACORE_S3_BUCKET}"
+    access_key_id: "${MEDIACORE_S3_ACCESS_KEY_ID}"
+    secret_access_key: "${MEDIACORE_S3_SECRET_ACCESS_KEY}"
     path_style: true
     # A total deadline for one PUT of one segment, so it has to fit
     # recording.max_segment_mb: the default gives the default ceiling a
