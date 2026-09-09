@@ -20,6 +20,15 @@
         <path d="M12 18v3" />
         <path d="M4 4l16 16" />
       </symbol>
+      <symbol id="icon-speaker" viewBox="0 0 24 24">
+        <path d="M4 9h4l5-4v14l-5-4H4z" />
+        <path d="M16.5 8.5a5 5 0 0 1 0 7" />
+      </symbol>
+      <symbol id="icon-speaker-off" viewBox="0 0 24 24">
+        <path d="M4 9h4l5-4v14l-5-4H4z" />
+        <path d="M16.5 8.5a5 5 0 0 1 0 7" />
+        <path d="M4 4l16 16" />
+      </symbol>
       <symbol id="icon-screen" viewBox="0 0 24 24">
         <rect x="3" y="4" width="18" height="12" rx="2" />
         <path d="M9 20h6" />
@@ -398,6 +407,11 @@
               <button id="mute" class="control" type="button" aria-pressed="false">
                 <svg class="icon" aria-hidden="true"><use href="#icon-mic" /></svg>
                 <span class="control-label" id="mute-label">Mute</span>
+              </button>
+
+              <button id="deafen" class="control" type="button" aria-pressed="false">
+                <svg class="icon" aria-hidden="true"><use href="#icon-speaker" /></svg>
+                <span class="control-label" id="deafen-label">Mute speaker</span>
               </button>
 
               <button

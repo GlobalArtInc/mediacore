@@ -235,6 +235,8 @@ const el = {
   denoise: document.getElementById("denoise"),
   mute: document.getElementById("mute"),
   muteLabel: document.getElementById("mute-label"),
+  deafen: document.getElementById("deafen"),
+  deafenLabel: document.getElementById("deafen-label"),
   noise: document.getElementById("noise"),
   noiseSub: document.getElementById("noise-sub"),
   shareScreen: document.getElementById("share-screen"),
@@ -362,6 +364,18 @@ let showBench = false;
  */
 let unread = 0;
 let panel = "people";
+/**
+ * Whether this browser is refusing to hear the room, and what the microphone
+ * was doing before it started refusing.
+ *
+ * The pair is one state rather than two flags: going deaf takes the microphone
+ * with it, because talking into a room you cannot hear is the position nobody
+ * means to be in, and coming back has to put the microphone where it was found
+ * rather than where it would be convenient. Somebody who was already muted
+ * stays muted.
+ */
+let deafened = false;
+let mutedBeforeDeafened = false;
 let pinnedShare = null;
 let stageShare = null;
 let stageFocus = null;
@@ -398,6 +412,7 @@ async function start() {
   el.form.addEventListener("submit", onJoin);
   el.joinRoom.addEventListener("input", onRoomTyped);
   el.mute.addEventListener("click", onMute);
+  el.deafen.addEventListener("click", onDeafen);
   el.noise.addEventListener("click", onCycleNoise);
   el.audioSettings.addEventListener("click", () => toggleMenu());
   el.audioClose.addEventListener("click", () => {
@@ -844,6 +859,8 @@ async function leave(reason) {
   paintShare(null, false);
   paintShareTabs([]);
   el.audio.replaceChildren();
+  deafened = false;
+  mutedBeforeDeafened = false;
   pinnedShare = null;
   stageFocus = null;
   layoutStage({ mode: "grid", main: null });
@@ -971,6 +988,51 @@ async function onMute() {
   const result = await media.toggleMuted();
   pending.mute = false;
   if (result.reason) fail(el.roomError, result.reason);
+  paintControls();
+  render();
+}
+
+/**
+ * Silences every sink that carries somebody else's audio, and keeps silencing
+ * the ones that appear later.
+ *
+ * `Track.attach` writes `muted = false` on every attach, so a participant who
+ * arrives after the button was pressed, a resubscription after a reconnect and
+ * `room.startAudio()` all bring the room back at full volume unless this runs
+ * again. Muting the element rather than turning the volume down is deliberate:
+ * iOS Safari ignores writes to `volume`, a recycled element carries a volume of
+ * zero on to the next person's track, and screen-share audio is not covered by
+ * a participant's volume at all.
+ */
+function silenceIncoming() {
+  for (const element of el.audio.children) element.muted = deafened;
+}
+
+async function onDeafen() {
+  if (!media) return;
+
+  deafened = !deafened;
+  silenceIncoming();
+
+  const state = media.state();
+  const muted = Boolean(state.microphone.muted);
+
+  if (deafened) {
+    mutedBeforeDeafened = muted;
+  }
+
+  const wanted = deafened || mutedBeforeDeafened;
+
+  paintControls();
+
+  if (state.microphone.open && muted !== wanted) {
+    pending.mute = true;
+    paintControls();
+    const result = await media.setMuted(wanted);
+    pending.mute = false;
+    if (result.reason) fail(el.roomError, result.reason);
+  }
+
   paintControls();
   render();
 }
@@ -1472,6 +1534,7 @@ function onTrackSubscribed(track, _publication, participant) {
   if (track.kind === lk.Track.Kind.Audio) {
     const element = track.attach();
     element.dataset.identity = participant.identity;
+    element.muted = deafened;
     el.audio.appendChild(element);
     if (track.source === lk.Track.Source.Microphone) watchLevel(participant.identity, track);
   }
@@ -1756,6 +1819,7 @@ async function onEnableAudio() {
   ensureAudioContext();
   try {
     await room.startAudio();
+    silenceIncoming();
     onPlaybackStatus();
   } catch (error) {
     fail(el.roomError, `The browser would not start audio playback: ${error.message || error}`);
@@ -2697,16 +2761,32 @@ function paintControls() {
   const open = Boolean(state && state.microphone.open);
   const muted = Boolean(state && state.microphone.muted);
 
-  el.mute.disabled = !open || pending.mute;
+  el.mute.disabled = !open || pending.mute || deafened;
   el.mute.setAttribute("aria-pressed", String(muted));
   el.mute.dataset.on = String(open && !muted);
   el.mute.dataset.alert = String(muted);
   el.muteLabel.textContent = muted ? "Unmute" : "Mute";
   el.mute.setAttribute("aria-label", muted ? "Unmute your microphone" : "Mute your microphone");
   icon(el.mute, muted ? "#icon-mic-off" : "#icon-mic");
-  el.mute.title = open
-    ? "Muting stops the packets leaving; every page in the room shows it at once."
-    : "No microphone is open.";
+  el.mute.title = deafened
+    ? "The microphone follows the speaker: it comes back when you hear the room again."
+    : open
+      ? "Muting stops the packets leaving; every page in the room shows it at once."
+      : "No microphone is open.";
+
+  el.deafen.disabled = !room || pending.mute;
+  el.deafen.setAttribute("aria-pressed", String(deafened));
+  el.deafen.dataset.on = String(Boolean(room) && !deafened);
+  el.deafen.dataset.alert = String(deafened);
+  el.deafenLabel.textContent = deafened ? "Unmute speaker" : "Mute speaker";
+  el.deafen.setAttribute(
+    "aria-label",
+    deafened ? "Hear the room again, and speak again" : "Stop hearing the room, and stop speaking",
+  );
+  icon(el.deafen, deafened ? "#icon-speaker-off" : "#icon-speaker");
+  el.deafen.title =
+    "This silences your own speakers and mutes you with them. Nothing stops arriving, and the " +
+    "room is told only that you are muted.";
 
   paintNoise(state);
 

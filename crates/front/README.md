@@ -859,8 +859,8 @@ one.
 
 The room is the shape a voice chat has settled into, and nothing more: a persistent list of who is
 present down the left, the people or the shared screen in the middle, and one bar of controls along
-the bottom holding mute, the microphone chooser, the noise-suppression control, screen share,
-camera, the bench and leave. The noise control is one button naming the engine that is running —
+the bottom holding mute, the speaker mute, the microphone chooser, the noise-suppression control,
+screen share, camera, the bench and leave. The noise control is one button naming the engine that is running —
 pressing it steps through the values on offer — and the audio menu behind the chooser holds the
 same setting as a radio group with a sentence about each. When somebody is sharing a screen it takes the main area and the participants
 shrink to a strip beneath it; when nobody is, the participants fill it. Two people with the same
@@ -1448,6 +1448,31 @@ the main thread's job shrinks to reading messages. The node's output goes to a
 `MediaStreamAudioDestinationNode` whose stream is attached to nothing: a destination is what makes
 the graph pull the node, and the one destination it must never be pulled towards is the speakers,
 where everybody is already audible once through their own `<audio>` element.
+
+**Silencing the speaker is `muted` on every one of those elements, and it takes the microphone with
+it.** Talking into a room you cannot hear is the position nobody means to be in, so pressing it
+mutes the microphone as well, and pressing it again puts the microphone back where it was found
+rather than where it would be convenient — somebody who was already muted stays muted. It is a
+decision about this browser: nothing is unsubscribed, nothing stops arriving, and the room is told
+only the mute, which it would have been told anyway.
+
+Three reasons it is not a volume of zero, each enough on its own. iOS Safari ignores writes to
+`HTMLMediaElement.volume`, so on a phone the room would stay audible. A detached element goes back
+into the SDK's pool and is handed to the next person's track with its volume intact, so a zero
+leaks on to somebody who never asked for it. And a participant's volume does not cover screen-share
+audio, which arrives on a track of its own. Muting the elements covers all three, and it is already
+the idiom here — the shared screen and the video tiles are muted the same way.
+
+The part that leaks if it is forgotten is the arrivals. `Track.attach` writes `muted = false` every
+time it runs, so a participant who joins after the button was pressed, a resubscription after a
+reconnect, and `room.startAudio()` behind the playback banner each hand the room back at full
+volume. All three go through one funnel, and a test asserts on each of them by name.
+
+What it deliberately does not do is save bandwidth. Unsubscribing would: it would also turn every
+roster row into `not subscribed`, put out the speaking rings, and cost a renegotiation per track on
+the way back, so a button pressed to get some quiet would take the room's own display with it. The
+meter is untouched for the same reason — it runs off the media stream track rather than the element,
+so a deafened person still sees who is talking.
 
 The worklet is registered, fed and stopped the same way the denoiser's two are — `addModule` once
 per context, a `"stop"` message on the way out so the processor returns `false` and is collected.

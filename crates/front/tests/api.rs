@@ -1590,6 +1590,84 @@ async fn every_icon_the_script_swaps_in_exists_in_the_page() {
     }
 }
 
+#[tokio::test]
+async fn a_deafened_person_stays_deaf_when_more_audio_arrives() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let subscribed = body_of(&js, "\nfunction onTrackSubscribed(");
+    assert!(
+        subscribed.contains("element.muted = deafened"),
+        "`Track.attach` writes `muted = false` on every attach, so somebody who arrives after the \
+         speaker was silenced would be heard at full volume by a person who asked for quiet"
+    );
+
+    let enable = body_of(&js, "\nasync function onEnableAudio(");
+    assert!(
+        enable.contains("silenceIncoming()"),
+        "`room.startAudio()` clears `muted` on every attached element, so the playback banner \
+         would hand the whole room back to somebody who had switched it off"
+    );
+
+    let leave = body_of(&js, "\nasync function leave(");
+    assert!(
+        leave.contains("deafened = false"),
+        "being deaf belongs to one call, so joining the next one would start in a silence nobody \
+         asked for and no button explains"
+    );
+}
+
+#[tokio::test]
+async fn silencing_the_speaker_never_reaches_the_meter_or_the_roster() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    for function in [
+        "\nasync function attachLevel(",
+        "\nfunction describeParticipant(",
+    ] {
+        assert!(
+            !body_of(&js, function).contains("deafened"),
+            "the meter runs off the media stream track rather than the element, so a deafened \
+             person keeps seeing who is speaking -- {function} must not learn about it"
+        );
+    }
+
+    assert!(
+        !js.contains("setSubscribed(false)"),
+        "silencing the speaker never unsubscribes: the tracks would stop arriving, every roster \
+         row would read `not subscribed`, and coming back would cost a renegotiation each"
+    );
+    assert!(
+        !js.contains(".setVolume("),
+        "silencing is `muted` rather than a volume of zero: ios safari ignores writes to volume, \
+         a recycled element carries the zero on to the next person's track, and a participant's \
+         volume does not cover screen-share audio"
+    );
+}
+
+#[tokio::test]
+async fn the_speaker_button_says_what_it_does_and_what_it_does_not() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let paint = body_of(&js, "\nfunction paintControls(");
+
+    assert!(
+        paint.contains("silences your own speakers"),
+        "the button is local, and a page that does not say so reads as though the room was told"
+    );
+    assert!(
+        paint.contains("Nothing stops arriving"),
+        "the packets keep coming, so a button that looked like it saved a phone's data would be \
+         lying about the one thing somebody would press it for"
+    );
+    assert!(
+        paint.contains("el.mute.disabled = !open || pending.mute || deafened"),
+        "the microphone follows the speaker, so its own button has to stop arguing with it while \
+         the room is silenced"
+    );
+}
+
 fn body_of<'a>(js: &'a str, signature: &str) -> &'a str {
     js.split_once(signature)
         .unwrap_or_else(|| panic!("{signature} is defined"))
@@ -2564,6 +2642,7 @@ async fn every_control_a_phone_takes_off_the_bar_is_still_one_press_away() {
 
     for control in [
         "mute",
+        "deafen",
         "audio-settings",
         "noise",
         "share-screen",
