@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn member(sid: &str, identity: &str, joined_at_ms: i64) -> Member {

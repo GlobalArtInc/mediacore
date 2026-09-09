@@ -1,4 +1,3 @@
-
 use super::*;
 
 const CAPTURED_OFFER: &str = concat!(

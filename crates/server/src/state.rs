@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use mediacore_config::{BweConfig, Config, DuplicateIdentity};
+use mediacore_config::{BweConfig, Config, DataConfig, DuplicateIdentity};
 use mediacore_events::{Bus, Delivery};
 use mediacore_proto::mediacore;
 use mediacore_room::{Registry, RoomDefaults};
 use mediacore_session::{PostgresSettings, SessionStore};
 
 use mediacore_sfu::SelectorConfig;
-use mediacore_transport::{Bitrate, BweSettings};
+use mediacore_transport::{Bitrate, BweSettings, DataSettings};
 
 use crate::bandwidth::Subscribers;
 use crate::caretaker::Caretaker;
@@ -52,7 +52,12 @@ pub struct AppState {
 
 impl AppState {
     pub async fn start(config: Config) -> anyhow::Result<Self> {
-        let media = MediaEngine::start(&config.rtc, subscriber_bwe(&config.video.bwe)).await?;
+        let media = MediaEngine::start(
+            &config.rtc,
+            subscriber_bwe(&config.video.bwe),
+            publisher_data(&config.data),
+        )
+        .await?;
 
         Self::with_media(config, media)
     }
@@ -187,6 +192,18 @@ fn duplicate_identity(setting: DuplicateIdentity) -> mediacore_room::DuplicateId
         DuplicateIdentity::Suffix => mediacore_room::DuplicateIdentity::Suffix,
         DuplicateIdentity::Displace => mediacore_room::DuplicateIdentity::Displace,
     }
+}
+
+/// What the publisher transport carries data with, or `None` when this
+/// deployment carries none.
+///
+/// The transport takes it as a setting rather than reading the configuration
+/// itself, so a peer built without it ignores a data channel outright instead
+/// of accepting packets nothing will forward.
+pub fn publisher_data(config: &DataConfig) -> Option<DataSettings> {
+    config.enabled.then_some(DataSettings {
+        max_packet: config.max_packet_bytes as usize,
+    })
 }
 
 pub fn subscriber_bwe(config: &BweConfig) -> Option<BweSettings> {

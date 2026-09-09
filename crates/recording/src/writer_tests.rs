@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn writing(directory: &std::path::Path) -> (Writing, Arc<AtomicU64>) {

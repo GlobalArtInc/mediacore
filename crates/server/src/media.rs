@@ -5,8 +5,8 @@ use mediacore_sfu::{VideoCodec, is_keyframe};
 use mediacore_transport::str0m::Candidate;
 use mediacore_transport::str0m::format::Codec;
 use mediacore_transport::{
-    BweSettings, KeyframeProbe, PeerConfig, PeerRole, RouterConfig, SpawnedPeer, TransportCrypto,
-    TransportError, UdpRouter, spawn_peer,
+    BweSettings, DataSettings, KeyframeProbe, PeerConfig, PeerRole, RouterConfig, SpawnedPeer,
+    TransportCrypto, TransportError, UdpRouter, spawn_peer,
 };
 
 const ROUTE_PROBE_TARGET: &str = "192.0.2.1:9";
@@ -20,12 +20,14 @@ pub struct MediaEngine {
     negotiation_timeout: std::time::Duration,
     keyframe_probe: KeyframeProbe,
     subscriber_bwe: Option<BweSettings>,
+    publisher_data: Option<DataSettings>,
 }
 
 impl MediaEngine {
     pub async fn start(
         config: &RtcConfig,
         subscriber_bwe: Option<BweSettings>,
+        publisher_data: Option<DataSettings>,
     ) -> anyhow::Result<Self> {
         let crypto = TransportCrypto::new()?;
         let bind: IpAddr = config.bind_address.parse()?;
@@ -69,6 +71,7 @@ impl MediaEngine {
             negotiation_timeout: config.negotiation_grace(),
             keyframe_probe: keyframe_probe(),
             subscriber_bwe,
+            publisher_data,
         })
     }
 
@@ -86,7 +89,10 @@ impl MediaEngine {
 
     fn spawn(&self, role: PeerRole) -> Result<SpawnedPeer, TransportError> {
         let base = match role {
-            PeerRole::Publisher => PeerConfig::publisher(),
+            PeerRole::Publisher => PeerConfig {
+                data: self.publisher_data,
+                ..PeerConfig::publisher()
+            },
             PeerRole::Subscriber => PeerConfig::subscriber(self.subscriber_bwe),
         };
 

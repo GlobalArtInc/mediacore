@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn packet(sequence: u64, timestamp: u32) -> ReceivedPacket {

@@ -1,4 +1,3 @@
-
 use super::*;
 
 const SPEND: Bitrate = Bitrate::kbps(1_000);

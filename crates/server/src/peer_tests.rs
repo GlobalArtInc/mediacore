@@ -1,4 +1,3 @@
-
 use super::*;
 
 const BUNDLED_OFFER: &str = "v=0\r\n\

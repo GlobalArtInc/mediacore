@@ -1,5 +1,7 @@
+use mediacore_config::DataConfig;
 
 use super::*;
+use crate::state::publisher_data;
 
 fn config(body: &str) -> RtcConfig {
     mediacore_config::Config::parse(&format!("keys:\n  k: s\nrtc:\n{body}"))
@@ -54,7 +56,7 @@ async fn the_engine_binds_a_socket_and_offers_a_host_candidate() {
     let rtc = config(
         "  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n  bind_address: 127.0.0.1\n",
     );
-    let engine = MediaEngine::start(&rtc, None).await.unwrap();
+    let engine = MediaEngine::start(&rtc, None, None).await.unwrap();
 
     assert_eq!(engine.local_addr().ip().to_string(), "127.0.0.1");
     assert_eq!(engine.advertised(), [engine.local_addr()]);
@@ -62,4 +64,50 @@ async fn the_engine_binds_a_socket_and_offers_a_host_candidate() {
 
     let peer = engine.spawn_publisher().unwrap();
     peer.handle.close();
+}
+
+#[tokio::test]
+async fn the_publisher_transport_carries_the_data_channels_the_configuration_asked_for() {
+    let rtc = config(
+        "  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n  bind_address: 127.0.0.1\n",
+    );
+
+    let carrying = MediaEngine::start(&rtc, None, publisher_data(&DataConfig::default()))
+        .await
+        .unwrap();
+    let publisher = carrying.spawn_publisher().unwrap();
+
+    assert!(
+        publisher.handle.carries_data(),
+        "a transport built without data settings ignores the channels a client opens, and the \
+         room goes quiet with every test still passing"
+    );
+    assert_eq!(
+        publisher.handle.data().map(|data| data.max_packet),
+        Some(DataConfig::default().max_packet_bytes as usize)
+    );
+
+    let subscriber = carrying.spawn_subscriber().unwrap();
+    assert!(
+        !subscriber.handle.carries_data(),
+        "a client opens its channels on the publisher connection, so a subscriber that accepted \
+         data would be accepting it where nothing arrives"
+    );
+
+    let silent = MediaEngine::start(
+        &rtc,
+        None,
+        publisher_data(&DataConfig {
+            enabled: false,
+            ..DataConfig::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let refused = silent.spawn_publisher().unwrap();
+    assert!(!refused.handle.carries_data());
+
+    publisher.handle.close();
+    subscriber.handle.close();
+    refused.handle.close();
 }

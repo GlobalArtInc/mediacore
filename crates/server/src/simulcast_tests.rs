@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn declared(entries: &[(mediacore::VideoQuality, &str, u32, u32)]) -> Vec<mediacore::VideoLayer> {

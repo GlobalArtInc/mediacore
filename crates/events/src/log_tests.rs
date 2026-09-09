@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A room name reaches this server from a token somebody else minted. The

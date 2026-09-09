@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The configuration every WebRTC client in the wild sends: fullband CELT

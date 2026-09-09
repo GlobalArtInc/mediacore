@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A recorder's queue with nothing at the other end of it.

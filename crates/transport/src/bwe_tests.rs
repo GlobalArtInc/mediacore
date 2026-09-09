@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn entry(mid: &str, bytes: usize, packets: usize, oldest: Option<Instant>) -> SendQueueEntry {

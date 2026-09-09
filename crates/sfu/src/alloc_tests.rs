@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ladder::{LayerLadder, VideoQuality};
 

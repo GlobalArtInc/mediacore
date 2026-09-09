@@ -1,4 +1,3 @@
-
 use super::*;
 
 const BASE: SpatialLayer = SpatialLayer::BASE;

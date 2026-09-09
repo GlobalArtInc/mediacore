@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn room(name: &str) -> mediacore::Room {

@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn headers(content_type: &str) -> HeaderMap {
