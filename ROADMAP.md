@@ -20,8 +20,8 @@ what it returns.
 3. **An honest `active_recording`.** A room can be recorded today without one client being told.
    A day and a half, and it is the blocker on turning recording on anywhere else.
 
-Straight after those: **data channels**. M6 does not begin without them, and `SendData` and
-`PerformRpc` keep answering 501 until they land.
+Straight after those: **holding a data packet the SCTP buffer refused**, which is the first of the
+three steps under [Images in the chat](#images-in-chat) and the one everything else there waits on.
 
 ## Operations: the node stops lying
 
@@ -292,38 +292,10 @@ bucket.
 
 ## The LiveKit protocol: stop swallowing what clients send
 
-The core of M6 and the neighbouring holes of the same class: a client sends a request, the server
-logs "not implemented yet" and answers nothing, or the protocol declares a message the server never
-builds. Data channels come first — M6 does not begin without them — and everything else here costs
-between hours and a day.
-
-### Data channels: receive, check the grant, distribute, and turn `SendData` on
-
-Carry `Event::ChannelOpen`/`ChannelData`/`ChannelClose` from `peer.rs` into new `PeerEvent`
-variants and add a command that writes into a channel. On the server, parse the payload as
-`mediacore.DataPacket`, check `can_publish_data` — take it from the participant in `crates/room`,
-not from the token, because `UpdateParticipant` can revoke it — and deliver to
-`destination_identities` or to the whole room, with a ceiling on packet size and on rate. Write the
-packets back into the client's publisher channel: `livekit-client` listens to its lossy and
-reliable channels on the publisher connection, and that path does not touch SDP at all. A channel
-in the subscriber offer is a second step and not sufficient on its own: that transport is created
-lazily and a listener with no subscriptions never has one. Then `Support::Refused` becomes `Served`
-for `SendData`, the front end stops minting `can_publish_data: false`, and the whole thing sits
-behind a configuration flag shaped like `video.bwe.enabled`.
-
-Chat, reactions, a raised hand and any state exchange are physically impossible today.
-`livekit-client` opens two data channels as soon as it connects, str0m negotiates them, and
-everything that arrives lands in one match arm and is dropped. Do not sell this as "chat is
-coming" — there is no chat UI — but `SendData` over Twirp and reception in third-party LiveKit SDKs
-start working the day it lands.
-
-*Effort:* a day for receive and distribute with tests, half a day for the flag, the limits and the
-README.
-*Depends on:* nothing. The types are generated from the vendored protos, the grant is already
-computed and stored on the participant, and SCTP in str0m 0.23 is not behind a feature.
-*Evidence:* `crates/transport/src/peer.rs:1653-1659` — channel events swallowed by one arm
-returning true; `crates/server/src/rooms.rs:196-202` — "SendData needs a data channel, and
-mediacore does not carry data packets yet"; `crates/front/src/http.rs:520`.
+Holes of one class: a client sends a request, the server logs "not implemented yet" and answers
+nothing, or the protocol declares a message the server never builds. What is left here costs between
+hours and a day each. Data channels, `UpdateMetadata` and the publisher's `SubscriptionPermission`
+were the rest of this group and landed with M6.
 
 ### Honest `LeaveRequest.action` instead of a permanent DISCONNECT
 
@@ -349,29 +321,6 @@ to return belongs.
 *Evidence:* `crates/room/src/lib.rs:2122-2129` — the single constructor hard-codes `Disconnect`,
 with `reconnect()` right beside it at :2131, already used in `subscriber.rs:655`;
 `livekit_rtc.proto:371-386`.
-
-### `UpdateMetadata` over the signalling channel
-
-Handle `signal_request::Message::UpdateMetadata`: check `can_update_own_metadata` on the
-participant, bound the size of name, metadata and attributes with a new setting (shaped like
-`sessions.max_opaque_bytes`, one shared ceiling for the profile is reasonable), assemble a
-`ProfileUpdate` and apply it through `room.update_participant`, which already broadcasts
-`ParticipantUpdate` from the inside. Answer the `request_id` with `RequestResponse::Ok`, or
-`NOT_ALLOWED` with a reason; the plumbing for that already exists on the `AddTrack` path. The merge
-rules for attributes — a removal by empty value, and "a field not named is a field not touched" —
-are already implemented in `Participant::apply` and do not need writing again.
-
-There is no handler, so `setName`, `setMetadata` and `setAttributes` fall into the "signal request
-is not implemented yet" arm: no answer, the call times out, and the room learns nothing. Fairly:
-`can_update_own_metadata` defaults to false and our own front end does not grant it, so this is a
-hole for an external platform that turns the right on rather than a live breakage. Attributes on
-the meeting record are snapshotted once on arrival, so self-editing cannot forge those — only the
-live roster is exposed.
-
-*Effort:* half a day. The machinery is there; the new part is a match arm, a grant check, a config
-field and a couple of tests.
-*Depends on:* nothing; a rate limit belongs here naturally, since every call broadcasts to the room.
-*Evidence:* `crates/server/src/signal.rs:322-330` and `:434`; `crates/room/src/lib.rs:1162`.
 
 ### Server-side speaker detection and `SpeakersChanged`
 
@@ -422,32 +371,6 @@ table of rates — a tool for somebody debugging the SFU.
 so the first ones will be by eye.
 *Evidence:* `crates/room/src/lib.rs:2092` and `:2115` — the message is named and never built;
 `crates/server/src/peer.rs:190-229` — three `tracing::trace!` calls in a row.
-
-### Publisher permissions: `SubscriptionPermission` as a third gate in `can_subscribe`
-
-Keep `all_participants` and the publisher's list of `TrackPermission` on the participant and consult
-it inside `Room::can_subscribe` — the single gate that all three sources already pass through
-(auto-subscribe, the subscriber's own gate, and the admin `UpdateSubscriptions`). The three-way
-conflict does not need inventing: intent and gate are already separated in this architecture, and a
-publisher's permission is a third gate, stricter than anyone's intent, the admin included. What has
-to be written is the method that returns who is affected, the removal of intent through the existing
-`remove_desired_subscriptions` (without it a live forward never breaks), the
-`SubscriptionPermissionUpdate` broadcast, and careful separation of sid from identity given
-suffixes like `bob#7`. If the budget has to be cut, start with an honest refusal instead of silent
-swallowing — that is an hour.
-
-A publisher has no way to limit who listens: the right exists on the token at the door and in the
-admin call, and a request from a client falls into the "not implemented yet" arm — the message is
-not even named in the log. The shape of the hole is the unpleasant kind: the client believes it has
-restricted its audience and everybody hears it.
-
-*Effort:* a day, most of it tests on gate precedence and on breaking a live forward.
-*Depends on:* nothing, but the demand is hypothetical — our front end does not send this, the
-platform uses the admin API, and our own client needs the sending side added to have something to
-test against.
-*Evidence:* `crates/server/src/signal.rs:322-330`; `crates/client/src/signal.rs:359-365` and
-`tests/subscriber.rs:810-825` — our client parses a reply the server never sends;
-`crates/room/src/lib.rs:1318`.
 
 ## The network does not forgive: blocked UDP and broken sockets
 
@@ -649,6 +572,71 @@ editor's work rather than a programmer's.
 translated twice.
 *Evidence:* `crates/front/assets/index.html:2` — `<html lang="en">`; greps for i18n, locale and
 translat find only `translateX` in CSS.
+
+## Images in the chat
+
+A screenshot pasted into the chat, and nothing wider than that. The use somebody actually has for
+this is *show me what is on your screen*, not *transfer me a file*, and reading it that way removes
+the two expensive halves of the problem: an image scaled down in the browser to a few hundred
+kilobytes needs no object storage, and therefore no retention, no deletion endpoint and no answer to
+give when somebody asks for their data to be erased. It lives exactly as long as the chat does,
+which is the promise the empty panel already makes.
+
+Most of the wire is already there. The vendored client carries `sendFile` and `streamBytes` with
+`registerByteStreamHandler`, and the server forwards every `DataPacket` variant but the two it
+refuses, so `stream_header`, `stream_chunk` and `stream_trailer` relay today without a line written.
+What is missing is the three below, in this order.
+
+### Hold a data packet the SCTP buffer refused, rather than dropping it
+
+`PeerActor::write_data` counts `Ok(false)` and drops the packet. For a line of chat that is a rare
+loss nobody sees; for the 15 000-byte chunks a byte stream is cut into, it is a hole in the middle
+of an image, and byte streams have no retransmission of their own. Keep the packet in the actor and
+retry it on the next tick behind a bounded queue, dropping only when that queue is full and counting
+it when that happens. Deliberately not the full `set_buffered_amount_low_threshold` route with a new
+event out of the transport: that is a mechanism in the hot loop, and this is one method.
+
+*Effort:* half a day.
+*Depends on:* nothing; worth doing on its own, since it is the one place chat can lose a line today.
+*Evidence:* `crates/transport/src/peer.rs` — `write_data` counts `refused_data` and returns; str0m
+holds 128 KiB across all streams before it refuses.
+
+### Count bytes as well as packets in the rate limiter
+
+`DataLimiter` admits 60 packets a second, which at a stream's chunk size is about 900 KB/s per
+publisher, or three gigabytes an hour — bounded only by the sender's patience. A chat has a byte
+budget rather than a packet budget; the packet rate stays, because it is what stops a flood of tiny
+messages.
+
+*Effort:* two hours.
+*Depends on:* nothing.
+*Evidence:* `crates/server/src/data.rs` — the bucket counts packets; `crates/config/src/lib.rs` —
+`data.rate` and `data.burst` are packet figures.
+
+### Scale the image down in the browser before it is sent
+
+A drop zone on the chat panel, a hard ceiling applied with `canvas` — longest side about 1600 px,
+JPEG or WebP, a few hundred kilobytes — a preview, a progress line while the stream runs, and an
+honest refusal for a file type or size that will not fit. The ceiling is the whole design: at that
+size an image is a handful of chunks, well inside the rate above, and a ten-person room costs a few
+megabytes of egress rather than tens.
+
+*Effort:* a day.
+*Depends on:* the two above.
+*Evidence:* `crates/front/assets/chat.js` and the panel in `app.js` carry text only; the vendored
+client already has the byte-stream API this would call.
+
+### What this deliberately does not do
+
+An original file — a PDF, an archive, a screenshot where every pixel matters — cannot be scaled, and
+for those the honest answer is object storage: upload once, put the key in the chat, let receivers
+fetch it over HTTPS off the media node entirely. That is a different project, and its first day is
+retention and deletion rather than upload, because an object outlives the room while everything else
+in the chat does not. Worth starting when somebody asks for files rather than for screenshots.
+
+Streaming originals over the data channel is the option to refuse in both cases. The SFU is one
+replica on `hostNetwork` and sends a copy to each recipient, so a three-megabyte file in a room of
+ten is thirty megabytes off that node, on the same path as the audio.
 
 ## Instruments
 
