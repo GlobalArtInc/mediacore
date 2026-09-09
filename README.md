@@ -1701,13 +1701,15 @@ cargo fmt --all
 
 The protobuf definitions are compiled by `protox`, so no system `protoc` is needed.
 
-The Kafka producer is behind a feature and is therefore not in any of those:
+The Kafka producer is behind a feature, so none of those three compile a line of it:
 
 ```
 cargo test -p mediacore-events --features kafka
 cargo clippy -p mediacore-server --features kafka --all-targets
 ```
 
-That build wants a C toolchain, because `rdkafka-sys` compiles librdkafka. Everything else about
-events — the emitter, the outbox, the webhooks — is in the default build and covered by the commands
-above.
+That build wants a C toolchain, because `rdkafka-sys` compiles librdkafka. CI runs both commands
+beside the three above, and the image this repository ships is built with the feature on: a
+deployment that names a broker gets a binary that can reach it, and a change that breaks the
+producer is found here rather than in a pod. Everything else about events — the emitter, the outbox,
+the webhooks — is in the default build.

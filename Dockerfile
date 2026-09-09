@@ -15,11 +15,13 @@ RUN cargo chef prepare --recipe-path /recipe.json
 FROM chef AS builder
 COPY --from=planner /recipe.json /recipe.json
 # Dependencies only: this layer is reused until Cargo.toml or Cargo.lock change.
-RUN cargo chef cook --release --recipe-path /recipe.json
+# `--features kafka` here as well as below, or the layer would be cooked without
+# librdkafka and the workspace build would compile it every time.
+RUN cargo chef cook --release --features kafka --recipe-path /recipe.json
 COPY . .
 # The protobufs under crates/proto/protobufs are compiled in process by protox,
 # so no protoc is installed here.
-RUN cargo build --release -p mediacore-server -p mediacore-front \
+RUN cargo build --release --features kafka -p mediacore-server -p mediacore-front \
     && mkdir -p /out \
     && cp target/release/mediacore target/release/mediacore-front /out/
 

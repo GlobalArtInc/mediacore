@@ -75,3 +75,13 @@ jobs:
         env:
           MEDIACORE_TEST_POSTGRES: postgres://mediacore:mediacore@127.0.0.1:5432/postgres
         run: cargo test --workspace
+
+      # The Kafka producer is behind a feature, so none of the three commands
+      # above compile a line of it. It is in the image this repository ships,
+      # which means a change that breaks it is a change that breaks a
+      # deployment -- and would otherwise be found there rather than here.
+      - name: Clippy with kafka
+        run: cargo clippy -p mediacore-server --features kafka --all-targets -- -D warnings
+
+      - name: Test with kafka
+        run: cargo test -p mediacore-events --features kafka
