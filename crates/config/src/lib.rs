@@ -9,6 +9,10 @@ use serde::Deserialize;
 pub const DEFAULT_END_GRACE_SECONDS: u32 = 90;
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
 pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
+pub const MAX_DATA_PACKET_BYTES: u32 = 64 * 1024;
+pub const DEFAULT_DATA_MAX_PACKET_BYTES: u32 = 64_000;
+pub const DEFAULT_DATA_RATE: u32 = 60;
+pub const DEFAULT_DATA_BURST: u32 = 120;
 pub const DEFAULT_DYNACAST_PAUSE_DELAY_MS: u32 = 5_000;
 pub const DEFAULT_LAYER_UPGRADE_HOLD_MS: u32 = 2_000;
 pub const DEFAULT_BWE_INITIAL_KBPS: u32 = 600;
@@ -53,10 +57,59 @@ pub struct Config {
     pub room: RoomConfig,
     pub rtc: RtcConfig,
     pub video: VideoConfig,
+    pub data: DataConfig,
     pub twirp: TwirpConfig,
     pub sessions: SessionConfig,
     pub recording: RecordingConfig,
     pub events: EventConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DataConfig {
+    pub enabled: bool,
+    pub max_packet_bytes: u32,
+    pub rate: u32,
+    pub burst: u32,
+}
+
+impl Default for DataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_packet_bytes: DEFAULT_DATA_MAX_PACKET_BYTES,
+            rate: DEFAULT_DATA_RATE,
+            burst: DEFAULT_DATA_BURST,
+        }
+    }
+}
+
+impl DataConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            self.max_packet_bytes > 0,
+            "data.max_packet_bytes must not be zero; a limit of nothing refuses every packet \
+             while the server still says it carries data"
+        );
+
+        anyhow::ensure!(
+            self.max_packet_bytes <= MAX_DATA_PACKET_BYTES,
+            "data.max_packet_bytes must not exceed {MAX_DATA_PACKET_BYTES}, which is what a \
+             data channel carries in one message"
+        );
+
+        anyhow::ensure!(
+            self.rate > 0 && self.burst >= self.rate,
+            "data.rate must not be zero and data.burst must not be under it; a bucket that \
+             refills slower than it drains stops carrying data a few seconds in"
+        );
+
+        Ok(())
+    }
 }
 
 /// Who is told what happened, and how hard this server tries to tell them.
@@ -790,6 +843,7 @@ impl Default for Config {
             room: RoomConfig::default(),
             rtc: RtcConfig::default(),
             video: VideoConfig::default(),
+            data: DataConfig::default(),
             twirp: TwirpConfig::default(),
             sessions: SessionConfig::default(),
             recording: RecordingConfig::default(),
@@ -972,6 +1026,7 @@ impl Config {
         self.recording.validate(&self.sessions)?;
         self.rtc.validate()?;
         self.video.bwe.validate()?;
+        self.data.validate()?;
         self.events.validate(&self.keys)?;
         Ok(())
     }

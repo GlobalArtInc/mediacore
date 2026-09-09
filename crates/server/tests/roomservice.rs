@@ -570,10 +570,6 @@ async fn the_methods_that_need_several_nodes_say_they_are_not_implemented() {
             "PerformRpc",
             serde_json::json!({"room": "standup", "destinationIdentity": "alice", "method": "hi"}),
         ),
-        (
-            "SendData",
-            serde_json::json!({"room": "standup", "data": "aGk="}),
-        ),
     ] {
         let answer = post_json(addr, method, &admin, body).await;
 
@@ -588,6 +584,90 @@ async fn the_methods_that_need_several_nodes_say_they_are_not_implemented() {
             "{method} refused without saying why"
         );
     }
+}
+
+#[tokio::test]
+async fn the_room_service_sends_data_into_a_room_that_exists() {
+    let addr = spawn_server().await;
+
+    post_json(
+        addr,
+        "CreateRoom",
+        &creator(),
+        serde_json::json!({"name": "standup"}),
+    )
+    .await;
+
+    let sent = post_json(
+        addr,
+        "SendData",
+        &admin("standup"),
+        serde_json::json!({"room": "standup", "data": "aGk="}),
+    )
+    .await;
+
+    assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+
+    let missing = post_json(
+        addr,
+        "SendData",
+        &admin("board"),
+        serde_json::json!({"room": "board", "data": "aGk="}),
+    )
+    .await;
+
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.code(), "not_found");
+}
+
+#[tokio::test]
+async fn the_room_service_refuses_to_send_data_it_cannot_deliver_as_asked() {
+    let addr = spawn_server().await;
+
+    post_json(
+        addr,
+        "CreateRoom",
+        &creator(),
+        serde_json::json!({"name": "standup"}),
+    )
+    .await;
+
+    let by_sid = post_json(
+        addr,
+        "SendData",
+        &admin("standup"),
+        serde_json::json!({"room": "standup", "data": "aGk=", "destinationSids": ["PA_alice"]}),
+    )
+    .await;
+
+    assert_eq!(by_sid.status, 501);
+    assert_eq!(by_sid.code(), "unimplemented");
+    assert!(by_sid.message().contains("destinationIdentities"));
+
+    let nobody = post_json(
+        addr,
+        "SendData",
+        &admin("standup"),
+        serde_json::json!({"room": "standup", "data": "aGk=", "destinationIdentities": ["alice"]}),
+    )
+    .await;
+
+    assert_eq!(nobody.status, 404);
+    assert_eq!(nobody.code(), "not_found");
+
+    let oversized = post_json(
+        addr,
+        "SendData",
+        &admin("standup"),
+        serde_json::json!({
+            "room": "standup",
+            "data": "BwcH".repeat(23_334),
+        }),
+    )
+    .await;
+
+    assert_eq!(oversized.status, 400);
+    assert_eq!(oversized.code(), "invalid_argument");
 }
 
 #[tokio::test]

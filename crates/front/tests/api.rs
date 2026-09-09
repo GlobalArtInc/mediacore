@@ -209,6 +209,10 @@ async fn a_token_is_issued_that_the_server_accepts() {
     assert!(claims.video.room_join());
     assert!(claims.video.can_publish());
     assert!(claims.video.can_subscribe());
+    assert!(
+        claims.video.can_publish_data(),
+        "the chat panel stands on data channels, so the token this page mints carries them"
+    );
     assert_eq!(
         claims.video.can_publish_sources,
         vec!["microphone", "camera", "screen_share", "screen_share_audio"],

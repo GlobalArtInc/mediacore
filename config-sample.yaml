@@ -351,6 +351,34 @@ events:
     # and whatever else a broker wants.
     properties: {}
 
+data:
+  # Data channels, and the chat, reactions and application state that stand on
+  # them. On by default: a LiveKit client opens its channels the moment it
+  # connects, and a server that receives them and forwards nothing is a server
+  # where a message is typed, accepted and silently lost. Turn it off for a
+  # deployment that carries voice and nothing else.
+  #
+  # What the server does with a packet is forward it: the payload is never
+  # read, and only the sender's identity and sid are rewritten, because a name
+  # a participant writes for themselves is a name anyone can write for anyone.
+  # Nothing is stored, so a person who joins late sees nothing of what was
+  # said before they arrived.
+  enabled: true
+
+  # The largest packet carried, in bytes. A data channel takes 64 KiB in one
+  # message and this must not exceed it. It also cannot go far below 15 KiB:
+  # livekit-client cuts text streams into chunks of that size, and a limit
+  # under one chunk plus its envelope stops sendText working at all while chat
+  # keeps going, which is the confusing half of a wrong number here.
+  max_packet_bytes: 64000
+
+  # How many packets one participant may send a second, and how many may
+  # arrive at once before the average applies. A refused packet is dropped and
+  # counted rather than answered: a rate limit that disconnected people would
+  # end a call over a stuck key.
+  rate: 60
+  burst: 120
+
 twirp:
   # The room API is mediacore.RoomService, so its own path is
   # /twirp/mediacore.RoomService/<Method>. LiveKit's server SDKs and lk do not

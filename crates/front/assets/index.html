@@ -154,7 +154,13 @@
       </section>
 
       <div id="room" class="shell" data-fullscreen="off" hidden>
-        <aside id="roster" class="roster" aria-label="People in the room" data-people="shut">
+        <aside
+          id="roster"
+          class="roster"
+          aria-label="People in the room"
+          data-people="shut"
+          data-panel="people"
+        >
           <header class="roster-head">
             <div class="roster-title">
               <h1 id="room-name">&hellip;</h1>
@@ -169,12 +175,63 @@
               aria-controls="participants"
             >
               <span id="people-count" class="people-count">&hellip;</span>
+              <span id="people-unread" class="unread" hidden></span>
               <svg class="icon" aria-hidden="true"><use href="#icon-chevron" /></svg>
             </button>
           </header>
 
-          <div class="roster-sheet">
+          <div id="roster-sheet" class="roster-sheet">
+            <div class="panel-tabs" role="group" aria-label="Who is here, and what has been said">
+              <button
+                id="people-tab"
+                class="panel-tab"
+                type="button"
+                aria-pressed="true"
+                aria-controls="participants"
+              >
+                People
+              </button>
+              <button
+                id="chat-tab"
+                class="panel-tab"
+                type="button"
+                aria-pressed="false"
+                aria-controls="chat"
+              >
+                Chat<span id="chat-unread" class="unread" hidden></span>
+              </button>
+            </div>
+
             <ul id="participants" class="participants"></ul>
+
+            <section id="chat" class="chat" aria-label="Chat" hidden>
+              <ol
+                id="chat-log"
+                class="chat-log"
+                role="log"
+                aria-live="polite"
+                aria-relevant="additions"
+              ></ol>
+              <p id="chat-empty" class="chat-empty">
+                Nothing has been said since you joined. This room keeps no history: what was said
+                before you arrived is not here, and what is said now goes when you leave.
+              </p>
+              <form id="chat-form" class="chat-form" novalidate>
+                <input
+                  id="chat-text"
+                  class="chat-text"
+                  type="text"
+                  maxlength="2000"
+                  placeholder="Say something"
+                  aria-label="Message to everyone in the room"
+                  autocomplete="off"
+                  spellcheck="true"
+                  enterkeyhint="send"
+                />
+                <button id="chat-send" class="chat-send" type="submit">Send</button>
+              </form>
+              <p id="chat-note" class="chat-note" hidden></p>
+            </section>
 
             <footer class="foot">
               <span id="foot-url"></span>

@@ -49,6 +49,15 @@ import {
   sizeChange,
   stagePlan,
 } from "/stage.js";
+import {
+  KEEP_LINES,
+  NOT_ALLOWED,
+  afterArrival,
+  canSend,
+  clockOf,
+  lineFrom,
+  unreadLabel,
+} from "/chat.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 
@@ -176,6 +185,18 @@ const el = {
   peopleToggle: document.getElementById("people-toggle"),
   peopleCount: document.getElementById("people-count"),
   participants: document.getElementById("participants"),
+  rosterSheet: document.getElementById("roster-sheet"),
+  peopleTab: document.getElementById("people-tab"),
+  peopleUnread: document.getElementById("people-unread"),
+  chatTab: document.getElementById("chat-tab"),
+  chatUnread: document.getElementById("chat-unread"),
+  chat: document.getElementById("chat"),
+  chatLog: document.getElementById("chat-log"),
+  chatEmpty: document.getElementById("chat-empty"),
+  chatForm: document.getElementById("chat-form"),
+  chatText: document.getElementById("chat-text"),
+  chatSend: document.getElementById("chat-send"),
+  chatNote: document.getElementById("chat-note"),
   stage: document.getElementById("stage"),
   spotlight: document.getElementById("spotlight"),
   cards: document.getElementById("cards"),
@@ -332,6 +353,15 @@ let benchTimer = null;
 let lastReading = null;
 let tiles = null;
 let showBench = false;
+/**
+ * How much of what was said has not been read, and which of the column's two
+ * panels is showing. There is no message array beside them: the panel's own
+ * markup is the state, which is what keeps a room event from rebuilding the
+ * log and taking the scroll position and the live region's announcements with
+ * it.
+ */
+let unread = 0;
+let panel = "people";
 let pinnedShare = null;
 let stageShare = null;
 let stageFocus = null;
@@ -384,6 +414,9 @@ async function start() {
   el.benchToggle.addEventListener("click", onBenchToggle);
   el.barMore.addEventListener("click", () => toggleTray());
   el.peopleToggle.addEventListener("click", () => togglePeople());
+  el.peopleTab.addEventListener("click", () => showPanel("people"));
+  el.chatTab.addEventListener("click", () => showPanel("chat"));
+  el.chatForm.addEventListener("submit", onChatSubmit);
   el.leave.addEventListener("click", () => leave("You left the room."));
   el.enableAudio.addEventListener("click", onEnableAudio);
   el.noticeDismiss.addEventListener("click", () => clearNotice());
@@ -401,6 +434,7 @@ async function start() {
   buildDenoiseReadout();
   paintBenchToggle();
   paintControls();
+  paintChat();
 
   settings = await loadSettings(arrival.room);
   el.name.maxLength = settings.maxNameLength;
@@ -730,6 +764,8 @@ async function connect(credentials) {
     .on(lk.RoomEvent.TrackStreamStateChanged, render)
     .on(lk.RoomEvent.LocalTrackPublished, render)
     .on(lk.RoomEvent.LocalTrackUnpublished, render)
+    .on(lk.RoomEvent.ChatMessage, onChatMessage)
+    .on(lk.RoomEvent.ParticipantPermissionsChanged, onPermissions)
     .on(lk.RoomEvent.ConnectionStateChanged, onConnectionState)
     .on(lk.RoomEvent.AudioPlaybackStatusChanged, onPlaybackStatus)
     .on(lk.RoomEvent.Disconnected, onDisconnected);
@@ -765,6 +801,7 @@ function enterRoom(credentials) {
   onPlaybackStatus();
   paintControls();
   paintDevices();
+  paintChat();
   render();
   if (arrivalNotice) {
     showNotice(arrivalNotice);
@@ -801,6 +838,7 @@ async function leave(reason) {
   dropAllLevels();
   tiles.clear();
   clearCards();
+  clearChat();
   leaveFullscreen();
   scheduleShareRecheck(null);
   paintShare(null, false);
@@ -1100,6 +1138,10 @@ function togglePeople(open) {
   el.peopleToggle.setAttribute("aria-expanded", String(next));
   if (!next) keepFocus(el.roster, el.peopleToggle);
   paintPeople();
+  if (chatShowing()) {
+    unread = 0;
+    paintChat();
+  }
 }
 
 /**
@@ -1124,11 +1166,159 @@ function paintPeople() {
   const count = el.participants.children.length;
   const many = count === 1 ? "Just you" : `${count} people`;
   const open = el.roster.dataset.people === "open";
+  const news = unread === 0 ? "" : ` ${unread} unread ${unread === 1 ? "message" : "messages"}.`;
   el.peopleCount.textContent = many;
   el.peopleToggle.setAttribute(
     "aria-label",
-    `${many} in the room. Press to ${open ? "hide" : "show"} the list.`,
+    `${many} in the room. Press to ${open ? "hide" : "show"} the list.${news}`,
   );
+}
+
+async function onChatSubmit(event) {
+  event.preventDefault();
+
+  const verdict = canSend({
+    connected: room !== null && room.state === "connected",
+    allowed: mayPublishData(),
+    text: el.chatText.value,
+  });
+
+  if (!verdict.send) {
+    sayChat(verdict.reason);
+    return;
+  }
+
+  el.chatText.value = "";
+  el.chatSend.disabled = true;
+  sayChat("");
+
+  try {
+    await room.localParticipant.sendChatMessage(verdict.text);
+  } catch (error) {
+    el.chatText.value = verdict.text;
+    sayChat(`That message did not leave this browser: ${(error && error.message) || error}.`);
+  } finally {
+    paintChat();
+  }
+}
+
+function onChatMessage(message, participant) {
+  const labels = labelsFor([room.localParticipant, ...room.remoteParticipants.values()]);
+  const line = lineFrom(
+    message,
+    participant,
+    room.localParticipant,
+    participant && labels.get(participant.identity),
+  );
+
+  if (!line) return;
+
+  appendChatLine(line);
+  unread = afterArrival(unread, chatShowing());
+  paintChat();
+}
+
+function onPermissions(_previous, participant) {
+  if (room && participant === room.localParticipant) paintChat();
+}
+
+function appendChatLine(line) {
+  const log = el.chatLog;
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+
+  const row = document.createElement("li");
+  row.dataset.mine = String(line.mine);
+
+  const who = document.createElement("span");
+  who.className = "who";
+  who.textContent = line.label;
+  if (line.mine) {
+    const you = document.createElement("span");
+    you.className = "you";
+    you.textContent = "you";
+    who.append(" ", you);
+  }
+
+  const when = document.createElement("time");
+  when.className = "when";
+  when.dateTime = new Date(line.at).toISOString();
+  when.textContent = clockOf(line.at);
+
+  const said = document.createElement("p");
+  said.className = "said";
+  said.setAttribute("dir", "auto");
+  said.textContent = line.text;
+
+  row.append(who, when, said);
+  log.append(row);
+
+  while (log.children.length > KEEP_LINES) log.firstElementChild.remove();
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+function showPanel(which) {
+  panel = which;
+  el.roster.dataset.panel = which;
+  el.participants.hidden = which !== "people";
+  el.chat.hidden = which !== "chat";
+  el.peopleTab.setAttribute("aria-pressed", String(which === "people"));
+  el.chatTab.setAttribute("aria-pressed", String(which === "chat"));
+
+  if (chatShowing()) unread = 0;
+
+  paintChat();
+  paintPeople();
+
+  if (which === "chat") el.chatText.focus();
+}
+
+/**
+ * Whether the chat panel is on the screen, measured rather than guessed. On a
+ * phone the sheet is put away with `display: none`, so a chosen tab is not the
+ * same thing as a visible panel, and unread would reset for somebody who never
+ * saw it.
+ */
+function chatShowing() {
+  return el.chat.offsetParent !== null;
+}
+
+function paintChat() {
+  const allowed = mayPublishData();
+
+  el.chatEmpty.hidden = el.chatLog.children.length > 0;
+  el.chatUnread.textContent = String(unread);
+  el.chatUnread.hidden = unread === 0;
+  el.peopleUnread.textContent = String(unread);
+  el.peopleUnread.hidden = unread === 0 || panel === "chat";
+  el.chatTab.setAttribute("aria-label", unreadLabel(unread));
+  el.chatText.disabled = room === null;
+  el.chatSend.disabled = room === null || !allowed;
+
+  if (!allowed) sayChat(NOT_ALLOWED);
+  else if (el.chatNote.textContent === NOT_ALLOWED) sayChat("");
+}
+
+/**
+ * The server drops a data packet from somebody whose token does not carry the
+ * right and says nothing about it, so the refusal has to be shown here: an
+ * attempt would resolve as if it had been sent.
+ */
+function mayPublishData() {
+  const permissions = room ? room.localParticipant.permissions : null;
+  return !permissions || permissions.canPublishData !== false;
+}
+
+function sayChat(text) {
+  el.chatNote.textContent = text;
+  el.chatNote.hidden = text === "";
+}
+
+function clearChat() {
+  el.chatLog.replaceChildren();
+  el.chatText.value = "";
+  unread = 0;
+  sayChat("");
+  showPanel("people");
 }
 
 function onKeydown(event) {

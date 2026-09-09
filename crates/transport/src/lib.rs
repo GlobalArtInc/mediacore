@@ -1,5 +1,6 @@
 mod bwe;
 mod crypto;
+mod data;
 mod error;
 mod negotiation;
 mod peer;
@@ -12,6 +13,10 @@ pub use bwe::{
     SendQueueEntry, clamp_desired,
 };
 pub use crypto::TransportCrypto;
+pub use data::{
+    DATA_QUEUE_CAPACITY, DataChannel, DataSettings, IncomingData, LOSSY_LABEL, MAX_DATA_PACKET,
+    OutgoingData, RELIABLE_LABEL,
+};
 pub use error::TransportError;
 pub use negotiation::{
     LocalOffer, MediaSpec, NEGOTIATION_BACKLOG, NEGOTIATION_TIMEOUT, Negotiation,

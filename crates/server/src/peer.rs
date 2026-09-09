@@ -6,9 +6,13 @@ use mediacore_proto::mediacore::{self, signal_response};
 use mediacore_room::Joined;
 use mediacore_transport::str0m::format::{Codec, PayloadParams};
 use mediacore_transport::str0m::media::MediaKind;
-use mediacore_transport::{MediaInfo, PeerEvent, PeerEvents, PeerHandle};
+use mediacore_transport::{
+    DataChannel, IncomingData, MediaInfo, PeerEvent, PeerEvents, PeerHandle,
+};
+use prost::Message as _;
 use tokio::task::JoinHandle;
 
+use crate::data::{DataLimiter, distribute};
 use crate::forward::TrackSource;
 use crate::publisher::PublisherStats;
 use crate::simulcast::{LayerMap, apply_quality_update};
@@ -17,6 +21,7 @@ use crate::state::AppState;
 pub struct PublisherSession {
     stats: Arc<PublisherStats>,
     handle: Option<PeerHandle>,
+    data: DataLimiter,
     events: Option<PeerEvents>,
     task: Option<JoinHandle<()>>,
     queued_candidates: Vec<String>,
@@ -39,6 +44,7 @@ impl PublisherSession {
         Self {
             stats: state.publishers.register(participant_sid),
             handle: None,
+            data: DataLimiter::new(&state.config.data),
             events: None,
             task: None,
             queued_candidates: Vec::new(),
@@ -144,6 +150,11 @@ impl PublisherSession {
             }
             PeerEvent::MediaAdded(info) => self.on_media_added(state, joined, info),
             PeerEvent::MediaChanged(info) => self.on_media_changed(state, joined, &info),
+            PeerEvent::ChannelOpen(channel) => self.on_channel_open(state, joined, channel),
+            PeerEvent::Data(data) => self.on_data(state, joined, data),
+            PeerEvent::ChannelClose(channel) => {
+                state.data.closed(&joined.participant.sid, channel);
+            }
             PeerEvent::NegotiationFailed => {
                 tracing::warn!(
                     identity = %joined.participant.identity,
@@ -291,7 +302,85 @@ impl PublisherSession {
         self.taps.clear();
         self.events = None;
         self.task = None;
+        state.data.remove(participant_sid);
         state.publishers.remove(participant_sid);
+    }
+
+    fn on_channel_open(&mut self, state: &AppState, joined: &Joined, channel: DataChannel) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+
+        state.data.opened(&joined.participant.sid, handle, channel);
+
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            ?channel,
+            "a data channel opened"
+        );
+    }
+
+    #[allow(deprecated)]
+    fn on_data(&mut self, state: &AppState, joined: &Joined, data: IncomingData) {
+        if data.payload.len() > state.config.data.max_packet_bytes as usize {
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                bytes = data.payload.len(),
+                "refusing a data packet larger than this server carries"
+            );
+            return;
+        }
+
+        if !joined.participant.can_publish_data() {
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                "refusing data from a participant who may not publish it"
+            );
+            return;
+        }
+
+        if !self.data.admit(Instant::now()) {
+            tracing::debug!(
+                identity = %joined.participant.identity,
+                "refusing a data packet over the rate this server carries"
+            );
+            return;
+        }
+
+        let Ok(mut packet) = mediacore::DataPacket::decode(data.payload.as_slice()) else {
+            tracing::warn!(
+                identity = %joined.participant.identity,
+                "undecodable data packet"
+            );
+            return;
+        };
+
+        match packet.value {
+            None | Some(mediacore::data_packet::Value::Speaker(_)) => {
+                tracing::debug!(
+                    identity = %joined.participant.identity,
+                    "refusing a data packet only the server may author"
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+
+        packet.participant_identity = joined.participant.identity.clone();
+        packet.participant_sid = joined.participant.sid.clone();
+
+        let delivered = distribute(
+            &state.data,
+            &joined.room,
+            &packet,
+            Some(&joined.participant.sid),
+        );
+
+        tracing::trace!(
+            identity = %joined.participant.identity,
+            delivered,
+            "forwarded a data packet"
+        );
     }
 
     async fn ensure_peer(&mut self, state: &AppState, joined: &Joined) -> Option<PeerHandle> {

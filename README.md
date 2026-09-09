@@ -21,7 +21,7 @@ subscriber gets is the one its own link can carry.
 | M4 | Simulcast, layer selection, dynacast | done |
 | M5 | Bandwidth estimation, allocation and pacing | done, off by default |
 | M5.5 | Meeting records, events, audio recording and upload | done, recording off by default |
-| M6 | Data channels, permissions, own SDKs | not started |
+| M6 | Data channels, permissions, own SDKs | done, without the SDKs |
 | M7 | Node registry, signal relay, TURN, drain | not started |
 | M8 | Metrics, load and interop testing | not started |
 
@@ -160,6 +160,39 @@ connection they have; `GetParticipant`, `UpdateParticipant`, `MutePublishedTrack
 people whose network is merely slow, so this is documented rather than closed;
 `room.duplicate_identity: displace` is there for a deployment that would rather have LiveKit's rule
 and its ghost-free rejoin.
+
+**People in a room can say something to each other.** Data channels are carried: what a client sends
+on its reliable or lossy channel is decoded as a `DataPacket`, checked against the sender's right to
+publish data and against a rate this server carries, and written into the data channels of the people
+it named — or of the whole room, which is what naming nobody means. The payload is never read. What
+is rewritten is the sender: `participant_identity` and `participant_sid` are stamped with the
+connection the packet arrived on, because a name a participant writes for themselves is a name anyone
+can write for anyone, and a receiver deduplicates by that sid. A packet only the server may author —
+an active-speaker update — is refused rather than relayed. `SendData` on the room API is served on
+the same path, which is how a backoffice says something to a room it is not in. Nothing is stored:
+somebody who joins at half past six sees none of the morning, and the front end says so where a
+newcomer reads it. See [Data channels](#data-channels).
+
+The front end has a chat panel beside the roster, on the two channels above and on nothing else. It
+counts what arrived while it was away, on a badge that stays visible on a phone with the sheet shut,
+and it will not turn a message into a link.
+
+**A publisher decides who may listen.** `SubscriptionPermission` is a third gate inside the one
+function all three subscription paths already pass through — a participant's own `canSubscribe`, the
+subscriber's gate, and an admin `UpdateSubscriptions` — so the publisher's word is stricter than all
+of them, the admin call included. Because a gate stops the next subscription and not the one already
+running, setting it also drops the intent behind a forward in flight, and the subscriber whose access
+changed is told with `SubscriptionPermissionUpdate` and reconciles at once rather than up to three
+seconds later. An identity named there is matched exactly, against the identity that session carries:
+elsewhere a name means a person and reaches `alice`, `alice#2` and `alice#3` together, but a gate has
+to close rather than open.
+
+**A participant can rename themselves.** `UpdateMetadata` over the signalling channel sets a name,
+metadata and attributes, subject to `canUpdateOwnMetadata` in the token and to the same
+`sessions.max_opaque_bytes` ceiling that bounds what a meeting record keeps — measured against the
+profile the patch would produce rather than the patch itself, since attributes merge key by key. It
+never carries permission: the right to change your own name is not the right to write your own
+grants. The answer is a `RequestResponse`, so a client that asked knows whether it happened.
 
 There is a server API as well as a signalling one. `mediacore.RoomService` — LiveKit's room service,
 method for method, which its own server SDKs and `lk` speak — answers at
@@ -410,6 +443,10 @@ unsubscribe stops the flow and parks the media section rather than renegotiating
 resubscribe reuses it; and the subscriber never renegotiates on codec changes. Known gaps in M2: no
 ICE restart, no receive-side estimation towards publishers, and `rtc.use_external_ip` is accepted
 but not implemented.
+Known gaps in M6: our own Rust and TypeScript SDKs are not written, so `livekit-client` and the
+LiveKit server SDKs remain the clients this server is used from; data reaches a participant over
+their publisher channel only, so a strictly LiveKit-shaped subscriber channel is not offered; and
+nothing keeps what was said, so there is no history for a late arrival.
 Known gaps: session resume (`reconnect=1`) falls back to a full join — the returning client takes
 back the identity of the session it names, but nothing else about it — the `/rtc/v1` signalling path a
 recent client tries first is not implemented so the client falls back to `/rtc`, and requests outside
@@ -444,6 +481,42 @@ Both wires are generated from them. The signalling socket carries the types as p
 API carries the same types as protobuf or as protobuf's JSON mapping, whose serialisers are generated
 beside the Rust ones from the same descriptors. Neither wire is written by hand, so neither can drift
 from the `.proto`.
+
+## Data channels
+
+```yaml
+data:
+  enabled: true
+  max_packet_bytes: 64000
+  rate: 60
+  burst: 120
+```
+
+A LiveKit client opens `_reliable` and `_lossy` on its **publisher** connection as soon as it
+connects, before it publishes anything, so even a pure listener has them; the server never opens one
+of its own and never uses the subscriber transport for data. That is why a packet is delivered by
+writing into the recipient's own publisher channel, and why somebody whose transport has not come up
+yet receives nothing rather than being waited for. A third channel the client opens, `_data_track`,
+is not carried and is ignored by name.
+
+The checks run before the packet is decoded, cheapest first: the size against `max_packet_bytes`,
+then the sender's `can_publish_data` — read off the participant rather than out of the token, because
+`UpdateParticipant` can take it away mid-call while a token stays valid for hours — then the rate.
+A refused packet is dropped and counted; nothing here ends a session, because a chat that kills a
+call is worse than a chat that loses a line.
+
+`max_packet_bytes` must not exceed the 64 KiB a data channel carries in one message, and should not
+be dropped far below it: `livekit-client` cuts text streams into 15 000-byte chunks, so a limit under
+one chunk and its envelope stops `sendText` while leaving chat working, which is the confusing half
+of a wrong number. The rate is a token bucket per publisher, held by that participant's own session
+and shared with nothing.
+
+`SendData` on the room API sends into a room from outside it. It wraps the payload in a `UserPacket`
+with no sender, which is what makes it arrive as a message from the room rather than from somebody in
+it, and it refuses `destinationSids` rather than pretending to honour it — a name in
+`destinationIdentities` is a person, so `alice` reaches every connection alice has. Naming identities
+nobody in the room answers to is a `not_found` rather than a silent success; a broadcast into a room
+where nobody has a channel open yet is not.
 
 ## Server API
 
@@ -1498,6 +1571,12 @@ and `attempts` are how many connections a node opens, the cap on one statement, 
 meetings and upload claims are believed without a heartbeat, and how many times one recording's
 upload is handed out before it is left alone. There is no value that turns recording a meeting off.
 See [Sessions](#sessions).
+
+The `data` block is the data channels and everything that stands on them: `enabled` carries them at
+all, `max_packet_bytes` is the largest packet forwarded, and `rate` and `burst` are the token bucket
+each publisher gets. On by default, because a client opens its channels before it publishes anything
+and a server that takes them and forwards nothing loses messages silently. See
+[Data channels](#data-channels).
 
 The `events` block is who is told what happens as it happens: `webhooks.urls` and `kafka.brokers` are
 the destinations, `directory` is the outbox that holds what has been promised and not yet taken, and

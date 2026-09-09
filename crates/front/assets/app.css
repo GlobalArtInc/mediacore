@@ -487,6 +487,128 @@ li[data-speaking="true"] .state {
   color: var(--text);
 }
 
+.panel-tabs {
+  display: flex;
+  gap: 0.3rem;
+  padding: 0.5rem 0.5rem 0;
+}
+
+.panel-tab {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.panel-tab[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--raised);
+  border-color: #38424e;
+}
+
+.unread {
+  min-width: 1.15rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem;
+  display: grid;
+  gap: 0.55rem;
+  align-content: start;
+}
+
+.chat-log li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0 0.5rem;
+}
+
+.chat-log .who {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.chat-log li[data-mine="true"] .who {
+  color: var(--accent);
+}
+
+.when {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--faint);
+}
+
+.said {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-empty {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  color: var(--faint);
+  font-size: 0.8rem;
+}
+
+.chat-form {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border-top: 1px solid var(--line-soft);
+}
+
+.chat-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-send {
+  flex: none;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  color: var(--text);
+}
+
+.chat-note {
+  margin: 0;
+  padding: 0 0.7rem 0.5rem;
+  color: var(--warn);
+  font-size: 0.76rem;
+}
+
+
 /* ------------------------------------------------------------------ stage */
 
 .main {
@@ -1570,6 +1692,8 @@ li[data-speaking="true"] .state {
   .switch,
   .link-button,
   .people-toggle,
+  .panel-tab,
+  .chat-send,
   .foot-notice,
   .toggle,
   #join {
@@ -1751,6 +1875,10 @@ li[data-speaking="true"] .state {
 
   .roster[data-people="open"] .foot {
     display: flex;
+  }
+
+  .roster[data-panel="chat"] .foot {
+    display: none;
   }
 
   .stage {

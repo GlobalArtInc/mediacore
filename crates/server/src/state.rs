@@ -13,6 +13,7 @@ use mediacore_transport::{Bitrate, BweSettings};
 
 use crate::bandwidth::Subscribers;
 use crate::caretaker::Caretaker;
+use crate::data::DataRouter;
 use crate::events;
 use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
@@ -27,6 +28,10 @@ pub struct AppState {
     pub publishers: Arc<Publishers>,
     pub router: Arc<MediaRouter>,
     pub bandwidth: Arc<Subscribers>,
+    /// Where a participant's open data channels are found, so that a packet
+    /// arriving on one session can be written into another's without going
+    /// through the room, which knows nothing about transports.
+    pub data: Arc<DataRouter>,
     /// Where the rooms announce what happens in them. Held here as well as in
     /// the registry so that `/healthz` can say how many events this server has
     /// emitted without going through a room.
@@ -115,6 +120,7 @@ impl AppState {
             publishers: Arc::new(Publishers::default()),
             router: Arc::new(MediaRouter::default()),
             bandwidth: Arc::new(Subscribers::default()),
+            data: Arc::new(DataRouter::default()),
             events,
             delivery,
             recording,

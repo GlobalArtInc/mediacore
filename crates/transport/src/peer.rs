@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpApi, SdpOffer, SdpPendingOffer};
+use str0m::channel::{ChannelData, ChannelId};
 use str0m::format::{Codec, PayloadParams};
 use str0m::media::{
     Direction, KeyframeRequest, KeyframeRequestKind, MediaAdded, MediaChanged, MediaData,
@@ -22,6 +23,9 @@ use tracing::Instrument as _;
 
 use crate::bwe::{BweSettings, PeerReport, SendQueueEntry, clamp_desired};
 use crate::crypto::TransportCrypto;
+use crate::data::{
+    DATA_QUEUE_CAPACITY, DataChannel, DataChannels, DataSettings, IncomingData, OutgoingData,
+};
 use crate::error::TransportError;
 use crate::negotiation::{
     LocalOffer, NEGOTIATION_BACKLOG, NEGOTIATION_TIMEOUT, Negotiation, Queued, Renegotiation,
@@ -59,12 +63,14 @@ pub struct PeerConfig {
     pub command_queue: usize,
     pub media_queue: usize,
     pub write_queue: usize,
+    pub data_queue: usize,
     pub ice_disconnected_grace: Duration,
     pub negotiation_timeout: Duration,
     pub negotiation_backlog: usize,
     pub layer_silence: Duration,
     pub keyframe_probe: Option<KeyframeProbe>,
     pub bwe: Option<BweSettings>,
+    pub data: Option<DataSettings>,
 }
 
 impl Default for PeerConfig {
@@ -78,12 +84,14 @@ impl Default for PeerConfig {
             command_queue: COMMAND_QUEUE_CAPACITY,
             media_queue: MEDIA_QUEUE_CAPACITY,
             write_queue: WRITE_QUEUE_CAPACITY,
+            data_queue: DATA_QUEUE_CAPACITY,
             ice_disconnected_grace: ICE_DISCONNECTED_GRACE,
             negotiation_timeout: NEGOTIATION_TIMEOUT,
             negotiation_backlog: NEGOTIATION_BACKLOG,
             layer_silence: LAYER_SILENCE_THRESHOLD,
             keyframe_probe: None,
             bwe: None,
+            data: None,
         }
     }
 }
@@ -189,6 +197,9 @@ pub enum PeerEvent {
     BitrateEstimate { bitrate: Bitrate, at: Instant },
     RembRequested { mid: Mid, bitrate: Bitrate },
     LayerActivity(LayerActivity),
+    ChannelOpen(DataChannel),
+    Data(IncomingData),
+    ChannelClose(DataChannel),
     Disconnected,
 }
 
@@ -251,14 +262,21 @@ pub struct PeerHandle {
     id: SessionId,
     role: PeerRole,
     bwe: Option<BweSettings>,
+    data: Option<DataSettings>,
     ice_creds: Arc<RwLock<IceCreds>>,
     dropped_media: Arc<AtomicU64>,
     dropped_writes: Arc<AtomicU64>,
     unroutable_writes: Arc<AtomicU64>,
     missed_keyframes: Arc<AtomicU64>,
     keyframes_without_stream: Arc<AtomicU64>,
+    dropped_data: Arc<AtomicU64>,
+    incoming_data_dropped: Arc<AtomicU64>,
+    unroutable_data: Arc<AtomicU64>,
+    refused_data: Arc<AtomicU64>,
+    oversized_data: Arc<AtomicU64>,
     tx: mpsc::Sender<PeerCommand>,
     rtp: mpsc::Sender<Box<OutgoingRtp>>,
+    data_tx: mpsc::Sender<Box<OutgoingData>>,
 }
 
 impl PeerHandle {
@@ -276,6 +294,14 @@ impl PeerHandle {
 
     pub fn estimates_bandwidth(&self) -> bool {
         self.bwe.is_some()
+    }
+
+    pub fn data(&self) -> Option<DataSettings> {
+        self.data
+    }
+
+    pub fn carries_data(&self) -> bool {
+        self.data.is_some()
     }
 
     pub fn ice_creds(&self) -> IceCreds {
@@ -303,6 +329,26 @@ impl PeerHandle {
 
     pub fn keyframe_requests_without_stream(&self) -> u64 {
         self.keyframes_without_stream.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_data_writes(&self) -> u64 {
+        self.dropped_data.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_incoming_data(&self) -> u64 {
+        self.incoming_data_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn unroutable_data_writes(&self) -> u64 {
+        self.unroutable_data.load(Ordering::Relaxed)
+    }
+
+    pub fn refused_data_writes(&self) -> u64 {
+        self.refused_data.load(Ordering::Relaxed)
+    }
+
+    pub fn oversized_data_packets(&self) -> u64 {
+        self.oversized_data.load(Ordering::Relaxed)
     }
 
     pub async fn accept_offer(&self, sdp: String) -> Result<String, TransportError> {
@@ -451,6 +497,29 @@ impl PeerHandle {
         }
     }
 
+    pub fn write_data(&self, packet: OutgoingData) -> Result<(), TransportError> {
+        let Some(settings) = self.data else {
+            return Err(TransportError::DataDisabled);
+        };
+
+        if packet.payload.len() > settings.max_packet {
+            self.oversized_data.fetch_add(1, Ordering::Relaxed);
+            return Err(TransportError::DataPacketTooLarge {
+                bytes: packet.payload.len(),
+                limit: settings.max_packet,
+            });
+        }
+
+        match self.data_tx.try_send(Box::new(packet)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::PeerGone),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_data.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
     pub fn close(&self) {
         let _ = self.notify(PeerCommand::Close);
     }
@@ -484,14 +553,16 @@ impl PeerHandle {
 pub struct PeerEvents {
     control: mpsc::UnboundedReceiver<PeerEvent>,
     media: mpsc::Receiver<PeerEvent>,
+    data: mpsc::Receiver<PeerEvent>,
     control_open: bool,
     media_open: bool,
+    data_open: bool,
 }
 
 impl PeerEvents {
     pub async fn recv(&mut self) -> Option<PeerEvent> {
         loop {
-            if !self.control_open && !self.media_open {
+            if !self.control_open && !self.media_open && !self.data_open {
                 return None;
             }
 
@@ -501,6 +572,11 @@ impl PeerEvents {
                 control = self.control.recv(), if self.control_open => match control {
                     Some(event) => return Some(event),
                     None => self.control_open = false,
+                },
+
+                data = self.data.recv(), if self.data_open => match data {
+                    Some(event) => return Some(event),
+                    None => self.data_open = false,
                 },
 
                 media = self.media.recv(), if self.media_open => match media {
@@ -521,6 +597,7 @@ impl std::fmt::Debug for PeerEvents {
         f.debug_struct("PeerEvents")
             .field("control_open", &self.control_open)
             .field("media_open", &self.media_open)
+            .field("data_open", &self.data_open)
             .finish()
     }
 }
@@ -576,6 +653,8 @@ fn build_peer(
     let (rtp_tx, writes) = mpsc::channel(config.write_queue.max(1));
     let (control_tx, control) = mpsc::unbounded_channel();
     let (media_tx, media) = mpsc::channel(config.media_queue.max(1));
+    let (data_tx, data_writes) = mpsc::channel(config.data_queue.max(1));
+    let (incoming_data_tx, incoming_data) = mpsc::channel(config.data_queue.max(1));
 
     let creds = Arc::new(RwLock::new(ice_creds));
     let dropped_media = Arc::new(AtomicU64::new(0));
@@ -583,19 +662,31 @@ fn build_peer(
     let unroutable_writes = Arc::new(AtomicU64::new(0));
     let missed_keyframes = Arc::new(AtomicU64::new(0));
     let keyframes_without_stream = Arc::new(AtomicU64::new(0));
+    let dropped_data = Arc::new(AtomicU64::new(0));
+    let incoming_data_dropped = Arc::new(AtomicU64::new(0));
+    let unroutable_data = Arc::new(AtomicU64::new(0));
+    let refused_data = Arc::new(AtomicU64::new(0));
+    let oversized_data = Arc::new(AtomicU64::new(0));
 
     let handle = PeerHandle {
         id: route.id(),
         role: config.role,
         bwe: config.bwe,
+        data: config.data,
         ice_creds: Arc::clone(&creds),
         dropped_media: Arc::clone(&dropped_media),
         dropped_writes,
         unroutable_writes: Arc::clone(&unroutable_writes),
         missed_keyframes: Arc::clone(&missed_keyframes),
         keyframes_without_stream: Arc::clone(&keyframes_without_stream),
+        dropped_data,
+        incoming_data_dropped: Arc::clone(&incoming_data_dropped),
+        unroutable_data: Arc::clone(&unroutable_data),
+        refused_data: Arc::clone(&refused_data),
+        oversized_data: Arc::clone(&oversized_data),
         tx,
         rtp: rtp_tx,
+        data_tx,
     };
 
     let actor = PeerActor {
@@ -606,11 +697,14 @@ fn build_peer(
         datagrams,
         commands,
         writes,
+        data_writes,
         unroutable_writes,
         sink: EventSink {
             control: control_tx,
             media: media_tx,
+            data: incoming_data_tx,
             dropped: dropped_media,
+            dropped_data: incoming_data_dropped,
             reported: 0,
             reported_at: None,
         },
@@ -622,19 +716,27 @@ fn build_peer(
         probe: config.keyframe_probe.clone(),
         layer_silence: config.layer_silence,
         bwe: config.bwe,
+        data: config.data,
+        channels: DataChannels::default(),
         send_streams: Vec::new(),
         missed_keyframes,
         keyframes_without_stream,
+        unroutable_data,
+        refused_data,
+        oversized_data,
         drain_deadline: None,
         commands_closed: false,
         writes_closed: false,
+        data_writes_closed: false,
     };
 
     let events = PeerEvents {
         control,
         media,
+        data: incoming_data,
         control_open: true,
         media_open: true,
+        data_open: true,
     };
 
     Ok((handle, actor, events))
@@ -714,7 +816,9 @@ fn build_rtc(
 struct EventSink {
     control: mpsc::UnboundedSender<PeerEvent>,
     media: mpsc::Sender<PeerEvent>,
+    data: mpsc::Sender<PeerEvent>,
     dropped: Arc<AtomicU64>,
+    dropped_data: Arc<AtomicU64>,
     reported: u64,
     reported_at: Option<Instant>,
 }
@@ -729,6 +833,18 @@ impl EventSink {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.note_drop(Instant::now());
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn emit_data(&mut self, event: PeerEvent) -> bool {
+        match self.data.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let total = self.dropped_data.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(total, "data event queue is full, dropping a data packet");
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -801,6 +917,7 @@ struct PeerActor {
     datagrams: DatagramRx,
     commands: mpsc::Receiver<PeerCommand>,
     writes: mpsc::Receiver<Box<OutgoingRtp>>,
+    data_writes: mpsc::Receiver<Box<OutgoingData>>,
     unroutable_writes: Arc<AtomicU64>,
     sink: EventSink,
     creds: Arc<RwLock<IceCreds>>,
@@ -811,12 +928,18 @@ struct PeerActor {
     probe: Option<KeyframeProbe>,
     layer_silence: Duration,
     bwe: Option<BweSettings>,
+    data: Option<DataSettings>,
+    channels: DataChannels,
     send_streams: Vec<(Mid, Option<Rid>)>,
     missed_keyframes: Arc<AtomicU64>,
     keyframes_without_stream: Arc<AtomicU64>,
+    unroutable_data: Arc<AtomicU64>,
+    refused_data: Arc<AtomicU64>,
+    oversized_data: Arc<AtomicU64>,
     drain_deadline: Option<Instant>,
     commands_closed: bool,
     writes_closed: bool,
+    data_writes_closed: bool,
 }
 
 impl PeerActor {
@@ -882,6 +1005,11 @@ impl PeerActor {
                 packet = self.writes.recv(), if !self.writes_closed => match packet {
                     Some(packet) => self.write_rtp(*packet),
                     None => self.writes_closed = true,
+                },
+
+                packet = self.data_writes.recv(), if !self.data_writes_closed => match packet {
+                    Some(packet) => self.write_data(*packet),
+                    None => self.data_writes_closed = true,
                 },
 
                 _ = &mut sleep => {
@@ -1480,6 +1608,68 @@ impl PeerActor {
         }
     }
 
+    fn open_channel(&mut self, id: ChannelId, label: &str) -> Option<DataChannel> {
+        self.data?;
+
+        let channel = self.channels.opened(id, label)?;
+
+        tracing::debug!(?channel, label, "a data channel opened");
+
+        Some(channel)
+    }
+
+    fn incoming_data(&mut self, data: ChannelData) -> Option<IncomingData> {
+        let settings = self.data?;
+        let channel = self.channels.kind(data.id)?;
+
+        if data.data.len() > settings.max_packet {
+            self.oversized_data.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                ?channel,
+                bytes = data.data.len(),
+                limit = settings.max_packet,
+                "dropping an oversized data packet"
+            );
+            return None;
+        }
+
+        Some(IncomingData {
+            channel,
+            binary: data.binary,
+            payload: data.data,
+        })
+    }
+
+    fn write_data(&mut self, packet: OutgoingData) {
+        let Some(id) = self.channels.id(packet.channel) else {
+            self.unroutable_data.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(channel = ?packet.channel, "no data channel is open");
+            return;
+        };
+
+        let Some(mut channel) = self.rtc.channel(id) else {
+            self.unroutable_data.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(channel = ?packet.channel, "the data channel is not writable");
+            return;
+        };
+
+        match channel.write(packet.binary, &packet.payload) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.refused_data.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    channel = ?packet.channel,
+                    bytes = packet.payload.len(),
+                    "the sctp send buffer refused a data packet"
+                );
+            }
+            Err(error) => {
+                self.unroutable_data.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(channel = ?packet.channel, %error, "writing to a data channel failed");
+            }
+        }
+    }
+
     fn codec_for(&mut self, pt: Pt) -> Option<Codec> {
         if let Some(codec) = self.codecs.get(&pt) {
             return Some(*codec);
@@ -1650,10 +1840,22 @@ impl PeerActor {
                 self.rtc.disconnect();
                 false
             }
-            Event::ChannelOpen(..)
-            | Event::ChannelData(_)
-            | Event::ChannelClose(_)
-            | Event::ChannelBufferedAmountLow(_)
+            Event::ChannelOpen(id, label) => match self.open_channel(id, &label) {
+                Some(channel) => self.sink.emit_control(PeerEvent::ChannelOpen(channel)),
+                None => true,
+            },
+            Event::ChannelData(data) => match self.incoming_data(data) {
+                Some(incoming) => self.sink.emit_data(PeerEvent::Data(incoming)),
+                None => true,
+            },
+            Event::ChannelClose(id) => match self.channels.closed(id) {
+                Some(channel) => {
+                    tracing::debug!(?channel, "a data channel closed");
+                    self.sink.emit_control(PeerEvent::ChannelClose(channel))
+                }
+                None => true,
+            },
+            Event::ChannelBufferedAmountLow(_)
             | Event::SenderFeedback(_)
             | Event::AppSpecificFeedback(_)
             | Event::RawPacket(_) => true,

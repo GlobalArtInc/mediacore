@@ -8,6 +8,7 @@ use mediacore_auth::Claims;
 use mediacore_proto::mediacore;
 use mediacore_room::{Adoption, Participant, ProfileUpdate, Room, RoomOptions};
 
+use crate::data::distribute;
 use crate::state::AppState;
 use crate::twirp::{self, Codec, Error};
 
@@ -195,11 +196,14 @@ pub const METHODS: &[Method] = &[
     },
     Method {
         name: "SendData",
-        support: Support::Refused(
-            "SendData needs a data channel, and mediacore does not carry data packets yet",
-        ),
-        requires: &[],
-        note: "",
+        support: Support::Served(Grant::Admin),
+        requires: &["room"],
+        note: "Delivered over the participants' own data channels, so a participant whose \
+               channel has not opened yet receives nothing and is not waited for. The payload \
+               is wrapped in a `UserPacket` with no sender, which is what makes it arrive as \
+               a message from the room rather than from somebody in it. \
+               `destinationSids` is refused: a name in `destinationIdentities` is a person, \
+               so `alice` reaches every connection alice has, `alice#2` included.",
     },
     Method {
         name: "UpdateRoomMetadata",
@@ -425,6 +429,7 @@ fn serve(
             codec,
             update_subscriptions(state, &claims, decode(codec, body)?)?,
         ),
+        "SendData" => encode(codec, send_data(state, &claims, decode(codec, body)?)?),
         "UpdateRoomMetadata" => encode(
             codec,
             update_room_metadata(state, &claims, decode(codec, body)?)?,
@@ -779,6 +784,58 @@ fn update_subscriptions(
     room.update_subscriptions(&participant.sid, &update);
 
     Ok(mediacore::UpdateSubscriptionsResponse {})
+}
+
+#[allow(deprecated)]
+fn send_data(
+    state: &AppState,
+    claims: &Claims,
+    request: mediacore::SendDataRequest,
+) -> Result<mediacore::SendDataResponse, Error> {
+    require(&request.room, "room")?;
+    ensure_admin(claims, &request.room)?;
+
+    if !request.destination_sids.is_empty() {
+        return Err(Error::unimplemented(
+            "destinationSids names connections and mediacore will not answer as if it had \
+             honoured it; name the people in destinationIdentities instead",
+        ));
+    }
+
+    if request.data.len() > state.config.data.max_packet_bytes as usize {
+        return Err(Error::invalid_argument(format!(
+            "data is {} bytes, over the {} this server carries in one packet",
+            request.data.len(),
+            state.config.data.max_packet_bytes
+        )));
+    }
+
+    let room = room_of(state, &request.room)?;
+    let named = !request.destination_identities.is_empty();
+    let packet = mediacore::DataPacket {
+        kind: request.kind,
+        destination_identities: request.destination_identities,
+        value: Some(mediacore::data_packet::Value::User(mediacore::UserPacket {
+            payload: request.data,
+            topic: request.topic,
+            nonce: request.nonce,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+
+    let delivered = distribute(&state.data, &room, &packet, None);
+
+    if named && delivered == 0 {
+        return Err(Error::not_found(format!(
+            "room `{}` has nobody listening under the identities named",
+            request.room
+        )));
+    }
+
+    tracing::info!(room = %request.room, delivered, "the room service sent a data packet");
+
+    Ok(mediacore::SendDataResponse {})
 }
 
 fn update_room_metadata(

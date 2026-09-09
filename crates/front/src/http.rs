@@ -28,6 +28,7 @@ const BENCH_JS: &str = include_str!("../assets/bench.js");
 const READOUT_JS: &str = include_str!("../assets/readout.js");
 const STAGE_JS: &str = include_str!("../assets/stage.js");
 const ROOM_JS: &str = include_str!("../assets/room.js");
+const CHAT_JS: &str = include_str!("../assets/chat.js");
 const PREFS_JS: &str = include_str!("../assets/prefs.js");
 const VOICE_JS: &str = include_str!("../assets/voice.js");
 const LEVEL_METER_JS: &str = include_str!("../assets/level-meter.js");
@@ -113,6 +114,7 @@ pub fn router(config: Config) -> Router {
         .route("/readout.js", get(readout))
         .route("/stage.js", get(stage))
         .route("/room.js", get(room))
+        .route("/chat.js", get(chat))
         .route("/prefs.js", get(prefs))
         .route("/voice.js", get(voice))
         .route(LEVEL_METER_PATH, get(level_meter))
@@ -229,6 +231,10 @@ async fn stage() -> impl IntoResponse {
 
 async fn room() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, ROOM_JS)
+}
+
+async fn chat() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, CHAT_JS)
 }
 
 async fn prefs() -> impl IntoResponse {
@@ -517,7 +523,7 @@ async fn token(
             room: room.clone(),
             can_publish: Some(true),
             can_subscribe: Some(true),
-            can_publish_data: Some(false),
+            can_publish_data: Some(true),
             can_publish_sources: PUBLISH_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             ..VideoGrant::default()
         },
@@ -588,6 +594,7 @@ mod tests {
             ("/readout.js", READOUT_JS),
             ("/stage.js", STAGE_JS),
             ("/room.js", ROOM_JS),
+            ("/chat.js", CHAT_JS),
             ("/prefs.js", PREFS_JS),
             ("/media.js", MEDIA_JS),
             ("/voice.js", VOICE_JS),
@@ -609,6 +616,7 @@ mod tests {
             ("/bench.js", BENCH_JS),
             ("/stage.js", STAGE_JS),
             ("/room.js", ROOM_JS),
+            ("/chat.js", CHAT_JS),
             ("/prefs.js", PREFS_JS),
             ("/voice.js", VOICE_JS),
             (LEVEL_METER_PATH, LEVEL_METER_JS),
@@ -751,6 +759,7 @@ mod tests {
             ("denoise-gate.js", DENOISE_GATE_JS),
             ("denoise-probe.js", DENOISE_PROBE_JS),
             ("app.js", APP_JS),
+            ("chat.js", CHAT_JS),
             ("prefs.js", PREFS_JS),
             ("voice.js", VOICE_JS),
             ("level-meter.js", LEVEL_METER_JS),

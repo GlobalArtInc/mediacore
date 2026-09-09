@@ -8,9 +8,11 @@ use mediacore_proto::mediacore;
 use mediacore_session::{Member, SessionStore};
 use tokio::sync::mpsc;
 
+mod audience;
 mod subscription;
 mod track;
 
+pub use audience::Audience;
 pub use subscription::{SubscriptionDiff, Subscriptions};
 pub use track::{
     MAX_PUBLISHED_TRACKS, PublishError, PublishedTrack, TRACK_SID_PREFIX, TrackKind, TrackVersion,
@@ -218,6 +220,7 @@ pub struct Participant {
     version: AtomicU32,
     tracks: Mutex<Vec<PublishedTrack>>,
     subscriptions: Mutex<Subscriptions>,
+    audience: Mutex<Audience>,
     tx: Mutex<Option<SignalTx>>,
     close_reason: Mutex<Option<mediacore::DisconnectReason>>,
 }
@@ -280,6 +283,72 @@ impl Participant {
             .expect("profile lock")
             .permission
             .can_subscribe
+    }
+
+    /// Whether this publisher lets `subscriber` hear one of their tracks.
+    pub fn admits(&self, subscriber: &Participant, track_sid: &str) -> bool {
+        self.audience.lock().expect("audience lock").admits(
+            &subscriber.sid,
+            &subscriber.identity,
+            track_sid,
+        )
+    }
+
+    pub(crate) fn set_audience(&self, permission: &mediacore::SubscriptionPermission) {
+        self.audience.lock().expect("audience lock").set(permission);
+    }
+
+    pub fn can_update_metadata(&self) -> bool {
+        self.profile
+            .lock()
+            .expect("profile lock")
+            .permission
+            .can_update_metadata
+    }
+
+    /// How many bytes of name, metadata and attributes this participant would
+    /// carry once a patch is applied.
+    ///
+    /// Measured against the result rather than against the patch: attributes
+    /// are merged key by key, so a participant who may set them could otherwise
+    /// grow their profile without limit one small patch at a time.
+    pub fn profile_bytes_with(&self, update: &ProfileUpdate) -> usize {
+        let profile = self.profile.lock().expect("profile lock");
+
+        let name = update.name.as_deref().unwrap_or(&profile.name).len();
+        let metadata = update
+            .metadata
+            .as_deref()
+            .unwrap_or(&profile.metadata)
+            .len();
+
+        let mut attributes: HashMap<&str, &str> = profile
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+
+        for (key, value) in &update.attributes {
+            if value.is_empty() {
+                attributes.remove(key.as_str());
+            } else {
+                attributes.insert(key.as_str(), value.as_str());
+            }
+        }
+
+        name + metadata
+            + attributes
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+    }
+
+    pub fn can_publish_data(&self) -> bool {
+        self.profile
+            .lock()
+            .expect("profile lock")
+            .permission
+            .can_publish_data
     }
 
     pub fn can_publish_source(&self, source: mediacore::TrackSource) -> bool {
@@ -1149,6 +1218,35 @@ impl Room {
         found
     }
 
+    /// Who a data packet goes to, given the identities its sender named.
+    ///
+    /// An empty list is the whole room, which is what `livekit-client` means by
+    /// leaving `destination_identities` unset. A named identity resolves
+    /// through [`Room::participants_of`], so `alice` reaches every connection
+    /// the person called alice has, suffix and all, and a token minted for the
+    /// literal identity `bob#7` reaches that person rather than bob's seventh
+    /// tab. The sender is never a recipient of their own packet, even when they
+    /// named themselves.
+    pub fn data_recipients(
+        &self,
+        sender_sid: Option<&str>,
+        destinations: &[String],
+    ) -> Vec<Arc<Participant>> {
+        let mut found = if destinations.is_empty() {
+            self.participants()
+        } else {
+            destinations
+                .iter()
+                .flat_map(|identity| self.participants_of(identity))
+                .collect()
+        };
+
+        found.retain(|participant| Some(participant.sid.as_str()) != sender_sid);
+        found.sort_by(|left, right| left.sid.cmp(&right.sid));
+        found.dedup_by(|left, right| left.sid == right.sid);
+        found
+    }
+
     /// Renames a participant, rewrites their metadata, or changes what they may
     /// do, and tells the room about it.
     ///
@@ -1324,9 +1422,91 @@ impl Room {
         }
 
         match self.track(track_sid) {
-            Some((publisher, _)) => publisher.sid != subscriber.sid && !publisher.is_hidden(),
+            Some((publisher, _)) => {
+                publisher.sid != subscriber.sid
+                    && !publisher.is_hidden()
+                    && publisher.admits(&subscriber, track_sid)
+            }
             None => false,
         }
+    }
+
+    /// Records who a publisher lets listen, and cuts off whoever may no longer.
+    ///
+    /// The permission is a gate rather than an intent: it is asked after the
+    /// subscriber's own `canSubscribe` and after an admin `UpdateSubscriptions`,
+    /// so the publisher's word is stricter than all three and nothing routes
+    /// around it. Which is why the intent behind a subscription already running
+    /// is dropped here too: the gate stops the next subscription, and only a
+    /// vanished intent stops the one already forwarding.
+    ///
+    /// The intent is removed rather than declined. A decline is the listener's
+    /// own answer and survives auto-subscription on purpose, so declining on
+    /// their behalf would leave them with a black tile when the publisher opens
+    /// the audience again.
+    ///
+    /// Answers with how many subscriptions were cut, or `None` when no session
+    /// in this room carries that sid.
+    pub fn set_subscription_permission(
+        &self,
+        publisher_sid: &str,
+        permission: &mediacore::SubscriptionPermission,
+    ) -> Option<usize> {
+        let publisher = self.participant_by_sid(publisher_sid)?;
+        let tracks: Vec<String> = publisher
+            .tracks()
+            .into_iter()
+            .map(|track| track.sid)
+            .collect();
+        let listeners: Vec<Arc<Participant>> = self
+            .participants()
+            .into_iter()
+            .filter(|participant| participant.sid != publisher.sid)
+            .collect();
+
+        let before: Vec<Vec<bool>> = listeners
+            .iter()
+            .map(|listener| {
+                tracks
+                    .iter()
+                    .map(|track_sid| self.can_subscribe(&listener.sid, track_sid))
+                    .collect()
+            })
+            .collect();
+
+        publisher.set_audience(permission);
+
+        let mut cut = 0;
+
+        for (listener, was) in listeners.iter().zip(before) {
+            for (track_sid, was_allowed) in tracks.iter().zip(was) {
+                let allowed = self.can_subscribe(&listener.sid, track_sid);
+
+                if allowed == was_allowed {
+                    continue;
+                }
+
+                if !allowed {
+                    listener.remove_desired_subscriptions([track_sid.clone()]);
+                    cut += 1;
+                }
+
+                listener.send(subscription_permission_update(
+                    &publisher.sid,
+                    track_sid,
+                    allowed,
+                ));
+            }
+        }
+
+        tracing::info!(
+            room = %self.name,
+            identity = %publisher.identity,
+            cut,
+            "the publisher said who may listen"
+        );
+
+        Some(cut)
     }
 
     pub fn subscribable_track_sids(&self, subscriber_sid: &str) -> Vec<String> {
@@ -1345,6 +1525,7 @@ impl Room {
                 publisher
                     .tracks()
                     .into_iter()
+                    .filter(|track| publisher.admits(&subscriber, &track.sid))
                     .map(|track| track.sid)
                     .collect::<Vec<_>>()
             })
@@ -1853,6 +2034,7 @@ impl Registry {
                 version: AtomicU32::new(if replaces { 2 } else { 1 }),
                 tracks: Mutex::new(Vec::new()),
                 subscriptions: Mutex::new(Subscriptions::default()),
+                audience: Mutex::new(Audience::default()),
                 tx: Mutex::new(Some(tx)),
                 close_reason: Mutex::new(None),
             });
@@ -2081,6 +2263,20 @@ pub fn participant_update(
     mediacore::signal_response::Message::Update(mediacore::ParticipantUpdate { participants })
 }
 
+fn subscription_permission_update(
+    publisher_sid: &str,
+    track_sid: &str,
+    allowed: bool,
+) -> mediacore::signal_response::Message {
+    mediacore::signal_response::Message::SubscriptionPermissionUpdate(
+        mediacore::SubscriptionPermissionUpdate {
+            participant_sid: publisher_sid.to_owned(),
+            track_sid: track_sid.to_owned(),
+            allowed,
+        },
+    )
+}
+
 fn is_droppable(message: &mediacore::signal_response::Message) -> bool {
     use mediacore::signal_response::Message;
 
@@ -2115,6 +2311,7 @@ fn message_name(message: &mediacore::signal_response::Message) -> &'static str {
         Message::ConnectionQuality(_) => "connection_quality",
         Message::StreamStateUpdate(_) => "stream_state_update",
         Message::SubscribedQualityUpdate(_) => "subscribed_quality_update",
+        Message::SubscriptionPermissionUpdate(_) => "subscription_permission_update",
         _ => "other",
     }
 }
@@ -2968,6 +3165,140 @@ mod tests {
         assert_eq!(
             alice.participant.subscription_diff().to_unsubscribe,
             vec![track.sid]
+        );
+    }
+
+    #[test]
+    fn a_publisher_decides_who_may_listen_and_the_gate_outlasts_every_intent() {
+        let registry = registry(RoomDefaults::default());
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (bob_tx, mut bob_rx) = signal_channel();
+        let (carol_tx, _carol_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+        let carol = registry.join("demo", spec("carol"), carol_tx).unwrap();
+
+        let track = alice
+            .room
+            .publish_track(&alice.participant.sid, &camera("cid-1"))
+            .unwrap();
+
+        bob.participant
+            .set_desired_subscriptions([track.sid.clone()]);
+        assert!(alice.room.can_subscribe(&bob.participant.sid, &track.sid));
+        assert!(alice.room.can_subscribe(&carol.participant.sid, &track.sid));
+
+        let cut = alice
+            .room
+            .set_subscription_permission(
+                &alice.participant.sid,
+                &mediacore::SubscriptionPermission {
+                    all_participants: false,
+                    track_permissions: vec![mediacore::TrackPermission {
+                        participant_identity: "carol".to_owned(),
+                        all_tracks: true,
+                        ..Default::default()
+                    }],
+                },
+            )
+            .expect("alice is in the room");
+
+        assert_eq!(cut, 1, "only bob was subscribed and only bob is cut");
+        assert!(!alice.room.can_subscribe(&bob.participant.sid, &track.sid));
+        assert!(alice.room.can_subscribe(&carol.participant.sid, &track.sid));
+        assert!(
+            alice
+                .room
+                .subscribable_track_sids(&bob.participant.sid)
+                .is_empty(),
+            "auto-subscription must not put the track back"
+        );
+        assert!(
+            !bob.participant
+                .subscription_diff()
+                .to_subscribe
+                .contains(&track.sid),
+            "the intent behind the running subscription is gone"
+        );
+
+        let told = std::iter::from_fn(|| bob_rx.try_recv().ok())
+            .filter_map(|response| response.message)
+            .any(|message| {
+                matches!(
+                    message,
+                    mediacore::signal_response::Message::SubscriptionPermissionUpdate(update)
+                        if update.track_sid == track.sid && !update.allowed
+                )
+            });
+        assert!(told, "bob is told the track is no longer his to hear");
+
+        alice
+            .room
+            .set_subscription_permission(
+                &alice.participant.sid,
+                &mediacore::SubscriptionPermission {
+                    all_participants: true,
+                    track_permissions: Vec::new(),
+                },
+            )
+            .expect("alice is in the room");
+
+        assert!(alice.room.can_subscribe(&bob.participant.sid, &track.sid));
+        assert_eq!(
+            alice.room.subscribable_track_sids(&bob.participant.sid),
+            vec![track.sid.clone()],
+            "opening the audience lets auto-subscription find the track again"
+        );
+    }
+
+    #[test]
+    fn a_data_packet_goes_to_the_people_it_named_and_never_back_to_its_sender() {
+        let registry = registry(RoomDefaults::default());
+        let (alice_tx, _alice_rx) = signal_channel();
+        let (second_tx, _second_rx) = signal_channel();
+        let (bob_tx, _bob_rx) = signal_channel();
+
+        let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+        let second = registry.join("demo", spec("alice"), second_tx).unwrap();
+        let bob = registry.join("demo", spec("bob"), bob_tx).unwrap();
+
+        assert_eq!(second.participant.identity, "alice#2");
+
+        let everyone = alice
+            .room
+            .data_recipients(Some(&alice.participant.sid), &[]);
+        assert_eq!(everyone.len(), 2);
+        assert!(
+            !everyone
+                .iter()
+                .any(|participant| participant.sid == alice.participant.sid)
+        );
+
+        let to_alice = alice
+            .room
+            .data_recipients(Some(&bob.participant.sid), &["alice".to_owned()]);
+        assert_eq!(
+            to_alice.len(),
+            2,
+            "a name is a person, so both of alice's connections are named"
+        );
+
+        let named_twice = alice.room.data_recipients(
+            Some(&bob.participant.sid),
+            &["alice".to_owned(), "alice#2".to_owned()],
+        );
+        assert_eq!(named_twice.len(), 2, "naming a connection twice sends once");
+
+        let to_nobody = alice.room.data_recipients(None, &["dave".to_owned()]);
+        assert!(to_nobody.is_empty());
+
+        let to_self = alice
+            .room
+            .data_recipients(Some(&bob.participant.sid), &["bob".to_owned()]);
+        assert!(
+            to_self.is_empty(),
+            "a sender never receives their own packet"
         );
     }
 

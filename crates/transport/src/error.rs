@@ -42,6 +42,10 @@ pub enum TransportError {
     BweOnPublisher,
     #[error("this peer was built without bandwidth estimation and cannot be steered")]
     BweDisabled,
+    #[error("this peer was built without data channels and cannot carry data")]
+    DataDisabled,
+    #[error("a data packet of {bytes} bytes is over the {limit} byte limit")]
+    DataPacketTooLarge { bytes: usize, limit: usize },
     #[error("{0} is not implemented in this milestone")]
     NotImplemented(&'static str),
     #[error("webrtc error")]

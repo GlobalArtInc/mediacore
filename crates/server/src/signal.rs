@@ -9,7 +9,7 @@ use futures_util::stream::{SplitSink, StreamExt};
 use mediacore_auth::{Claims, VideoGrant};
 use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use mediacore_proto::{PROTOCOL_VERSION, SERVER_VERSION};
-use mediacore_room::{Joined, ParticipantKind, ParticipantSpec};
+use mediacore_room::{Joined, ParticipantKind, ParticipantSpec, ProfileUpdate};
 use prost::Message as _;
 use serde::Deserialize;
 use tokio::time::Instant;
@@ -183,7 +183,11 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
                 let Some(response) = outgoing else { break };
                 let Some(message) = response.message else { continue };
                 let closing = matches!(message, signal_response::Message::Leave(_));
-                let room_changed = matches!(message, signal_response::Message::Update(_));
+                let room_changed = matches!(
+                    message,
+                    signal_response::Message::Update(_)
+                        | signal_response::Message::SubscriptionPermissionUpdate(_)
+                );
 
                 if send(&mut sink, message).await.is_err() {
                     break;
@@ -319,6 +323,14 @@ async fn handle_request(
                 .send(signal_response::Message::Pong(now_ms()));
             true
         }
+        signal_request::Message::SubscriptionPermission(permission) => {
+            subscription_permission_request(joined, permission);
+            true
+        }
+        signal_request::Message::UpdateMetadata(update) => {
+            update_metadata_request(state, joined, update);
+            true
+        }
         signal_request::Message::Leave(_) => false,
         other => {
             tracing::debug!(
@@ -329,6 +341,118 @@ async fn handle_request(
             true
         }
     }
+}
+
+fn subscription_permission_request(joined: &Joined, request: mediacore::SubscriptionPermission) {
+    let Some(cut) = joined
+        .room
+        .set_subscription_permission(&joined.participant.sid, &request)
+    else {
+        tracing::debug!(
+            identity = %joined.participant.identity,
+            "a subscription permission arrived from a session the room no longer holds"
+        );
+        return;
+    };
+
+    tracing::info!(
+        identity = %joined.participant.identity,
+        all_participants = request.all_participants,
+        named = request.track_permissions.len(),
+        cut,
+        "the publisher restricted who may subscribe"
+    );
+}
+
+fn update_metadata_request(
+    state: &AppState,
+    joined: &Joined,
+    request: mediacore::UpdateParticipantMetadata,
+) {
+    if !joined.participant.can_update_metadata() {
+        refuse_metadata(
+            joined,
+            request,
+            mediacore::request_response::Reason::NotAllowed,
+            "this participant may not change their own name, metadata or attributes".to_owned(),
+        );
+        return;
+    }
+
+    let update = ProfileUpdate {
+        name: (!request.name.is_empty()).then(|| request.name.clone()),
+        metadata: (!request.metadata.is_empty()).then(|| request.metadata.clone()),
+        attributes: request.attributes.clone(),
+        permission: None,
+    };
+
+    let limit = state.config.sessions.max_opaque_bytes();
+    let bytes = joined.participant.profile_bytes_with(&update);
+
+    if bytes > limit {
+        refuse_metadata(
+            joined,
+            request,
+            mediacore::request_response::Reason::LimitExceeded,
+            format!(
+                "a participant profile is limited to {limit} bytes and this one would be {bytes}"
+            ),
+        );
+        return;
+    }
+
+    if joined
+        .room
+        .update_participant(&joined.participant.identity, update)
+        .is_none()
+    {
+        refuse_metadata(
+            joined,
+            request,
+            mediacore::request_response::Reason::NotFound,
+            "this session is no longer in the room".to_owned(),
+        );
+        return;
+    }
+
+    joined
+        .participant
+        .send(signal_response::Message::RequestResponse(
+            mediacore::RequestResponse {
+                request_id: request.request_id,
+                reason: mediacore::request_response::Reason::Ok as i32,
+                request: Some(mediacore::request_response::Request::UpdateMetadata(
+                    request,
+                )),
+                ..Default::default()
+            },
+        ));
+}
+
+fn refuse_metadata(
+    joined: &Joined,
+    request: mediacore::UpdateParticipantMetadata,
+    reason: mediacore::request_response::Reason,
+    message: String,
+) {
+    tracing::info!(
+        identity = %joined.participant.identity,
+        ?reason,
+        "refusing a profile update"
+    );
+
+    joined
+        .participant
+        .send(signal_response::Message::RequestResponse(
+            mediacore::RequestResponse {
+                request_id: request.request_id,
+                reason: reason as i32,
+                message,
+                request: Some(mediacore::request_response::Request::UpdateMetadata(
+                    request,
+                )),
+            },
+        ));
 }
 
 fn add_track_request(joined: &Joined, request: mediacore::AddTrackRequest) {
@@ -431,7 +555,6 @@ async fn subscription_request(
 fn request_name(message: &signal_request::Message) -> &'static str {
     match message {
         signal_request::Message::SyncState(_) => "sync_state",
-        signal_request::Message::UpdateMetadata(_) => "update_metadata",
         _ => "other",
     }
 }

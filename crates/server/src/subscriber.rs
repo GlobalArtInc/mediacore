@@ -177,7 +177,10 @@ impl SubscriberSession {
             | PeerEvent::Rtp(_)
             | PeerEvent::Media(_)
             | PeerEvent::IngressReport(_)
-            | PeerEvent::LayerActivity(_) => {}
+            | PeerEvent::LayerActivity(_)
+            | PeerEvent::ChannelOpen(_)
+            | PeerEvent::Data(_)
+            | PeerEvent::ChannelClose(_) => {}
             PeerEvent::Disconnected => {
                 tracing::info!(
                     identity = %joined.participant.identity,

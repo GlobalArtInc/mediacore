@@ -72,6 +72,16 @@ const {
   roomInPath,
   roomPath,
 } = await import(`file://${assetPath("room.js")}`);
+const {
+  KEEP_LINES,
+  MESSAGE_LIMIT,
+  NOT_ALLOWED,
+  NOT_CONNECTED,
+  afterArrival,
+  canSend,
+  lineFrom,
+  unreadLabel,
+} = await import(`file://${assetPath("chat.js")}`);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 const {
   ATTACK_OVER_FLOOR_DB,
@@ -1460,6 +1470,78 @@ describe("a room is an address", () => {
     );
     assert.equal(plainRoom("", "demo", "."), "");
     assert.equal(plainRoom(null, "demo", "."), "");
+  });
+});
+
+describe("what may be said in a room, and what arriving in it becomes", () => {
+  const allowed = { connected: true, allowed: true };
+
+  it("says nothing on an empty line and explains itself on a refusal", () => {
+    assert.deepEqual(canSend({ ...allowed, text: "   " }), {
+      send: false,
+      text: "",
+      reason: "",
+    });
+
+    assert.equal(
+      canSend({ connected: true, allowed: false, text: "hello" }).reason,
+      NOT_ALLOWED,
+      "a token without the right is the one refusal the server will not report itself",
+    );
+    assert.equal(canSend({ connected: false, allowed: true, text: "hello" }).reason, NOT_CONNECTED);
+  });
+
+  it("trims what is sent and stops at the length the field allows", () => {
+    assert.deepEqual(canSend({ ...allowed, text: "  hello  " }), {
+      send: true,
+      text: "hello",
+      reason: "",
+    });
+
+    const long = canSend({ ...allowed, text: "x".repeat(MESSAGE_LIMIT + 500) });
+    assert.equal(long.send, true);
+    assert.equal(long.text.length, MESSAGE_LIMIT);
+  });
+
+  it("drops a message whose sender the room does not know", () => {
+    const self = { identity: "alice" };
+
+    assert.equal(
+      lineFrom({ message: "hello", timestamp: 1 }, undefined, self, "bob"),
+      null,
+      "the sender is stamped by the server, so a message without one is not attributable",
+    );
+    assert.equal(lineFrom({ message: "   ", timestamp: 1 }, self, self, "alice"), null);
+    assert.equal(lineFrom({ timestamp: 1 }, self, self, "alice"), null);
+  });
+
+  it("marks a line as this browser's own and dates it", () => {
+    const self = { identity: "alice" };
+    const bob = { identity: "bob" };
+
+    const mine = lineFrom({ message: " hi ", timestamp: 1_700_000_000_000 }, self, self, "alice");
+    assert.deepEqual(mine, {
+      id: "",
+      text: "hi",
+      label: "alice",
+      mine: true,
+      at: 1_700_000_000_000,
+    });
+
+    const theirs = lineFrom({ message: "hi", timestamp: 0 }, bob, self, "bob (2)");
+    assert.equal(theirs.mine, false);
+    assert.equal(theirs.label, "bob (2)", "two people with one name read the same as in the roster");
+    assert.ok(theirs.at > 0, "a message without a usable clock still gets one");
+  });
+
+  it("counts what arrived while the panel was away", () => {
+    assert.equal(afterArrival(0, false), 1);
+    assert.equal(afterArrival(3, false), 4);
+    assert.equal(afterArrival(3, true), 0, "a panel on the screen is a panel being read");
+
+    assert.equal(unreadLabel(0), "Chat");
+    assert.equal(unreadLabel(2), "Chat, 2 unread");
+    assert.ok(KEEP_LINES > 0);
   });
 });
 
