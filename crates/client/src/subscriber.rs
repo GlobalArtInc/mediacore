@@ -253,7 +253,9 @@ impl Subscriber {
                 let window = self.window;
                 self.tracks
                     .entry(added.mid.to_string())
-                    .or_insert_with(|| TrackReceiver::new(added.mid.to_string(), window))
+                    .or_insert_with(|| {
+                        TrackReceiver::new(added.mid.to_string(), window, Instant::now())
+                    })
                     .describe(None, Some(kind));
             }
             Event::RtpPacket(packet) => self.on_rtp(packet),
@@ -288,7 +290,7 @@ impl Subscriber {
         let track = self
             .tracks
             .entry(mid.clone())
-            .or_insert_with(|| TrackReceiver::new(mid, window));
+            .or_insert_with(|| TrackReceiver::new(mid, window, Instant::now()));
 
         track.accept(ReceivedPacket {
             sequence: *packet.seq_no,
@@ -298,6 +300,11 @@ impl Subscriber {
             marker: packet.header.marker,
             rid: packet.header.ext_vals.rid.map(|rid| rid.to_string()),
             payload: packet.payload.to_vec(),
+            // str0m's own stamp, taken when the datagram was read off the
+            // socket, rather than one taken here: everything between the two is
+            // decryption and this task's turn to run, and a jitter estimate that
+            // included our own scheduling would be measuring the bot.
+            arrival: Some(packet.timestamp),
         });
     }
 
@@ -376,9 +383,13 @@ impl Subscriber {
                 .cloned()
                 .or(section.track_id);
 
+            // The offer is the moment this client learns it will be given the
+            // track, and so where the clock on time-to-first-packet starts.
+            let opened = Instant::now();
+
             self.tracks
                 .entry(section.mid.clone())
-                .or_insert_with(|| TrackReceiver::new(section.mid, window))
+                .or_insert_with(|| TrackReceiver::new(section.mid, window, opened))
                 .describe(track_sid, section.kind);
         }
     }

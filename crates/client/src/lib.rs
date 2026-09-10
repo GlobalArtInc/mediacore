@@ -25,7 +25,7 @@ pub use crate::media::{
 };
 pub use crate::receiver::{
     DEFAULT_PAYLOAD_WINDOW, DEFAULT_SWITCH_HISTORY, LayerId, LayerReport, MAX_LAYERS,
-    MAX_TRACKED_MISSING, ReceivedPacket, Span, Switch, TrackReport,
+    MAX_TRACKED_MISSING, ReceivedPacket, Span, Switch, Timings, TrackReport,
 };
 pub use crate::signal::SignalStream;
 pub use crate::simulcast::{
