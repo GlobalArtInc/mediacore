@@ -20,6 +20,8 @@ const HIGH: u8 = b'f';
 const ROOMY: Bitrate = Bitrate::mbps(5);
 const CRAMPED: Bitrate = Bitrate::kbps(100);
 const HEALTHY_SAMPLES: u64 = 2;
+/// The index of the `f` rung, as the allocator counts them.
+const TOP_LAYER: u8 = 2;
 const SETTLE: Duration = Duration::from_millis(500);
 
 struct Server {
@@ -184,6 +186,23 @@ async fn sampled(server: &Server, subscriber_sid: &str, count: u64) {
     .await;
 }
 
+/// Wait until the allocator has settled this subscription on a layer.
+///
+/// A subscriber's first packets are whatever the forwarder had before the
+/// estimator had run once -- the top rung -- and the allocator steps it down a
+/// few milliseconds later, once its first real budget arrives. So the first
+/// packet of a layer is as likely to be that transient as it is to be a
+/// decision, and a test that starts measuring on it can be measuring across a
+/// step down it never asked for. The server's own view changes when the
+/// allocator decides and not before, which is the precondition these tests
+/// actually want.
+async fn settled_on(server: &Server, track_sid: &str, subscriber_sid: &str, layer: u8) {
+    until("the allocator to settle on a layer", || {
+        (server.subscription(track_sid, subscriber_sid).layer == Some(layer)).then_some(())
+    })
+    .await;
+}
+
 async fn grew(client: &Client, track_sid: &str, by: u64) -> TrackReport {
     let now = report(client, track_sid)
         .await
@@ -254,6 +273,9 @@ async fn a_subscriber_whose_budget_collapses_steps_down_and_keeps_its_sequence()
     let camera = publish(&alice, TrackSpec::simulcast_video("camera")).await;
     let sid = camera.sid().to_owned();
 
+    sampled(&server, bob.sid(), HEALTHY_SAMPLES).await;
+    settled_on(&server, &sid, bob.sid(), TOP_LAYER).await;
+
     let top = on_layer(&bob, &sid, HIGH, "bob").await;
     assert_only_layer(
         &top,
@@ -262,7 +284,6 @@ async fn a_subscriber_whose_budget_collapses_steps_down_and_keeps_its_sequence()
         "bob before the squeeze",
     );
 
-    sampled(&server, bob.sid(), HEALTHY_SAMPLES).await;
     server.pin(bob.sid(), CRAMPED);
 
     let stepped = on_layer(&bob, &sid, LOW, "bob").await;
@@ -294,7 +315,6 @@ async fn audio_keeps_flowing_while_video_is_paused_for_bandwidth() {
 
     let bob = join(&server, "bob").await;
     server.pin(bob.sid(), ROOMY);
-    let mut states = bob.responses();
     let alice = join(&server, "alice").await;
 
     let mic = publish(&alice, TrackSpec::audio("mic")).await;
@@ -306,6 +326,17 @@ async fn audio_keeps_flowing_while_video_is_paused_for_bandwidth() {
     grew(&bob, &audio_sid, 20).await;
 
     sampled(&server, bob.sid(), HEALTHY_SAMPLES).await;
+    settled_on(&server, &video_sid, bob.sid(), TOP_LAYER).await;
+    assert!(
+        !server.subscription(&video_sid, bob.sid()).bandwidth_paused,
+        "the squeeze has not happened yet and the video is already paused"
+    );
+
+    // Subscribed here rather than before alice publishes: with pausing allowed
+    // and a floor of one kbps, the allocator's first pass over a subscriber it
+    // has no estimate for can pause the video on its own, and a listener opened
+    // earlier matches that update instead of the one the squeeze below causes.
+    let mut states = bob.responses();
     server.pin(bob.sid(), Bitrate::kbps(1));
 
     let paused = states
