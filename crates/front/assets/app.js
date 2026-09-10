@@ -58,15 +58,7 @@ import {
   lineFrom,
   unreadLabel,
 } from "/chat.js";
-import {
-  claimsOf,
-  forgetPass,
-  passFrom,
-  passProblem,
-  recallPass,
-  rememberPass,
-  whoFrom,
-} from "/pass.js";
+import { claimsOf, passFrom, passProblem, whoFrom } from "/pass.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 
@@ -279,20 +271,17 @@ const wantsSimulcast = query.get("simulcast") !== "0";
  */
 const arrival = addressedRoom(location.pathname, location.search);
 /**
- * A pass minted by whatever sent this person here, taken out of the address and
- * removed from it in the same breath.
+ * A pass minted by whatever sent this person here, read out of the address and
+ * left in it.
  *
- * Wiped before anything else runs, because from here on it is a credential
- * this tab holds rather than one the address carries: out of the address bar,
- * out of a screenshot of it, out of the history entry, and out of what a
- * bookmark would keep.
+ * Left there deliberately. A page that wiped the fragment would lose the pass
+ * on the first reload unless it kept a copy of the credential somewhere, and
+ * the address is the one place it can live without this page storing anything
+ * the server signed. The cost is that it is in the address bar, in the history
+ * and in a bookmark, which is an argument for minting passes that expire soon
+ * rather than for hiding one that does not.
  */
-const addressed = passFrom(location.hash);
-if (addressed) {
-  history.replaceState(null, "", location.pathname + location.search);
-  rememberPass(sessionStorage, addressed);
-}
-const pass = addressed ?? recallPass(sessionStorage);
+const pass = passFrom(location.hash);
 const passClaims = pass ? claimsOf(pass) : null;
 
 /**
@@ -958,11 +947,17 @@ function enterRoom(credentials) {
  * `popstate` -- and leaving the room is what the Leave button is for. The room
  * survives the leave in the URL and in the field, so pressing it and changing
  * your mind costs one press rather than the link you no longer have.
+ *
+ * A pass in the fragment survives it too. This is the one write that happens
+ * *after* somebody arrived on a link, so dropping the fragment here would take
+ * the pass away at the exact moment the address finally names the room -- and
+ * the next reload would land in a lobby.
  */
 function showAddress(room) {
   const path = roomPath(room, location.search);
-  if (path === `${location.pathname}${location.search}`) return;
-  history.replaceState(null, "", path);
+  const address = `${path}${location.hash}`;
+  if (address === `${location.pathname}${location.search}${location.hash}`) return;
+  history.replaceState(null, "", address);
 }
 
 async function leave(reason) {
@@ -977,9 +972,6 @@ async function leave(reason) {
   tiles.clear();
   clearCards();
   clearChat();
-  // Leaving is a decision, and a reload after one should land in the lobby
-  // rather than walking straight back in.
-  forgetPass(sessionStorage);
   leaveFullscreen();
   scheduleShareRecheck(null);
   paintShare(null, false);

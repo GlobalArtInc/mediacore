@@ -391,15 +391,16 @@ async fn the_rooms_url_carries_the_room_and_nothing_else() {
 
     assert_eq!(
         js.matches("history.replaceState(").count(),
-        3,
-        "the page writes the address bar somewhere other than the three places that may: the \
-         correction of a legacy link, entering a room, and taking a pass out of the fragment. \
-         The last of those removes rather than writes, which is the whole point of it"
+        2,
+        "the page writes the address bar somewhere other than the two places that know what a \
+         room's url is: the correction of a legacy link, and entering a room"
     );
     assert!(
         js.contains(r#"history.replaceState(null, "", arrival.canonical);"#)
-            && js.contains(r#"history.replaceState(null, "", path);"#),
-        "a url is being assembled at the call site rather than by `roomPath`"
+            && js.contains(r#"history.replaceState(null, "", address);"#),
+        "a url is being assembled at the call site rather than by `roomPath`. The one thing the \
+         call site may add is the fragment it was already carrying, which `roomPath` has no \
+         business knowing about"
     );
     assert!(
         js.contains("const path = roomPath(room, location.search);"),
@@ -1690,20 +1691,21 @@ async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
     );
 
     assert!(
-        js.contains("const addressed = passFrom(location.hash);"),
+        js.contains("const pass = passFrom(location.hash);"),
         "the address is where a platform puts a pass"
     );
     assert!(
-        js.contains("rememberPass(sessionStorage, addressed);")
-            && js.contains("recallPass(sessionStorage)"),
-        "wiping the address would also lose the pass on a reload, so the tab keeps a copy for as \
-         long as it is open -- and sessionStorage rather than localStorage, because a token that \
-         outlives the visit buys nobody anything"
+        !js.contains("sessionStorage") && !js.contains("localStorage.setItem"),
+        "the pass is not copied anywhere: it lives in the address, which is the one place it can \
+         survive a reload without this page storing something the server signed"
     );
+
+    let address = body_of(&js, "\nfunction showAddress(");
     assert!(
-        js.contains("history.replaceState(null, \"\", location.pathname + location.search);"),
-        "the fragment is wiped as it is read: from here on the credential is the tab's, not the \
-         address bar's, not the history entry's and not a screenshot's"
+        address.contains("location.hash"),
+        "entering a room is the one write to the address that happens after somebody arrived on \
+         a link, so it has to carry the fragment or the pass is gone at the moment the address \
+         finally names the room"
     );
 
     let join = body_of(&js, "\nasync function onJoin(");
@@ -1732,13 +1734,6 @@ async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
         auto.contains("el.form.requestSubmit()"),
         "with both questions answered the button exists only to be pressed, so the page joins on \
          arrival instead"
-    );
-
-    let leaving = body_of(&js, "\nasync function leave(");
-    assert!(
-        leaving.contains("forgetPass(sessionStorage)"),
-        "leaving is a decision, and a reload after one has to land in the lobby rather than \
-         walking straight back in"
     );
 
     assert!(

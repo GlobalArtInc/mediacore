@@ -16,10 +16,14 @@
  * which is why one is not read here -- accepting both would mean the safe
  * shape is the one nobody uses.
  *
- * It is still a credential in a link. Whoever holds it is that person in that
- * room until it expires, so the fragment is wiped from the address bar the
- * moment it is read: what is left is a link that opens the right room and
- * lets nobody in by itself.
+ * It stays in the address. A link that carried its pass once and lost it on the
+ * first reload is a link that works exactly until somebody presses F5, and the
+ * address is the only place it can live without this page keeping a copy of a
+ * credential somewhere. What that costs is honest and worth naming: the pass is
+ * in the address bar, in the history entry, in a bookmark and in a screenshot
+ * of any of them, so a short expiry is what keeps an old link from being a way
+ * in. A fragment is still never sent to a server, so logs, `Referer` headers
+ * and proxies see none of it.
  *
  * Nothing here verifies anything. The signature is the server's business and
  * it will check it on the socket; what these functions do is read the claims
@@ -28,7 +32,6 @@
  */
 
 export const PASS_FIELD = "token";
-export const PASS_KEY = "mediacore.front.pass";
 
 export function passFrom(hash) {
   const text = String(hash ?? "").replace(/^#/, "");
@@ -105,54 +108,6 @@ export function whoFrom(claims) {
   }
 
   return claims.name || claims.identity;
-}
-
-/**
- * The pass this tab is holding, remembered across a reload and nothing more.
- *
- * The address bar is wiped as the pass is read, which is what keeps the
- * credential out of the history and out of a screenshot -- and would also lose
- * it on F5, dropping somebody who reloaded back into a lobby with nothing in
- * it. So the tab keeps a copy.
- *
- * `sessionStorage`, never `localStorage`. This origin already refuses to write
- * anything the server minted into the store that outlives the visit, for the
- * reason written at the top of `prefs.js`: a token there outlasts the call it
- * was for and buys nobody anything. A tab-scoped copy dies when the tab does,
- * which is the same lifetime the room has.
- *
- * The store is handed in rather than reached for, because reading
- * `window.sessionStorage` at all throws in a browser set to block site data,
- * and a page that cannot remember a pass must still open.
- */
-export function rememberPass(store, token) {
-  try {
-    store.setItem(PASS_KEY, token);
-  } catch {
-    // A browser that will not keep it is a browser where F5 asks for a new
-    // link. Nothing else about this visit changes.
-  }
-}
-
-export function recallPass(store) {
-  let found = null;
-
-  try {
-    found = store.getItem(PASS_KEY);
-  } catch {
-    return null;
-  }
-
-  return found && looksLikeToken(found) ? found : null;
-}
-
-export function forgetPass(store) {
-  try {
-    store.removeItem(PASS_KEY);
-  } catch {
-    // Nothing to do and nothing worth saying: the copy dies with the tab
-    // either way.
-  }
 }
 
 function looksLikeToken(value) {

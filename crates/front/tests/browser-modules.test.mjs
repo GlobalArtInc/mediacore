@@ -82,8 +82,9 @@ const {
   lineFrom,
   unreadLabel,
 } = await import(`file://${assetPath("chat.js")}`);
-const { claimsOf, forgetPass, passFrom, passProblem, recallPass, rememberPass, whoFrom } =
-  await import(`file://${assetPath("pass.js")}`);
+const { claimsOf, passFrom, passProblem, whoFrom } = await import(
+  `file://${assetPath("pass.js")}`
+);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 const {
   ATTACK_OVER_FLOOR_DB,
@@ -1594,46 +1595,6 @@ describe("a pass minted somewhere else", () => {
     assert.equal(claimsOf("nonsense"), null);
     assert.equal(claimsOf("a.b.c"), null);
     assert.equal(claimsOf(undefined), null);
-  });
-
-  it("is kept for as long as the tab is open, and no longer", () => {
-    const kept = new Map();
-    const store = {
-      getItem: (key) => (kept.has(key) ? kept.get(key) : null),
-      setItem: (key, value) => kept.set(key, String(value)),
-      removeItem: (key) => kept.delete(key),
-    };
-
-    assert.equal(recallPass(store), null);
-
-    rememberPass(store, pass);
-    assert.equal(
-      recallPass(store),
-      pass,
-      "the address bar is wiped as the pass is read, so without this a reload lands in an empty " +
-        "lobby",
-    );
-
-    forgetPass(store);
-    assert.equal(recallPass(store), null);
-  });
-
-  it("opens even where the browser will not let it remember", () => {
-    const blocked = {
-      getItem() {
-        throw new Error("site data is blocked");
-      },
-      setItem() {
-        throw new Error("site data is blocked");
-      },
-      removeItem() {
-        throw new Error("site data is blocked");
-      },
-    };
-
-    assert.doesNotThrow(() => rememberPass(blocked, pass));
-    assert.equal(recallPass(blocked), null, "a browser that blocks storage asks for a new link");
-    assert.doesNotThrow(() => forgetPass(blocked));
   });
 
   it("says why a pass cannot be used, before the socket does", () => {

@@ -884,18 +884,20 @@ logs, out of the `Referer` header sent to whatever the page loads, and out of a 
 `?token=` is in all three. Accepting both would mean the safe shape is the one nobody uses, so only
 one is read.
 
-**And it is wiped as it is read.** A pass in a link is a credential — whoever holds the link is that
-person in that room until it expires — so the fragment is removed from the address before anything
-else runs. What is left in the address bar, in the history entry, in a bookmark and in a screenshot
-of any of them is a link that opens the right room and lets nobody in by itself.
+**And it stays there.** A page that wiped the fragment would lose the pass on the first reload
+unless it kept a copy of the credential somewhere, and the address is the one place it can live
+without this page storing something the server signed — which is the rule stated at the top of
+`prefs.js` and worth keeping. So the link works as a link: reload it, bookmark it, open it again
+tomorrow, and it is the same person in the same room until the pass expires.
 
-Wiping it would also lose it on a reload, dropping somebody who pressed F5 back into a lobby with
-nothing in it, so the tab keeps a copy in `sessionStorage` — never in `localStorage`, for the reason
-written at the top of `prefs.js`: a token that outlives the visit it was minted for buys nobody
-anything. The copy dies when the tab closes, and pressing Leave forgets it on the spot, because
-leaving is a decision and a reload after one should land in the lobby rather than walk straight back
-in. A browser set to block site data throws on the accessor itself; the page opens anyway and a
-reload there asks for a new link.
+Entering a room carries it too. That write is the one that happens *after* somebody arrived on a
+link, and dropping the fragment there would take the pass away at the exact moment the address
+finally names the room.
+
+What it costs is worth naming rather than hiding: the pass sits in the address bar, in the history,
+in a bookmark and in a screenshot of any of them, and whoever reads it is that person in that room.
+The answer to that is a short expiry on the passes a platform mints, not a page that hides one that
+does not expire.
 
 Nothing here verifies the signature. That is the server's business and it checks it when the socket
 opens. What the page reads out of the claims is who somebody is about to be, and two refusals it can
