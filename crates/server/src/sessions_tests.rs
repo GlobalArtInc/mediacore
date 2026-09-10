@@ -69,6 +69,7 @@ fn every_endpoint_on_the_page_is_one_this_module_serves() {
             [
                 ROOM_SESSIONS_PATH,
                 ROOM_SESSION_PATH,
+                ROOMS_SESSIONS_PATH,
                 SESSION_PATH,
                 SESSION_RECORDINGS_PATH
             ]
@@ -76,19 +77,26 @@ fn every_endpoint_on_the_page_is_one_this_module_serves() {
             "`{}` is documented at a path this module does not serve",
             endpoint.path
         );
-        assert!(
-            endpoint
-                .path
-                .contains(&format!("{{{}}}", endpoint.parameter.0)),
-            "`{}` documents a `{}` parameter that its path does not carry",
-            endpoint.operation,
-            endpoint.parameter.0
-        );
+
+        let placeholder = format!("{{{}}}", endpoint.parameter.0);
+        match endpoint.located {
+            Where::Path => assert!(
+                endpoint.path.contains(&placeholder),
+                "`{}` documents a path parameter `{}` that its path does not carry",
+                endpoint.operation,
+                endpoint.parameter.0
+            ),
+            Where::Query => assert!(
+                !endpoint.path.contains('{'),
+                "`{}` documents a query parameter, so its path takes none",
+                endpoint.operation
+            ),
+        }
     }
 
     assert_eq!(
         ENDPOINTS.len(),
-        4,
+        5,
         "an endpoint was added or removed and the page's table was not told"
     );
 }

@@ -84,7 +84,7 @@ not. A session starts when a room reaches the number of people it needs and ends
 and the grace period runs out, and its record carries an id, the room, a start, an end, everybody who
 was there with the times they arrived and left, and whatever the platform above put on the room and
 on each of them. `GET /api/rooms/<room>/sessions`,
-`GET /api/rooms/<room>/session`, `GET /api/sessions/<id>` and
+`GET /api/rooms/<room>/session`, `GET /api/rooms/sessions`, `GET /api/sessions/<id>` and
 `GET /api/sessions/<id>/recordings` answer for it; see [Sessions](#sessions).
 
 None of that waits for an operator to opt in. With `room.min_humans: 0` — the default, and what the
@@ -739,7 +739,7 @@ was.
 ### Sessions
 
 A **session** is one meeting; a **room** is the place it happened in, which outlives it and holds the
-next one — so `/sessions` is plural on purpose. These four are plain `GET`s and not Twirp: LiveKit
+next one — so `/sessions` is plural on purpose. These five are plain `GET`s and not Twirp: LiveKit
 has no session record, so there is no generated client anywhere that would call them and nothing to
 be compatible with. They are on the `/swagger` page all the same, under **Sessions**, because that
 page is where somebody integrating against this server looks.
@@ -748,11 +748,26 @@ page is where somebody integrating against this server looks.
 |---|---|
 | `GET /api/rooms/<room>/sessions` | `{"sessions": [ … ], "total": n}`, newest first, one page at a time; an empty list for a room that has never held one. |
 | `GET /api/rooms/<room>/session` | `{"session": { … }}` or `{"session": null}`. No meeting in progress is an answer and not a failure, so it is 200 either way and a poller has one case to handle. |
+| `GET /api/rooms/sessions?rooms=a,b,c` | The line above, for many rooms in one call: `{"sessions": {"a": { … }, "b": null}}`, keyed by room. Every room asked about is in the answer, so a caller can tell a room with no meeting from a room it forgot to ask about. |
 | `GET /api/sessions/<id>` | `{"session": { … }}`, or `not_found` (404). |
 | `GET /api/sessions/<id>/recordings` | `{"recordings": [ … ]}` — the audio recorded during that meeting and where it is. An empty list for a meeting that was not recorded. |
 
 They read the record rather than the registry, so a room that no longer exists still answers for the
 meetings it held.
+
+**Asking about many rooms at once.** A page listing rooms needs the meeting running in each of them,
+and asking one by one is a request per room and a page that fills in raggedly.
+`GET /api/rooms/sessions?rooms=standup,retro,demo` is that question asked once. Room names cannot
+contain a comma — letters, digits, `.`, `-` and `_` — so the list needs no escaping. Duplicates
+collapse. Like the single-room form it reads memory rather than the store, so it answers while the
+store is away.
+
+Two refusals rather than a partial answer, both for the same reason: an answer that is quietly
+missing rooms is one nobody can tell is incomplete. More than a hundred rooms in one call is
+`invalid_argument` (400) saying what the limit is, not the first hundred; and a room the token may
+not read is `permission_denied` (403) naming that room, not an answer with it left out. The caller
+wrote every name down, so being told which one is not theirs tells them nothing they did not know —
+the same reasoning the single-room endpoints already use.
 
 **Grants.** `roomList` reads every meeting on this server: it already returns every room and the
 whole of every room record, metadata included, so a lock here would be a lock on a door with no wall.

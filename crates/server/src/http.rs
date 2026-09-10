@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         // them and nothing to be compatible with. See `sessions.rs`.
         .route(sessions::ROOM_SESSIONS_PATH, get(sessions::of_room))
         .route(sessions::ROOM_SESSION_PATH, get(sessions::current))
+        .route(sessions::ROOMS_SESSIONS_PATH, get(sessions::now))
         .route(sessions::SESSION_PATH, get(sessions::one))
         .route(sessions::SESSION_RECORDINGS_PATH, get(sessions::recordings));
 

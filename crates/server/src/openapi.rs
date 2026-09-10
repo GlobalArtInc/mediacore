@@ -579,7 +579,10 @@ fn session_path(endpoint: &Endpoint) -> Value {
     operation.insert("x-mediacore-implemented".to_owned(), json!(true));
     let mut parameters = vec![json!({
         "name": endpoint.parameter.0,
-        "in": "path",
+        "in": endpoint.located.as_str(),
+        // A path parameter is part of the address and cannot be left out; a
+        // query one is required here because there is nothing to answer
+        // without it, and the endpoint says so rather than answering nothing.
         "required": true,
         "description": endpoint.parameter.1,
         "schema": { "type": "string" },
@@ -682,6 +685,19 @@ fn session_answer(answer: Answer) -> Value {
                 },
             },
         }),
+        Answer::Map => json!({
+            "type": "object",
+            "required": ["sessions"],
+            "properties": {
+                "sessions": {
+                    "type": "object",
+                    "description":
+                        "One entry per room asked about, keyed by room name. Null where no \
+                         meeting is running.",
+                    "additionalProperties": { "nullable": true, "allOf": [session] },
+                },
+            },
+        }),
     }
 }
 
@@ -696,6 +712,9 @@ fn session_answer_description(answer: Answer) -> &'static str {
         Answer::One => "The meeting.",
         Answer::Recordings => {
             "Every recording made during the meeting, by participant and then by segment.                          An empty list for a meeting that was not recorded, which is an answer and not                          a failure."
+        }
+        Answer::Map => {
+            "One entry per room asked about, keyed by room name, `null` where no meeting is                          running. Every room named is present, so a caller never has to compare the                          answer against what it sent."
         }
     }
 }

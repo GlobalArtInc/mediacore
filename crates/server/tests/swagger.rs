@@ -561,9 +561,18 @@ async fn every_session_endpoint_is_on_the_page_with_a_grant_on_it() {
 
         let parameters = operation["parameters"]
             .as_array()
-            .unwrap_or_else(|| panic!("`{}` documents no path parameter", endpoint.path));
+            .unwrap_or_else(|| panic!("`{}` documents no parameter", endpoint.path));
         assert_eq!(parameters[0]["name"], json!(endpoint.parameter.0));
-        assert_eq!(parameters[0]["in"], json!("path"));
+        // Documented where it is actually written: a query parameter listed as
+        // a path one is a page telling a caller to build an address that does
+        // not exist.
+        assert_eq!(
+            parameters[0]["in"],
+            json!(endpoint.located.as_str()),
+            "`{}` documents its `{}` parameter in the wrong place",
+            endpoint.path,
+            endpoint.parameter.0
+        );
     }
 
     assert!(

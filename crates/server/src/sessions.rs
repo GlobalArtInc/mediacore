@@ -32,6 +32,9 @@ pub const ROOM_SESSIONS_PATH: &str = "/api/rooms/{room}/sessions";
 /// The meeting running in a room right now, if one is.
 pub const ROOM_SESSION_PATH: &str = "/api/rooms/{room}/session";
 
+/// The same question about many rooms at once.
+pub const ROOMS_SESSIONS_PATH: &str = "/api/rooms/sessions";
+
 /// One meeting by id, whatever room it was in.
 pub const SESSION_PATH: &str = "/api/sessions/{id}";
 
@@ -49,6 +52,28 @@ pub enum Answer {
     One,
     /// `{"recordings": [...]}`, each with the two pieces of work behind it.
     Recordings,
+    /// `{"sessions": {"<room>": {...} | null}}`, one entry per room asked for.
+    Map,
+}
+
+/// Where an endpoint's parameter is written.
+///
+/// The table drives the router, the page at `/swagger` and the tests that walk
+/// it, and a query parameter documented as a path one produces a page that
+/// tells a caller to build a url that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    Path,
+    Query,
+}
+
+impl Where {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Query => "query",
+        }
+    }
 }
 
 /// One endpoint, as this server serves it.
@@ -62,19 +87,25 @@ pub enum Answer {
 pub struct Endpoint {
     pub path: &'static str,
     pub operation: &'static str,
-    /// The `{name}` in the path, and what it holds.
+    /// The parameter's name and what it holds.
     pub parameter: (&'static str, &'static str),
+    /// Whether that parameter is written in the path or in the query. The
+    /// table drives the router, the page at `/swagger` and the tests that walk
+    /// it, so a query parameter documented as a path one is a page telling a
+    /// caller to build an address that does not exist.
+    pub located: Where,
     pub summary: &'static str,
     pub description: &'static str,
     pub answer: Answer,
 }
 
-/// All four, in the order somebody reads them.
+/// All five, in the order somebody reads them.
 pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         path: ROOM_SESSIONS_PATH,
         operation: "ListRoomSessions",
         parameter: ("room", "The room's name, as a join token spells it."),
+        located: Where::Path,
         summary: "Every meeting a room has held.",
         description: "Newest first, one page at a time: `limit` (100 by default, 1000 at most) and \
              `offset`, with `total` on the answer so a caller knows what it has not seen. Plural \
@@ -90,6 +121,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
         path: ROOM_SESSION_PATH,
         operation: "GetRoomSession",
         parameter: ("room", "The room's name, as a join token spells it."),
+        located: Where::Path,
         summary: "The meeting running in a room now, or nothing.",
         description: "`session` is null when no meeting is running, which is an answer and not a failure, \
              so this is 200 either way and a poller has one case to handle. A meeting is still \
@@ -99,6 +131,29 @@ pub const ENDPOINTS: &[Endpoint] = &[
         answer: Answer::Perhaps,
     },
     Endpoint {
+        path: ROOMS_SESSIONS_PATH,
+        operation: "GetRoomSessions",
+        parameter: (
+            "rooms",
+            "The rooms to ask about, comma separated. A room name cannot contain a comma, so \
+             nothing here needs escaping.",
+        ),
+        located: Where::Query,
+        summary: "The meetings running now in the rooms you name.",
+        description: "`GetRoomSession` for many rooms in one call, for the caller with a page of rooms \
+             on screen: asking one by one is one request per room and a page that fills in \
+             raggedly. The answer is an object keyed by room, and **every room asked for is in \
+             it** -- null where no meeting is running -- so a caller can tell a room with no \
+             meeting from a room it forgot to ask about, without comparing lists. Duplicates \
+             collapse. Not to be confused \
+             with `ListRoomSessions`, one path segment away, which is the history of a single \
+             room; this is the present of many. Like `GetRoomSession` it reads memory rather \
+             than the store, so it answers while the store is away. At most 100 rooms, and more \
+             than that is refused rather than truncated: an answer silently missing the rooms \
+             past the limit is one nobody can tell is incomplete.",
+        answer: Answer::Map,
+    },
+    Endpoint {
         path: SESSION_PATH,
         operation: "GetSession",
         parameter: (
@@ -106,6 +161,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
             "The session id, as `SE_` and twelve hex digits. It appears in the server log beside \
              everything that happened in that meeting.",
         ),
+        located: Where::Path,
         summary: "One meeting, whatever room it was in.",
         description: "The id is what a recording, a transcript or a billing line hangs off later, because \
              those belong to a meeting and not to a room. A meeting the caller's token may not \
@@ -122,6 +178,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
             "The session id, as `SE_` and twelve hex digits. The same id a \
              `recording_ready` event carries in its `session` field.",
         ),
+        located: Where::Path,
         summary: "The audio recorded during one meeting, and where it is.",
         description: "One entry per stretch of one participant's audio: where the object is, how long it \
              is, and where it sits inside the meeting. **This is what a consumer that missed a \
@@ -190,6 +247,94 @@ pub async fn current(
 
     json(&Perhaps {
         session: state.registry.sessions().live(&room),
+    })
+}
+
+/// How many rooms one call may ask about.
+///
+/// A cap and not a clamp. Truncating would answer about the first hundred and
+/// say nothing about the rest, and the caller could not tell the difference
+/// between a room with no meeting and a room the answer never reached.
+pub const MAX_ROOMS: usize = 100;
+
+/// The rooms one call asks about, comma separated.
+///
+/// A room name is letters, digits, `.`, `-` and `_`, so a comma can never be
+/// part of one and the list needs no escaping and no repeated parameter.
+#[derive(Debug, Deserialize)]
+pub struct Rooms {
+    #[serde(default)]
+    rooms: String,
+}
+
+/// The meetings running now in several rooms, keyed by room.
+///
+/// The batch of `current`, and it reads the same memory: a caller with a page
+/// of rooms on screen asks once instead of once per room. Every room asked
+/// about is in the answer, null where nothing is running, so the caller never
+/// has to diff what it sent against what came back.
+///
+/// Authorisation is the same rule applied to every name, and a room the token
+/// may not read refuses the whole call rather than being quietly dropped. That
+/// is the choice `reading_room` already made and for the same reason: the
+/// caller wrote the name down, so being told it is not theirs tells them
+/// nothing they did not know, and an answer missing rooms nobody mentioned is
+/// how a caller ends up showing an empty page and blaming the server.
+pub async fn now(
+    State(state): State<AppState>,
+    Query(asked): Query<Rooms>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&state, &headers) {
+        Ok(claims) => claims,
+        Err(error) => return refused("GetRoomSessions", error),
+    };
+
+    let mut rooms: Vec<&str> = asked
+        .rooms
+        .split(',')
+        .map(str::trim)
+        .filter(|room| !room.is_empty())
+        .collect();
+    rooms.sort_unstable();
+    rooms.dedup();
+
+    if rooms.is_empty() {
+        return refused(
+            "GetRoomSessions",
+            Error::invalid_argument(
+                "name at least one room in `rooms`, comma separated".to_owned(),
+            ),
+        );
+    }
+
+    if rooms.len() > MAX_ROOMS {
+        return refused(
+            "GetRoomSessions",
+            Error::invalid_argument(format!(
+                "one call asks about at most {MAX_ROOMS} rooms and this one names {}; ask in \
+                 pages rather than being answered about some of them",
+                rooms.len()
+            )),
+        );
+    }
+
+    if let Some(refused_room) = rooms.iter().find(|room| !reads(&claims, room)) {
+        return refused(
+            "GetRoomSessions",
+            Error::permission_denied(format!(
+                "this token carries neither roomList nor roomAdmin over room `{refused_room}`"
+            )),
+        );
+    }
+
+    let store = state.registry.sessions();
+
+    json(&Live {
+        sessions: rooms
+            .into_iter()
+            .map(|room| (room.to_owned(), store.live(room)))
+            .collect(),
     })
 }
 
@@ -324,6 +469,17 @@ struct Sessions {
 #[derive(Serialize)]
 struct Perhaps {
     session: Option<Session>,
+}
+
+/// One entry per room asked about, in the order a reader would sort them.
+///
+/// A map and not a list: the caller looks each room up by name, and a list
+/// would make it build the map itself. `BTreeMap` so the answer is byte for
+/// byte the same for the same question, which is what makes it cacheable and
+/// diffable.
+#[derive(Debug, Serialize)]
+struct Live {
+    sessions: std::collections::BTreeMap<String, Option<Session>>,
 }
 
 /// Turns "this store does not keep recordings" into "there are none".

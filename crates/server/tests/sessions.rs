@@ -679,13 +679,18 @@ async fn every_endpoint_the_page_lists_is_one_this_server_answers() {
 
     for endpoint in sessions::ENDPOINTS {
         let value = match endpoint.parameter.0 {
-            "room" => ROOM,
+            "room" | "rooms" => ROOM,
             "id" => &id,
-            other => panic!("`{other}` is a path parameter no test knows how to fill in"),
+            other => panic!("`{other}` is a parameter no test knows how to fill in"),
         };
-        let path = endpoint
-            .path
-            .replace(&format!("{{{}}}", endpoint.parameter.0), value);
+        let path = match endpoint.located {
+            sessions::Where::Path => endpoint
+                .path
+                .replace(&format!("{{{}}}", endpoint.parameter.0), value),
+            sessions::Where::Query => {
+                format!("{}?{}={value}", endpoint.path, endpoint.parameter.0)
+            }
+        };
 
         let answer = get(addr, &path, Some(&lister())).await;
         assert_eq!(
@@ -695,6 +700,7 @@ async fn every_endpoint_the_page_lists_is_one_this_server_answers() {
         );
 
         match endpoint.answer {
+            Answer::Map => assert!(answer.json()["sessions"].is_object()),
             Answer::List => assert!(answer.json()["sessions"].is_array()),
             Answer::Perhaps | Answer::One => assert!(
                 answer.json().get("session").is_some(),
@@ -717,4 +723,169 @@ async fn every_endpoint_the_page_lists_is_one_this_server_answers() {
 
 fn room_path(tail: &str) -> String {
     format!("/api/rooms/{ROOM}/{tail}")
+}
+
+/// The whole point: a caller with a page of rooms asks once. Every room it
+/// named is in the answer, including the ones with nothing running, so it
+/// never has to compare what came back against what it sent.
+#[tokio::test]
+async fn one_call_answers_about_every_room_it_was_given() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+    let _bob = join(addr, "bob", "retro").await;
+
+    let answer = get(
+        addr,
+        &format!("{}?rooms={ROOM},retro,empty", sessions::ROOMS_SESSIONS_PATH),
+        Some(&lister()),
+    )
+    .await;
+
+    assert_eq!(answer.status, 200);
+    let sessions = answer.json()["sessions"].clone();
+
+    assert!(
+        sessions[ROOM]["id"].is_string(),
+        "the meeting running in {ROOM} is not in the answer: {sessions}"
+    );
+    assert!(sessions["retro"]["id"].is_string());
+    assert!(
+        sessions.get("empty").is_some() && sessions["empty"].is_null(),
+        "a room with no meeting has to be present and null, or the caller cannot tell it from \
+         a room it forgot to ask about: {sessions}"
+    );
+    assert_eq!(
+        sessions.as_object().expect("an object keyed by room").len(),
+        3,
+        "the answer holds rooms nobody asked about: {sessions}"
+    );
+}
+
+/// The same answer as asking one at a time, which is the only reason a caller
+/// is allowed to stop asking one at a time.
+#[tokio::test]
+async fn the_batch_says_what_the_single_room_endpoint_says() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+
+    let single = get(addr, &room_path("session"), Some(&lister()))
+        .await
+        .json()["session"]
+        .clone();
+    let batch = get(
+        addr,
+        &format!("{}?rooms={ROOM}", sessions::ROOMS_SESSIONS_PATH),
+        Some(&lister()),
+    )
+    .await
+    .json()["sessions"][ROOM]
+        .clone();
+
+    assert_eq!(single, batch);
+}
+
+/// Duplicates are the caller's page having the same room twice, not a request
+/// to be answered twice.
+#[tokio::test]
+async fn a_room_named_twice_is_answered_once() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+
+    let sessions = get(
+        addr,
+        &format!(
+            "{}?rooms={ROOM},{ROOM},{ROOM}",
+            sessions::ROOMS_SESSIONS_PATH
+        ),
+        Some(&lister()),
+    )
+    .await
+    .json()["sessions"]
+        .clone();
+
+    assert_eq!(sessions.as_object().expect("an object").len(), 1);
+}
+
+/// A token scoped to one room does not learn about another by putting it in a
+/// list. The whole call is refused rather than the room being dropped: an
+/// answer quietly missing rooms is how a caller ends up showing an empty page
+/// and blaming the server.
+#[tokio::test]
+async fn a_room_the_token_may_not_read_refuses_the_whole_call() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+    let _bob = join(addr, "bob", "retro").await;
+
+    let answer = get(
+        addr,
+        &format!("{}?rooms={ROOM},retro", sessions::ROOMS_SESSIONS_PATH),
+        Some(&admin(ROOM)),
+    )
+    .await;
+
+    assert_eq!(answer.status, 403, "{}", String::from_utf8_lossy(&answer.body));
+    assert!(
+        answer.json()["msg"]
+            .as_str()
+            .expect("a refusal names the room")
+            .contains("retro"),
+        "the refusal does not say which room: {}",
+        answer.json()
+    );
+
+    let alone = get(
+        addr,
+        &format!("{}?rooms={ROOM}", sessions::ROOMS_SESSIONS_PATH),
+        Some(&admin(ROOM)),
+    )
+    .await;
+    assert_eq!(alone.status, 200, "its own room is still readable");
+}
+
+/// Too many rooms is refused rather than truncated. An answer silently missing
+/// everything past the limit is one nobody can tell is incomplete.
+#[tokio::test]
+async fn more_rooms_than_one_call_carries_is_refused_and_says_so() {
+    let addr = spawn_server().await;
+    let _alice = join(addr, "alice", ROOM).await;
+
+    let many: Vec<String> = (0..=sessions::MAX_ROOMS).map(|n| format!("room{n}")).collect();
+    let answer = get(
+        addr,
+        &format!(
+            "{}?rooms={}",
+            sessions::ROOMS_SESSIONS_PATH,
+            many.join(",")
+        ),
+        Some(&lister()),
+    )
+    .await;
+
+    assert_eq!(answer.status, 400);
+    assert!(
+        answer.json()["msg"]
+            .as_str()
+            .expect("a reason")
+            .contains(&sessions::MAX_ROOMS.to_string()),
+        "the refusal does not say what the limit is: {}",
+        answer.json()
+    );
+}
+
+/// Asking about nothing is a mistake worth naming, not an empty answer that
+/// looks like every room is idle.
+#[tokio::test]
+async fn asking_about_no_rooms_at_all_is_refused() {
+    let addr = spawn_server().await;
+
+    for query in ["", "?rooms=", "?rooms=,,"] {
+        let answer = get(
+            addr,
+            &format!("{}{query}", sessions::ROOMS_SESSIONS_PATH),
+            Some(&lister()),
+        )
+        .await;
+
+        assert_eq!(answer.status, 400, "`{query}` was answered rather than refused");
+    }
 }
