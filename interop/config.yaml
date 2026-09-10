@@ -1,0 +1,95 @@
+# The server as the interop job runs it. Nothing here is a deployment: it is a
+# single node on the loopback with the media path turned down as far as it will
+# go, because this job proves the room service and the webhooks and deliberately
+# proves nothing about RTC -- a runner's UDP is its own story.
+#
+# THE KEY AND THE SECRET ARE TEST CREDENTIALS and are meant to look like it. Both
+# `lk` and the Node script read them out of this file's twin in run.sh, so
+# changing one means changing both.
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+
+# Debug rather than info: when this job goes red, the server log is the only
+# witness to what the other side actually sent, and a refused call is logged at
+# info while a routing decision behind it is not.
+log_level: debug
+
+keys:
+  interopkey: interopsecretinteropsecretinteropsecret00
+
+room:
+  # Off, so the rooms in this run are the rooms the job made. With it on, a typo
+  # in a room name would quietly create a second room and the assertion that
+  # followed would pass against the wrong one.
+  auto_create: false
+
+  # Long enough that a room made in the first second of the run is still there in
+  # the last: this job deletes its own rooms, and a sweeper collecting one out
+  # from under an assertion would fail the build for the wrong reason.
+  empty_timeout: 3600
+  departure_timeout: 3600
+  max_participants: 0
+  min_humans: 0
+  end_grace: 90
+  duplicate_identity: suffix
+  sweep_interval_ms: 1000
+
+sessions:
+  # Under the run's scratch directory, which run.sh makes and removes. A record
+  # per meeting is written whether anybody reads it or not, and writing it into
+  # the checkout would leave the tree dirty after a local run.
+  directory: sessions
+  max_opaque_bytes: 16384
+  postgres:
+    url: ""
+
+recording:
+  enabled: false
+
+events:
+  directory: events
+
+  # One attempt, and a short one. The receiver is a Node HTTP server on the same
+  # loopback: it is either up or the job is already failing, and five attempts
+  # over half a minute would turn a receiver that never came up into thirty
+  # seconds of waiting before anyone is told.
+  attempts: 1
+  timeout_ms: 2000
+  backoff_ms: 100
+  max_backoff_ms: 100
+  queue: 1000
+
+  webhooks:
+    # The Node receiver, which verifies every one of these through LiveKit's own
+    # `WebhookReceiver`. The port is fixed here because a config file cannot be
+    # told what port a process that has not started yet will pick.
+    urls:
+      - http://127.0.0.1:7899/webhook
+    api_key: interopkey
+
+data:
+  enabled: true
+
+twirp:
+  # The whole point of the `lk` half of this job: both the CLI and
+  # livekit-server-sdk build `/twirp/livekit.RoomService/<Method>` inside
+  # generated code and cannot be told to use another path. With this off there is
+  # no interop to test.
+  livekit_alias: true
+
+rtc:
+  # Port 0 on both, so two runs on one machine -- or a runner that already has
+  # something on 7882 -- do not collide. No media crosses this job; the media
+  # stack is started because the server always starts it, not because anything
+  # here uses it.
+  udp_port: 0
+  port_range_start: 0
+  port_range_end: 0
+  bind_address: 127.0.0.1
+  use_socket_address: true
+  use_external_ip: false
+
+video:
+  bwe:
+    enabled: false

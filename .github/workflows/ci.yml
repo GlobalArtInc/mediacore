@@ -85,3 +85,71 @@ jobs:
 
       - name: Test with kafka
         run: cargo test -p mediacore-events --features kafka
+
+  # Compatibility with LiveKit's SDKs is a declared property of this server --
+  # it is why the `livekit.RoomService` alias and the lowerCamelCase protobuf
+  # JSON exist -- and everything above validates it with our own code. This job
+  # validates it with theirs: a token minted by their CLI, requests built by
+  # their generator, answers parsed by their types, refusals caught as their
+  # Twirp errors, and webhooks checked by their `WebhookReceiver`. It is the one
+  # class of divergence that otherwise reaches us from an integrator rather than
+  # from a build.
+  #
+  # Separate from `check` rather than a step inside it, because it fails for
+  # reasons of its own: this going red means somebody else's code stopped
+  # understanding our answers, which is a different question from whether the
+  # workspace compiles.
+  interop:
+    name: lk and livekit-server-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+
+      # A key of its own. `check` builds debug and this builds release, so the
+      # two write different things into target/ -- sharing a key would have them
+      # racing to save a cache that suits neither.
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-interop-
+
+      # The SDK asks for node >= 19. Pinned to a major rather than to `latest`,
+      # for the same reason `lk` and the npm version are pinned: nothing in this
+      # job should be able to change without a commit.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: interop/package-lock.json
+
+      # Ninety megabytes of somebody else's release archive, and the version is
+      # pinned inside run.sh. Keying the cache on that file is what makes a
+      # version bump fetch the new one: bumping the pin edits run.sh, which
+      # changes the key, and a miss is a download rather than a wrong binary.
+      - name: Cache the pinned lk release
+        uses: actions/cache@v4
+        with:
+          path: interop/.cache
+          key: ${{ runner.os }}-lk-${{ hashFiles('interop/run.sh') }}
+
+      # No media, so no RTC ports and no service containers: the config puts the
+      # session records on files and the webhooks on a Node receiver run.sh
+      # starts on the loopback beside the server.
+      - name: Interop
+        run: interop/run.sh

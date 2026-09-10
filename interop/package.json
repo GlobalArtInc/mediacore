@@ -1,0 +1,19 @@
+{
+  "name": "mediacore-interop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Drives mediacore's room service through LiveKit's own server SDK, and checks its webhooks with LiveKit's own receiver.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "receiver": "node interop.mjs receiver",
+    "api": "node interop.mjs api",
+    "webhooks": "node interop.mjs webhooks"
+  },
+  "dependencies": {
+    "@livekit/protocol": "1.51.0",
+    "livekit-server-sdk": "2.19.0"
+  }
+}

@@ -1,0 +1,11 @@
+# The pinned lk release, unpacked. Ninety megabytes of somebody else's binary,
+# fetched by run.sh and cached so a second run on one machine is not a second
+# download.
+.cache/
+node_modules/
+
+# The repository root ignores `config.yaml` outright, because a checkout is
+# where `cargo run` looks for one and nobody wants their own on a branch. The
+# config in this directory is not that: it is the server as this job runs it,
+# and the job does not exist without it.
+!config.yaml
