@@ -22,8 +22,14 @@ subscriber gets is the one its own link can carry.
 | M5 | Bandwidth estimation, allocation and pacing | done, off by default |
 | M5.5 | Meeting records, events, audio recording and upload | done, recording off by default |
 | M6 | Data channels, permissions, own SDKs | done, without the SDKs |
-| M7 | Node registry, signal relay, TURN, drain | not started |
+| M7 | Node registry, signal relay, drain | done; TURN moved out, see below |
 | M8 | Metrics, load and interop testing | not started |
+
+TURN left M7 rather than being skipped in it. It shares nothing with the rest — the registry, the
+relay and the drain are all about which process holds which room, and TURN is about a client whose
+network eats UDP — and it does not make a second replica reachable, which is what the milestone
+existed for. It is cheaper after ICE over TCP, which wants the same fork in the transport, and is
+its own piece of work.
 
 A client that connects today receives a `JoinResponse`, sees other participants join and leave,
 answers pings, and is disconnected with a stated reason after 60 seconds of silence. It can add a
@@ -1743,6 +1749,28 @@ one sick node must not make the cluster unreadable.
 
 Both carry the same mark the relayed websocket does, so a node that receives a forwarded call answers
 it and asks nobody: one round, never a storm.
+
+### Installing more than one
+
+The chart refuses a second replica unless three things are true, because each of them is a way to
+get a cluster that installs and does not work.
+
+**A database.** Replicas share what they know through Postgres and through nothing else. Without it
+each pod holds its own rooms and its own idea of who is up, two clients for one room land on two
+pods, and neither hears the other with nothing in any log to say why.
+
+**No `node_id` in the values.** One value in a shared ConfigMap gives every pod one name, and then
+they claim each other's recordings and fight over one row in the node table. Left unset, each pod
+takes its own pod name, which a StatefulSet keeps stable across restarts. The server catches the
+collision too — but a release that cannot be installed wrong is better than one that is caught
+afterwards.
+
+**Anti-affinity, with `hostNetwork`.** Two pods on one node both try to bind the media port; the
+second crash-loops, or binds and answers for candidates the first advertised.
+
+Nodes reach each other at their own names in the headless service — `ws://<pod>.<release>-sfu-headless.<namespace>.svc:7880`. The ordinary Service load-balances, which is
+the one thing a node-to-node address must not do, and a pod address does not survive a reschedule.
+Clients still arrive through whatever is in front of the cluster; only the nodes use these.
 
 **What this does not do yet.** Nothing moves a room from one node to another. A room stays where it
 opened until it ends, so a node that is draining holds its meetings until the last person leaves

@@ -6,8 +6,9 @@ anything that turned out to be already implemented was struck out rather than ke
 Estimates are in this project's own units — a milestone here has closed in about a working day —
 so "a day" means a day of work, not a sprint.
 
-M0 through M5 are done and M5.5 (meeting records, events, audio recording and upload) with them;
-M6, M7 and M8 are not started. See [Status](README.md#status). Nothing below contradicts that
+M0 through M5 are done and M5.5 (meeting records, events, audio recording and upload) with them.
+M6 is done without the SDKs, and M7 with TURN taken out of it -- a node registry, a signal relay
+and a drain. M8 is not started. See [Status](README.md#status). Nothing below contradicts that
 table: it is the work between the milestones and inside them, ordered by what it costs against
 what it returns.
 
@@ -747,7 +748,10 @@ depacket are empty.
 
 Smaller than the work above and cheaper than all of it, and none of it is in any milestone.
 
-- **The `kafka` feature compiles nowhere.** `ci.yml` runs `fmt`, `clippy --workspace --all-targets`
+- ~~**The `kafka` feature compiles nowhere.**~~ Done: `ci.yml` clippies and tests it, and the
+  `Dockerfile` builds with it. What follows is kept for the reasoning.
+
+  **Originally:** `ci.yml` runs `fmt`, `clippy --workspace --all-targets`
   and `cargo test --workspace`, all with default features, and `Dockerfile:47` builds without
   features too. `crates/events/src/lib.rs:48` gates a 147-line module with zero tests, and
   `README.md:1624-1632` gives the two commands that would cover it — commands CI does not run. The
