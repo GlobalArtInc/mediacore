@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -45,12 +46,36 @@ pub struct AppState {
     /// so that the media path can find a track's tap without a lookup through
     /// the registry, and so that the last clone going takes the tasks with it.
     pub recording: Option<Arc<Recording>>,
+    /// Whether this node has been told to stop.
+    ///
+    /// Raised once, never lowered: a node that has begun letting go of its
+    /// rooms cannot take new ones without the meeting it is closing and the
+    /// meeting it is opening being in the same room at the same time. It is
+    /// what `/readyz` answers from, and what the join path refuses on, and the
+    /// two have to be the same bit or a load balancer keeps sending arrivals
+    /// to a node that is on its way out.
+    draining: Arc<AtomicBool>,
     /// The registry's clock, held here so that it lives exactly as long as the
     /// server does. Nothing reads it; dropping the last `AppState` stops it.
     _caretaker: Arc<Caretaker>,
 }
 
 impl AppState {
+    /// Whether this node is on its way out.
+    pub fn draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Says so, once.
+    ///
+    /// Returns whether this call is the one that said it, so a second signal
+    /// does not start a second drain: a deployment that sends SIGTERM twice
+    /// would otherwise walk the rooms twice and close meetings that the first
+    /// walk had already ended.
+    pub fn begin_draining(&self) -> bool {
+        !self.draining.swap(true, Ordering::AcqRel)
+    }
+
     pub async fn start(config: Config) -> anyhow::Result<Self> {
         let media = MediaEngine::start(
             &config.rtc,
@@ -129,6 +154,7 @@ impl AppState {
             events,
             delivery,
             recording,
+            draining: Arc::new(AtomicBool::new(false)),
             _caretaker: Arc::new(caretaker),
         })
     }

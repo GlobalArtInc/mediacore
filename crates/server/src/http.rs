@@ -19,6 +19,7 @@ pub fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/rtc", get(signal::handler))
         .route("/rtc/validate", get(validate))
         .route(rooms::SERVICE_PATH, any(rooms::handler))
@@ -75,6 +76,24 @@ fn cors() -> CorsLayer {
 
 async fn index() -> &'static str {
     "mediacore"
+}
+
+/// Whether this node should be sent new arrivals.
+///
+/// Separate from `/healthz` on purpose, and not a field on it. `/healthz` says
+/// whether the process is working and is parsed by a compose healthcheck and by
+/// three test files, so its shape is not free to change; this answers a
+/// different question -- *should traffic come here* -- and answers it with a
+/// status code, because that is the only thing a load balancer reads.
+///
+/// A draining node is still healthy: it is finishing the meetings it holds and
+/// its `/healthz` stays 200 until it exits. What it must not get is somebody
+/// new, which is what the 503 here is for.
+async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    match state.draining() {
+        true => (StatusCode::SERVICE_UNAVAILABLE, "draining\n"),
+        false => (StatusCode::OK, "ready\n"),
+    }
 }
 
 async fn healthz(State(state): State<AppState>) -> String {

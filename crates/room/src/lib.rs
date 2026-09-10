@@ -1812,6 +1812,27 @@ impl Registry {
     /// is nothing to come back to. The record stays, because the meeting still
     /// happened.
     pub fn delete(&self, name: &str) -> Option<Arc<Room>> {
+        self.close(name, mediacore::DisconnectReason::RoomDeleted)
+    }
+
+    /// The same, with the reason the people in it are given.
+    ///
+    /// `delete` is somebody asking for the room to stop existing, and that is
+    /// what its occupants are told. A node letting go of its rooms on the way
+    /// out is not that: the room is not being deleted and the meeting is not
+    /// over as far as anybody outside is concerned, so the reason has to say
+    /// the server is stopping. A client reads that field and decides whether
+    /// to come back; told the room was deleted, it would not.
+    ///
+    /// The meeting record ends the same way either way -- `Ending::Closed`, at
+    /// the time it really stopped -- because in both cases somebody watched it
+    /// end. What must not happen is the meeting being left unfinished for a
+    /// reaper to close later as a restart, with an end time nobody observed.
+    pub fn close(
+        &self,
+        name: &str,
+        reason: mediacore::DisconnectReason,
+    ) -> Option<Arc<Room>> {
         // Taking the room away and closing its meeting are one step. Between
         // the two, an arrival would find no room, build another under the same
         // name and open a second meeting in it -- which the close would then
@@ -1824,7 +1845,7 @@ impl Registry {
             (room, ended)
         };
 
-        end_session(&room, mediacore::DisconnectReason::RoomDeleted);
+        end_session(&room, reason);
 
         // In the order it happened: everybody left, then the meeting they were
         // at ended, then the place it was in stopped existing. A consumer

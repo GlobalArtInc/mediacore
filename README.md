@@ -1662,6 +1662,40 @@ identity, and the `video` claim carries the grants. Any LiveKit token generator 
 `lk token create`. A token for the server API is the same token with a different grant and no `sub`
 at all.
 
+## Stopping a node
+
+`SIGTERM` and `ctrl-c` both stop this server, and both stop it the same way. `SIGTERM` is the one
+that matters: the binary is PID 1 in its container and it is what kubelet sends on every rolling
+deploy.
+
+What happens, in this order:
+
+1. **`/readyz` answers 503.** A load balancer reads a status code and nothing else, so that is what
+   this endpoint is — `ready` at 200, `draining` at 503. It is separate from `/healthz` because it
+   answers a different question: *should traffic come here*, not *is this process working*. A
+   draining node stays healthy until it exits, and has to: a health check that went red here would
+   have the orchestrator kill it in the middle of writing its records.
+2. **Arrivals are turned away**, before they join rather than after. They are told `SERVER_SHUTDOWN`
+   with `can_reconnect`, so the client goes back through the load balancer — which by now has been
+   told not to send it here.
+3. **Every room is closed**, and everybody in it is told the same reason. Their meeting is recorded
+   as `closed`, at the time it really stopped.
+4. **The sockets go.** Closing a room drops its participants, which drops the senders their
+   signalling tasks wait on, so the tasks end and the sockets close by themselves — usually in
+   milliseconds. Five seconds is the bound on that going wrong, after which the node stops waiting
+   and says so, because a deploy that will not finish is worse than a socket that was not said
+   goodbye to.
+5. **The records are flushed**, bounded at ten seconds, and what did not land is named in the log.
+
+Before this existed the signal was ignored outright: the process ran until `SIGKILL`, nothing was
+flushed, and every meeting in flight was found unfinished afterwards and recorded as `restart` —
+an ending whose own documentation says nobody watched it happen. On a deployment that records, the
+tail of every recording went with it.
+
+Set `terminationGracePeriodSeconds` above the two bounds together, and point the readiness probe at
+`/readyz` rather than `/healthz`, or the orchestrator will keep sending arrivals to a node that is
+on its way out.
+
 ## Deployment
 
 `cargo run` above is a development server on plain HTTP, which a browser will

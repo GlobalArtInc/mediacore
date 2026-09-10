@@ -123,6 +123,23 @@ async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: We
         replaces: query.resumes(),
     };
 
+    // A node on its way out takes nobody new. Refused here rather than at the
+    // socket, and with a reason the client acts on: `Reconnect` sends it back
+    // through the load balancer, which by now has had `/readyz` say 503 and
+    // will hand it a node that is staying. Refusing after the join would mean
+    // opening a meeting this node is in the middle of closing.
+    if state.draining() {
+        tracing::info!(room = %room_name, identity = %requested, "refusing an arrival while draining");
+        let mut socket = socket;
+        let _ = write(
+            &mut socket,
+            mediacore_room::reconnect(mediacore::DisconnectReason::ServerShutdown),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
     let joined = match state.registry.join(&room_name, spec, tx) {
         Ok(joined) => joined,
         Err(error) => {
