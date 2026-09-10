@@ -1662,9 +1662,69 @@ async fn the_speaker_button_says_what_it_does_and_what_it_does_not() {
          lying about the one thing somebody would press it for"
     );
     assert!(
-        paint.contains("el.mute.disabled = !open || pending.mute || deafened"),
+        paint.contains("el.mute.disabled = (!open && !listening) || pending.mute || deafened"),
         "the microphone follows the speaker, so its own button has to stop arguing with it while \
          the room is silenced"
+    );
+}
+
+/// The defect this was written against: a browser refusing the microphone kept
+/// somebody out of the room altogether, and the one control that could have
+/// asked for it again was the one control that was switched off.
+#[tokio::test]
+async fn a_browser_that_refuses_the_microphone_does_not_refuse_the_room() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+
+    let join = body_of(&js, "\nasync function onJoin(");
+    assert!(
+        !join.contains("fail(el.lobbyError, opened.reason)"),
+        "a refused microphone still stops the join in the lobby, so somebody who cannot be heard \
+         cannot listen either"
+    );
+    assert!(
+        join.contains("micRefusal = opened.opened ? null : opened.reason"),
+        "the join throws away why there is no microphone, so nothing afterwards can say what \
+         happened or what to do about it"
+    );
+
+    let connect = body_of(&js, "\nasync function connect(");
+    assert!(
+        connect.contains("if (media.state().microphone.open) {"),
+        "the join publishes a microphone it may not have, and a listener's connection is rolled \
+         back over a track that was never opened"
+    );
+
+    let paint = body_of(&js, "\nfunction paintControls(");
+    assert!(
+        paint.contains(r#"el.muteLabel.textContent = !open ? "Turn on mic""#),
+        "the microphone button says `Mute` with no microphone to mute, so pressing it promises \
+         the opposite of what it does"
+    );
+    assert!(
+        paint.contains("String(muted || !open)"),
+        "a button with no microphone behind it reports itself unpressed, which tells a screen \
+         reader the room can hear this person"
+    );
+
+    let retry = body_of(&js, "\nasync function turnMicrophoneOn(");
+    assert!(
+        retry.contains("media.openMicrophone()") && retry.contains("media.publishMicrophone()"),
+        "asking again opens a microphone nothing publishes, so the room never hears it"
+    );
+
+    let mute = body_of(&js, "\nasync function onMute(");
+    assert!(
+        mute.contains("if (!media.state().microphone.open) return turnMicrophoneOn();"),
+        "nothing in the bar reaches the second attempt, so the only way to a microphone is to \
+         leave the room and join it again"
+    );
+
+    let enter = body_of(&js, "\nfunction enterRoom(");
+    assert!(
+        enter.contains("showNotice(listeningLine(micRefusal))"),
+        "the room says nothing to somebody who arrived in it without a microphone, so the only \
+         sign of it is a button that looks broken"
     );
 }
 

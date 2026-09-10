@@ -376,6 +376,16 @@ let panel = "people";
  */
 let deafened = false;
 let mutedBeforeDeafened = false;
+/**
+ * Why this browser has no microphone, in the room it is nonetheless in.
+ *
+ * It is kept rather than said once and forgotten. The sentence names the
+ * padlock, and the person reading it is usually the person who has just come
+ * back from the padlock wanting to know what to press now -- by which time a
+ * notice that timed out is of no use to anybody. It hangs on the one control
+ * the answer belongs to, and it goes the moment a microphone opens.
+ */
+let micRefusal = null;
 let pinnedShare = null;
 let stageShare = null;
 let stageFocus = null;
@@ -701,12 +711,15 @@ async function onJoin(event) {
   remember(settings.signIn ? { camera: withVideo } : { name, camera: withVideo });
   busy(true, "Asking for the microphone...");
 
+  // A browser that will not hand over a microphone is not a room refusing
+  // anybody. Everything else this page is -- hearing the room, seeing who is in
+  // it, the chat, the bench -- needs no capture at all, and the token minted
+  // below grants publishing whether one was opened or not, so the join carries
+  // on and the microphone becomes something to turn on rather than a gate to
+  // get past. The reason is kept: it is what the button in the bar goes on to
+  // say, and what the one line on arrival is made of.
   const opened = await media.openMicrophone();
-  if (!opened.opened) {
-    busy(false, "");
-    fail(el.lobbyError, opened.reason);
-    return;
-  }
+  micRefusal = opened.opened ? null : opened.reason;
 
   busy(true, "Connecting...");
 
@@ -788,10 +801,16 @@ async function connect(credentials) {
   await room.connect(credentials.url, credentials.token);
   media.attach(room);
 
-  const published = await media.publishMicrophone();
-  if (!published.published) throw new Error(published.reason);
+  // Somebody without a microphone has nothing to publish, and a join that threw
+  // over that would hand one browser permission the power to keep them out of
+  // the room altogether. A publication that fails with a microphone in hand is
+  // still fatal: that is the server refusing a source the token names.
+  if (media.state().microphone.open) {
+    const published = await media.publishMicrophone();
+    if (!published.published) throw new Error(published.reason);
+    watchLevel(room.localParticipant.identity, media.microphoneTrack);
+  }
 
-  watchLevel(room.localParticipant.identity, media.microphoneTrack);
   startBench();
 }
 
@@ -818,10 +837,12 @@ function enterRoom(credentials) {
   paintDevices();
   paintChat();
   render();
-  if (arrivalNotice) {
-    showNotice(arrivalNotice);
-    arrivalNotice = null;
-  }
+  // Arriving without a microphone outranks anything worked out before the join.
+  // Both sentences are about the same device, and this one is about the room
+  // this person is now in rather than about the list they were offered.
+  if (micRefusal) showNotice(listeningLine(micRefusal));
+  else if (arrivalNotice) showNotice(arrivalNotice);
+  arrivalNotice = null;
   el.mute.focus();
 }
 
@@ -869,6 +890,7 @@ async function leave(reason) {
   toggleTray(false);
   togglePeople(false);
   clearNotice();
+  micRefusal = null;
   el.room.hidden = true;
   el.lobby.hidden = false;
   busy(false, reason || "");
@@ -983,6 +1005,11 @@ function onScreenShareStopped() {
 
 async function onMute() {
   if (!media) return;
+  // With no microphone open this button is not a toggle at all: it is the way
+  // to one, for somebody who joined as a listener and has since told the
+  // browser to allow the device.
+  if (!media.state().microphone.open) return turnMicrophoneOn();
+
   pending.mute = true;
   paintControls();
   const result = await media.toggleMuted();
@@ -990,6 +1017,60 @@ async function onMute() {
   if (result.reason) fail(el.roomError, result.reason);
   paintControls();
   render();
+}
+
+/**
+ * Ask for the microphone again, in the room, without leaving it.
+ *
+ * The token every join mints carries `microphone`, so the grant was never the
+ * thing that was missing -- the browser was. Which leaves an ordinary publish
+ * onto a connection that is already up: nobody is unsubscribed, nothing beyond
+ * the new track is negotiated, and the room simply sees somebody who was quiet
+ * start talking.
+ *
+ * It has to be a press, and it cannot be anything else. `getUserMedia` only
+ * puts its question inside a gesture, so a page that retried on a timer would
+ * be asking a question the browser refuses to ask, and one that retried on
+ * every render would spend a call being refused in silence. A refusal that
+ * comes back is shown as it is, without the invitation to press again that
+ * arriving carries: the press has just happened.
+ */
+async function turnMicrophoneOn() {
+  hide(el.roomError);
+  pending.mute = true;
+  paintControls();
+
+  const opened = await media.openMicrophone();
+  micRefusal = opened.opened ? null : opened.reason;
+
+  if (!opened.opened) {
+    fail(el.roomError, opened.reason);
+  } else {
+    const published = await media.publishMicrophone();
+    if (published.published) {
+      showNotice("Your microphone is on, and the room can hear you.");
+    } else {
+      fail(el.roomError, published.reason);
+    }
+  }
+
+  pending.mute = false;
+  paintControls();
+  render();
+}
+
+/**
+ * The one line somebody who has no microphone gets on arrival, and the only
+ * place the page says it.
+ *
+ * Two halves, because they are two different claims. The first is the
+ * browser's: what it refused and where the padlock that undoes it is, in the
+ * words `media.js` already wrote for it. The second is this page's: the room
+ * refused nobody, and the way back to a microphone from here is a button in the
+ * bar rather than a rejoin.
+ */
+function listeningLine(reason) {
+  return `${reason} You are in the room meanwhile, listening; press Turn on mic to ask again.`;
 }
 
 /**
@@ -1120,7 +1201,12 @@ async function onSelectMicrophone() {
   remember({ microphone: chosen === SYSTEM_DEFAULT ? null : chosen });
   const result = await media.selectMicrophone(chosen === SYSTEM_DEFAULT ? null : chosen);
 
-  if (result.applied) {
+  // Choosing an input with nothing open is not a failure to report in red. It
+  // is what the next open will ask for, which is the whole of what somebody
+  // listening means by choosing one before they press Turn on mic.
+  if (!media.state().microphone.open) {
+    showNotice("That is the input this page will ask for when the microphone goes on.");
+  } else if (result.applied) {
     showNotice(
       "Switched microphone. Nobody was unsubscribed: only the capture behind the publication changed.",
     );
@@ -2761,18 +2847,38 @@ function paintControls() {
   const open = Boolean(state && state.microphone.open);
   const muted = Boolean(state && state.microphone.muted);
 
-  el.mute.disabled = !open || pending.mute || deafened;
-  el.mute.setAttribute("aria-pressed", String(muted));
+  // Without a microphone the button stops being a toggle and becomes the way to
+  // one. Leaving it disabled is what the page used to do, and it left the
+  // person who had just allowed the device in the padlock with nothing to press
+  // and no way back short of leaving the room and joining it again.
+  const listening = !open && canOpenMicrophone(state);
+
+  el.mute.disabled = (!open && !listening) || pending.mute || deafened;
+  // `aria-pressed` is about the microphone rather than about the label: a
+  // browser that has none is as far from talking as a muted one, and a button
+  // reporting itself unpressed there would tell a screen reader the room can
+  // hear this person.
+  el.mute.setAttribute("aria-pressed", String(muted || !open));
   el.mute.dataset.on = String(open && !muted);
   el.mute.dataset.alert = String(muted);
-  el.muteLabel.textContent = muted ? "Unmute" : "Mute";
-  el.mute.setAttribute("aria-label", muted ? "Unmute your microphone" : "Mute your microphone");
-  icon(el.mute, muted ? "#icon-mic-off" : "#icon-mic");
+  el.muteLabel.textContent = !open ? "Turn on mic" : muted ? "Unmute" : "Mute";
+  el.mute.setAttribute(
+    "aria-label",
+    !open
+      ? "Turn on your microphone, asking this browser for it again"
+      : muted
+        ? "Unmute your microphone"
+        : "Mute your microphone",
+  );
+  icon(el.mute, open && !muted ? "#icon-mic" : "#icon-mic-off");
   el.mute.title = deafened
     ? "The microphone follows the speaker: it comes back when you hear the room again."
     : open
       ? "Muting stops the packets leaving; every page in the room shows it at once."
-      : "No microphone is open.";
+      : listening
+        ? `${micRefusal ? `${micRefusal} ` : ""}Pressing this asks the browser again. The token ` +
+          "this page joined with already grants a microphone, so nothing has to be rejoined."
+        : "This browser will not hand a microphone to this page at all.";
 
   el.deafen.disabled = !room || pending.mute;
   el.deafen.setAttribute("aria-pressed", String(deafened));
@@ -2825,6 +2931,17 @@ function paintControls() {
 }
 
 /**
+ * Whether asking for a microphone could get one. A browser with no capture at
+ * all, or a page it will not trust with one, has already been told so by the
+ * lobby -- which refuses to load over anything but a secure context -- and a
+ * button offering an attempt that can only ever fail would be this page arguing
+ * with what it said on the way in.
+ */
+function canOpenMicrophone(state) {
+  return Boolean(room && state && state.support.microphone && state.support.secureContext);
+}
+
+/**
  * One button, one engine name. What the browser reports about its own two flags
  * is a separate line in the menu, because it is a different claim: this button
  * says what this page put in the path, not what the operating system did behind
@@ -2843,7 +2960,7 @@ function paintNoise(state) {
   el.noise.dataset.on = String(engine !== "off");
 
   if (!state || !state.microphone.open) {
-    sub("no microphone", true, "Open a microphone first.");
+    sub("no microphone", true, "Nothing is being captured yet. Press Turn on mic first.");
     return;
   }
   if (pending.noise) {

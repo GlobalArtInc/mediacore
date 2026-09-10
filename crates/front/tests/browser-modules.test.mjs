@@ -262,11 +262,17 @@ class FakeMediaTrack {
  * `absent` names device ids this browser no longer has. Asking for one by
  * `exact` fails the whole call with a `NotFoundError`, which is what a device
  * id remembered from a previous visit turns into once the device is unplugged.
+ *
+ * `refusals` is what the browser says before it says yes, one error per
+ * attempt. A permission is answered by the person and not by the page, so the
+ * interesting case is not a browser that always refuses but one that refuses
+ * and is then asked again.
  */
 function fakeLk(options = {}) {
   const screen = options.screen || {};
   const faults = options.faults || {};
   const absent = options.absent || [];
+  const refusals = [...(options.refusals || [])];
   const opened = [];
   const captured = [];
   return {
@@ -277,6 +283,8 @@ function fakeLk(options = {}) {
     ScreenSharePresets: { h1080fps15: { resolution: {}, encoding: { maxBitrate: 3_000_000 } } },
     DeviceUnsupportedError: class DeviceUnsupportedError extends Error {},
     async createLocalAudioTrack(constraints) {
+      const refusal = refusals.shift();
+      if (refusal) throw refusal;
       const wanted = constraints.deviceId ? constraints.deviceId.exact : null;
       if (wanted && absent.includes(wanted)) {
         const error = new Error("Requested device not found");
@@ -1349,6 +1357,66 @@ describe("the denoiser survives leaving the room and joining it again", () => {
     assert.equal(result.applied, false);
     assert.match(result.reason, /Audio context/);
     assert.equal(media.state().noise.engine, NOISE_BROWSER);
+  });
+});
+
+// --------------------------------------------------------- without a microphone
+
+describe("a refused microphone leaves a module that can still be asked", () => {
+  it("keeps nothing half-open after the refusal, and says where the answer is", async () => {
+    const blocked = new Error("Permission denied");
+    blocked.name = "NotAllowedError";
+
+    const { media, lk } = await openMedia({ open: false, refusals: [blocked] });
+    const refused = await media.openMicrophone();
+
+    assert.equal(refused.opened, false);
+    assert.match(
+      refused.reason,
+      /padlock/,
+      "a blocked microphone is reported without saying where the block is undone",
+    );
+    assert.equal(media.state().microphone.open, false);
+    assert.equal(media.state().microphone.published, false);
+    assert.equal(lk.opened.length, 0, "a track was kept from an open that never happened");
+  });
+
+  it("publishes into a room that was joined without one, when the answer changes", async () => {
+    const blocked = new Error("Permission denied");
+    blocked.name = "NotAllowedError";
+
+    const { media } = await openMedia({ open: false, refusals: [blocked] });
+    const room = fakeRoom();
+
+    // The join carries on: the page attaches the room it reached and publishes
+    // nothing into it, which is what being in a room as a listener is.
+    await media.openMicrophone();
+    media.attach(room);
+
+    const nothing = await media.publishMicrophone();
+    assert.equal(nothing.published, false);
+    assert.equal(room.published.length, 0, "a listener published something");
+
+    // Somebody comes back from the padlock and presses the button again. The
+    // connection is up and the grant is already in the token, so this is one
+    // added track and nothing else.
+    const opened = await media.openMicrophone();
+    assert.equal(opened.opened, true, opened.reason);
+
+    const published = await media.publishMicrophone();
+    assert.equal(
+      published.published,
+      true,
+      "the microphone opened mid-call and the room was never told about it",
+    );
+    assert.equal(room.published.length, 1);
+    assert.equal(media.state().microphone.open, true);
+    assert.equal(media.state().microphone.published, true);
+    assert.equal(
+      media.state().microphone.muted,
+      false,
+      "the microphone somebody asked for arrived muted",
+    );
   });
 });
 

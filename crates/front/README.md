@@ -868,6 +868,52 @@ name keep the last four characters of their identity beside it, as they always h
 shape on a window with room for it; "On a phone" below is the same room on a screen 375 pixels
 across, which is where most of these calls are actually taken.
 
+### Joining without a microphone
+
+The join asks for the microphone and then carries on whatever the answer was. It did not always: a
+refusal used to end the join in the lobby with the sentence about the padlock and nothing else,
+which let one browser permission decide whether somebody could be in the room at all. That is the
+wrong thing for it to decide. Hearing the room, seeing who is in it, reading and writing the chat,
+watching a shared screen and the bench are all of the room except one half of one control, and none
+of them needs a capture device. The person this happened to is not an edge case — a machine with no
+microphone, a laptop where the device is already held by something else, somebody who pressed Block
+on a prompt weeks ago and does not connect the two — and telling them to fix the padlock before
+they may hear a meeting that has already started is a page putting its own precondition ahead of
+what they came for.
+
+Nothing on the server ever depended on the device. **The token is minted per join and always grants
+`microphone`** — see "What the token grants" — so a listener holds exactly the same grant as
+everybody else and is one `publishTrack` away from talking. `connect()` publishes only when there
+is something to publish; a publication that fails *with* a microphone in hand is still fatal,
+because that one is the SFU refusing a source the token names, which is a different failure and
+worth stopping the join for.
+
+**The microphone button becomes the way to a microphone rather than a dead control.** It says
+`Turn on mic`, and pressing it asks the browser again and publishes what comes back onto the
+connection that is already up: nobody is unsubscribed, nothing renegotiates beyond the one added
+track, and the room sees somebody who was quiet start talking. Leaving it disabled — which is what
+the page used to do — is the worst of both, because the person most likely to press it is the
+person who has *just* come back from the padlock having allowed the device, and the page would
+answer them with a greyed-out button and no way back short of leaving the room and joining it
+again. The press is also the only mechanism available: `getUserMedia` puts its question inside a
+user gesture and nowhere else, so a page that retried on a timer would be asking a question the
+browser will not ask, and one that retried on every render would spend the call being refused in
+silence.
+
+**The reason is kept, not shown once.** The refusal `media.js` wrote — what happened and where the
+padlock that undoes it is — is said once on arrival as one line, with this page's half after it:
+the room refused nobody, and there is a button. Notices time out, so the same sentence then lives
+on the button's own tooltip for as long as there is no microphone, which is where somebody who has
+been away fixing a permission will look for it. To a screen reader the button reports itself
+*pressed* while there is no microphone: a browser that has not handed one over is exactly as far
+from the room as a muted one, and a control claiming otherwise would be telling somebody they can
+be heard.
+
+For anybody who does have a microphone nothing about this is visible. The one opened mid-call goes
+through the same `openMicrophone()` as the one opened at the join — the same denoiser probe, the
+same node attach, the same fallback to the browser's suppressor — and mute, the device chooser, the
+changes held until you unmute and the speaker mute are all untouched.
+
 ### Putting one thing in the middle
 
 Press a tile and that one thing fills the stage, with everything else in a strip down the right that
