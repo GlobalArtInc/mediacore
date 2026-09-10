@@ -2346,11 +2346,58 @@ fn message_name(message: &mediacore::signal_response::Message) -> &'static str {
     }
 }
 
+/// Whether somebody told to go should come back.
+///
+/// The client reads this and acts on it: `Reconnect` sends it round again,
+/// `Disconnect` is final and it stops. Answering `Disconnect` to everything --
+/// which this did until a node draining on a rolling deploy told every meeting
+/// in the cluster never to return -- makes every transient fault permanent.
+///
+/// The split is whether the reason is about this connection or about the
+/// person. A node stopping, a socket that went quiet, media that failed: the
+/// meeting is still there and whoever it was should come back to it. Being
+/// removed, the room being deleted or closed, a second connection under one
+/// identity, a token that would not do: coming back would produce the same
+/// answer, and a client retrying against it is a client in a loop.
+///
+/// Matched without a wildcard on purpose. A reason added to the protocol later
+/// stops this compiling, which is the moment to decide what it means rather
+/// than inheriting whichever default happened to be written here.
+fn comes_back(reason: mediacore::DisconnectReason) -> bool {
+    use mediacore::DisconnectReason as Why;
+
+    match reason {
+        Why::ServerShutdown
+        | Why::ConnectionTimeout
+        | Why::MediaFailure
+        | Why::SignalClose
+        | Why::UnknownReason => true,
+
+        Why::ClientInitiated
+        | Why::DuplicateIdentity
+        | Why::ParticipantRemoved
+        | Why::RoomDeleted
+        | Why::RoomClosed
+        | Why::StateMismatch
+        | Why::JoinFailure
+        | Why::Migration
+        | Why::UserUnavailable
+        | Why::UserRejected
+        | Why::SipTrunkFailure
+        | Why::AgentError => false,
+    }
+}
+
 pub fn leave(reason: mediacore::DisconnectReason) -> mediacore::signal_response::Message {
+    let again = comes_back(reason);
+
     mediacore::signal_response::Message::Leave(mediacore::LeaveRequest {
-        can_reconnect: false,
+        can_reconnect: again,
         reason: reason as i32,
-        action: mediacore::leave_request::Action::Disconnect as i32,
+        action: match again {
+            true => mediacore::leave_request::Action::Reconnect as i32,
+            false => mediacore::leave_request::Action::Disconnect as i32,
+        },
         regions: None,
     })
 }

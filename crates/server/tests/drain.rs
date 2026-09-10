@@ -279,3 +279,26 @@ async fn a_second_stop_signal_changes_nothing() {
     assert!(!state.begin_draining(), "a second signal began a second drain");
     assert!(state.draining());
 }
+
+/// The half the first version of this got wrong. Telling somebody the server
+/// is stopping is only half an answer: the client also reads whether it may
+/// come back, and `Disconnect` with `can_reconnect: false` means never. A
+/// rolling deploy would empty every meeting in the cluster permanently.
+#[tokio::test]
+async fn nobody_is_told_never_to_come_back() {
+    let (addr, state) = spawn().await;
+    let mut alice = join(addr, "alice", ROOM).await;
+
+    drain(&state);
+
+    let leave = next_leave(&mut alice).await;
+    assert!(
+        leave.can_reconnect,
+        "a rolling deploy told somebody in a meeting never to come back"
+    );
+    assert_eq!(
+        leave.action,
+        mediacore::leave_request::Action::Reconnect as i32,
+        "the client reads `action`, and only RECONNECT sends it back through the load balancer"
+    );
+}

@@ -2736,3 +2736,51 @@ fn a_policy_that_arrives_after_the_room_did_still_ends_the_session() {
     assert!(registry.rooms().is_empty());
     let _ = alice;
 }
+
+/// A client reads `action` and stops on `Disconnect`. Getting this wrong makes
+/// every transient fault permanent, which is what happened when a draining
+/// node told the meetings it was closing never to come back.
+#[test]
+fn a_transient_reason_sends_the_client_round_again_and_a_final_one_does_not() {
+    use mediacore::DisconnectReason as Why;
+
+    let told = |reason| match leave(reason) {
+        mediacore::signal_response::Message::Leave(request) => request,
+        other => panic!("leave built {other:?}"),
+    };
+
+    for reason in [
+        Why::ServerShutdown,
+        Why::ConnectionTimeout,
+        Why::MediaFailure,
+        Why::SignalClose,
+    ] {
+        let request = told(reason);
+        assert!(request.can_reconnect, "{reason:?} was made permanent");
+        assert_eq!(
+            request.action,
+            mediacore::leave_request::Action::Reconnect as i32,
+            "{reason:?} sets can_reconnect but tells the client to stop, which is what the \
+             client actually reads"
+        );
+    }
+
+    for reason in [
+        Why::ParticipantRemoved,
+        Why::RoomDeleted,
+        Why::RoomClosed,
+        Why::DuplicateIdentity,
+        Why::JoinFailure,
+        Why::ClientInitiated,
+    ] {
+        let request = told(reason);
+        assert!(
+            !request.can_reconnect,
+            "{reason:?} invites the client back to an answer that will not change"
+        );
+        assert_eq!(
+            request.action,
+            mediacore::leave_request::Action::Disconnect as i32
+        );
+    }
+}
