@@ -323,7 +323,10 @@ async fn a_subscription_is_offered_under_the_participant_and_the_track_together(
         offered[0].sdp
     );
     assert_eq!(
-        offered[0].mid_to_track_id.values().collect::<Vec<&String>>(),
+        offered[0]
+            .mid_to_track_id
+            .values()
+            .collect::<Vec<&String>>(),
         vec![&track.sid],
         "the mid the track was offered on is not the one it was announced under"
     );

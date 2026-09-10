@@ -47,7 +47,13 @@ fn the_node_publishing_a_room_is_the_one_that_holds_it() {
 #[test]
 fn a_node_that_stopped_beating_holds_nothing() {
     let seen = view(
-        vec![node("ND_gone", 1_000, 10_000, NodeState::Live, &["standup"])],
+        vec![node(
+            "ND_gone",
+            1_000,
+            10_000,
+            NodeState::Live,
+            &["standup"],
+        )],
         10_000 + 30_001,
     );
 
@@ -81,7 +87,13 @@ fn two_nodes_holding_one_room_agree_on_which_of_them_it_is() {
 fn a_draining_node_still_owns_its_rooms_and_is_offered_nothing() {
     let seen = view(
         vec![
-            node("ND_going", 1_000, 100_000, NodeState::Draining, &["standup"]),
+            node(
+                "ND_going",
+                1_000,
+                100_000,
+                NodeState::Draining,
+                &["standup"],
+            ),
             node("ND_staying", 2_000, 100_000, NodeState::Live, &[]),
         ],
         100_000,
@@ -94,7 +106,9 @@ fn a_draining_node_still_owns_its_rooms_and_is_offered_nothing() {
     );
     assert_eq!(seen.alive().count(), 2);
     assert_eq!(
-        seen.taking_work().map(|node| node.id.as_str()).collect::<Vec<&str>>(),
+        seen.taking_work()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<&str>>(),
         vec!["ND_staying"]
     );
 }

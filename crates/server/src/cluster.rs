@@ -17,8 +17,6 @@ use mediacore_room::Registry;
 use mediacore_session::{Node, NodeState, SessionStore, StoreError};
 use tokio::task::JoinHandle;
 
-
-
 /// What this node knew about the cluster when it last looked.
 ///
 /// Replaced whole rather than edited, so a reader holding one is holding a
@@ -263,7 +261,11 @@ async fn beat(
             },
             started_at_ms: row.started_at_ms,
             kept_alive_at_ms: now,
-            rooms: registry.rooms().into_iter().map(|room| room.name.clone()).collect(),
+            rooms: registry
+                .rooms()
+                .into_iter()
+                .map(|room| room.name.clone())
+                .collect(),
         };
 
         // Publishing and reading are one round of the same task rather than two
@@ -290,7 +292,9 @@ async fn beat(
                 node = %row.id,
                 "{what}"
             ),
-            Err(error) => tracing::warn!(node = %row.id, %error, "this node could not say it is up"),
+            Err(error) => {
+                tracing::warn!(node = %row.id, %error, "this node could not say it is up")
+            }
         }
 
         if let Ok(nodes) = seen {

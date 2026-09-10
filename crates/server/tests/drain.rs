@@ -135,14 +135,15 @@ async fn next_leave(socket: &mut Client) -> mediacore::LeaveRequest {
 
 async fn status(addr: SocketAddr, path: &str) -> (u16, String) {
     let mut socket = TcpStream::connect(addr).await.unwrap();
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     socket.write_all(request.as_bytes()).await.unwrap();
 
     let mut raw = Vec::new();
     socket.read_to_end(&mut raw).await.unwrap();
     let response = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = response.split_once("\r\n\r\n").expect("a response with a body");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("a response with a body");
     let code = head
         .split_whitespace()
         .nth(1)
@@ -221,7 +222,10 @@ async fn an_arrival_during_the_drain_is_turned_away_and_told_to_come_back() {
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let leave = next_leave(&mut socket).await;
 
-    assert_eq!(leave.reason, mediacore::DisconnectReason::ServerShutdown as i32);
+    assert_eq!(
+        leave.reason,
+        mediacore::DisconnectReason::ServerShutdown as i32
+    );
     assert!(
         leave.can_reconnect,
         "an arrival turned away by a node that is stopping was told never to come back"
@@ -276,7 +280,10 @@ async fn a_second_stop_signal_changes_nothing() {
     let (_addr, state) = spawn().await;
 
     assert!(state.begin_draining());
-    assert!(!state.begin_draining(), "a second signal began a second drain");
+    assert!(
+        !state.begin_draining(),
+        "a second signal began a second drain"
+    );
     assert!(state.draining());
 }
 

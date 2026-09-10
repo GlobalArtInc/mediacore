@@ -46,13 +46,13 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+use crate::brand::Brand;
 use crate::log::quoted;
 use crate::oidc::{ProviderError, local_path, safe_return_url};
 use crate::session::{
     LOGIN_COOKIE, Login, NotFinished, Session, fingerprint, login_cookie, random_token,
     same_secret, session_cookie, spent_login_cookie, spent_session_cookie,
 };
-use crate::brand::Brand;
 use crate::state::{Front, Shared};
 
 /// The redirect URI registered with the provider. It is a constant because the

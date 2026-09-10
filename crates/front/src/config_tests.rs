@@ -380,7 +380,14 @@ fn a_deployment_can_put_its_own_name_and_its_own_logo_on_the_page() {
     let config = Config::from_source(&env(&pairs)).unwrap();
 
     assert_eq!(config.brand.name, "Acme Rooms");
-    assert_eq!(config.brand.logo.expect("a logo was configured").content_type, "image/png");
+    assert_eq!(
+        config
+            .brand
+            .logo
+            .expect("a logo was configured")
+            .content_type,
+        "image/png"
+    );
 }
 
 /// A refusal has to say which variable to go and fix, because the message says
@@ -396,7 +403,11 @@ fn a_brand_that_cannot_be_one_names_the_variable_that_holds_it() {
     for (variable, value) in cases {
         let mut pairs = complete();
         let value = match variable == BRAND_NAME {
-            true => Box::leak(value.repeat(crate::brand::MAX_NAME_CHARS + 1).into_boxed_str()),
+            true => Box::leak(
+                value
+                    .repeat(crate::brand::MAX_NAME_CHARS + 1)
+                    .into_boxed_str(),
+            ),
             false => value,
         };
         pairs.push((variable, value));

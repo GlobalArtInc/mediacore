@@ -55,7 +55,9 @@ const ROSTER_ANCHOR: &str = r#"<h1 class="brand-mark room-brand">MediaCore</h1>"
 pub enum BrandError {
     #[error("a brand name is at most {MAX_NAME_CHARS} characters, and this one is {count}")]
     NameTooLong { count: usize },
-    #[error("a brand name goes in the tab and in an alt attribute, so it cannot carry control characters")]
+    #[error(
+        "a brand name goes in the tab and in an alt attribute, so it cannot carry control characters"
+    )]
     NameControl,
     #[error("{path}: {reason}")]
     LogoUnreadable { path: String, reason: String },
@@ -162,15 +164,18 @@ impl Brand {
         let mark = self.mark();
 
         Cow::Owned(
-            page.replace(TITLE_ANCHOR, &format!("<title>{}</title>", escape(&self.name)))
-                .replace(
-                    LOBBY_ANCHOR,
-                    &format!(r#"<span class="brand-mark">{mark}</span>"#),
-                )
-                .replace(
-                    ROSTER_ANCHOR,
-                    &format!(r#"<h1 class="brand-mark room-brand">{mark}</h1>"#),
-                ),
+            page.replace(
+                TITLE_ANCHOR,
+                &format!("<title>{}</title>", escape(&self.name)),
+            )
+            .replace(
+                LOBBY_ANCHOR,
+                &format!(r#"<span class="brand-mark">{mark}</span>"#),
+            )
+            .replace(
+                ROSTER_ANCHOR,
+                &format!(r#"<h1 class="brand-mark room-brand">{mark}</h1>"#),
+            ),
         )
     }
 

@@ -88,7 +88,8 @@ fn a_name_shaped_like_an_anchor_cannot_re_enter_the_substitution() {
         "a brand name was put on the page as markup"
     );
     assert_eq!(
-        page.matches(r#"<h1 class="brand-mark room-brand">"#).count(),
+        page.matches(r#"<h1 class="brand-mark room-brand">"#)
+            .count(),
         1,
         "the roster heading was substituted more than once"
     );
@@ -101,7 +102,9 @@ fn a_logo_replaces_the_words_and_keeps_them_as_the_alt_text() {
     let page = brand.render(INDEX_HTML);
     let path = &brand.logo.as_ref().unwrap().path;
 
-    assert!(page.contains(&format!(r#"<img class="brand-logo" src="{path}" alt="Acme" />"#)));
+    assert!(page.contains(&format!(
+        r#"<img class="brand-logo" src="{path}" alt="Acme" />"#
+    )));
     assert!(
         page.contains("<title>Acme</title>"),
         "a tab cannot show a picture, so it has to keep the words"
@@ -202,11 +205,7 @@ fn the_refusals_worth_making() {
         "a deployment that gave a logo two ways got one of them silently"
     );
 
-    let big = STANDARD.encode(
-        [PNG, &vec![0u8; MAX_LOGO_BYTES]]
-            .concat()
-            .as_slice(),
-    );
+    let big = STANDARD.encode([PNG, &vec![0u8; MAX_LOGO_BYTES]].concat().as_slice());
     assert!(matches!(
         Brand::new(Some("Acme"), Some(&big), None).unwrap_err(),
         BrandError::LogoTooLarge { .. }
@@ -271,7 +270,10 @@ fn the_logo_path_follows_the_bytes() {
 fn the_debug_rendering_carries_no_bytes() {
     let rendered = format!("{:?}", logo(PNG));
 
-    assert!(rendered.contains("Acme"), "the shape is what a log line is for");
+    assert!(
+        rendered.contains("Acme"),
+        "the shape is what a log line is for"
+    );
     assert!(
         rendered.contains("/brand/logo-"),
         "a log line cannot say which logo is loaded: {rendered}"

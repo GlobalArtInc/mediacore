@@ -66,10 +66,9 @@ pub async fn carry(client: WebSocket, url: String, token: String) -> Result<(), 
     // that use one: the newer server SDKs send `Authorization` and nothing in
     // the query, so a relay that only copied the query would carry them to a
     // node that answers 401 -- which is exactly what it did before this line.
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .map_err(|error| format!("the address of the node holding this room is not one: {error}"))?;
+    let mut request = url.as_str().into_client_request().map_err(|error| {
+        format!("the address of the node holding this room is not one: {error}")
+    })?;
 
     let bearer = format!("Bearer {token}")
         .parse()
@@ -163,7 +162,9 @@ pub async fn forward(
     body: bytes::Bytes,
 ) -> Result<(u16, String, bytes::Bytes), String> {
     let base = signal_url.trim_end_matches('/');
-    let http = base.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    let http = base
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
     let url = format!("{http}/twirp/{service}/{method}");
 
     let answer = reqwest::Client::new()
@@ -187,10 +188,9 @@ pub async fn forward(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_owned();
-    let bytes = answer
-        .bytes()
-        .await
-        .map_err(|error| format!("the answer from the node holding this room broke off: {error}"))?;
+    let bytes = answer.bytes().await.map_err(|error| {
+        format!("the answer from the node holding this room broke off: {error}")
+    })?;
 
     Ok((status, kind, bytes))
 }

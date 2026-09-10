@@ -128,13 +128,18 @@ async fn drain(state: AppState) {
     }
 
     let rooms = state.registry.rooms();
-    tracing::info!(rooms = rooms.len(), "draining: this node stops taking arrivals");
+    tracing::info!(
+        rooms = rooms.len(),
+        "draining: this node stops taking arrivals"
+    );
 
     // Each one ends as a meeting somebody watched end -- `Ending::Closed` at
     // the time it really stopped -- rather than being found unfinished later
     // and recorded as a restart with an end time nobody observed.
     for room in &rooms {
-        state.registry.close(&room.name, mediacore::DisconnectReason::ServerShutdown);
+        state
+            .registry
+            .close(&room.name, mediacore::DisconnectReason::ServerShutdown);
     }
 
     if !rooms.is_empty() {

@@ -823,7 +823,12 @@ async fn a_room_the_token_may_not_read_refuses_the_whole_call() {
     )
     .await;
 
-    assert_eq!(answer.status, 403, "{}", String::from_utf8_lossy(&answer.body));
+    assert_eq!(
+        answer.status,
+        403,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
     assert!(
         answer.json()["msg"]
             .as_str()
@@ -849,14 +854,12 @@ async fn more_rooms_than_one_call_carries_is_refused_and_says_so() {
     let addr = spawn_server().await;
     let _alice = join(addr, "alice", ROOM).await;
 
-    let many: Vec<String> = (0..=sessions::MAX_ROOMS).map(|n| format!("room{n}")).collect();
+    let many: Vec<String> = (0..=sessions::MAX_ROOMS)
+        .map(|n| format!("room{n}"))
+        .collect();
     let answer = get(
         addr,
-        &format!(
-            "{}?rooms={}",
-            sessions::ROOMS_SESSIONS_PATH,
-            many.join(",")
-        ),
+        &format!("{}?rooms={}", sessions::ROOMS_SESSIONS_PATH, many.join(",")),
         Some(&lister()),
     )
     .await;
@@ -886,6 +889,9 @@ async fn asking_about_no_rooms_at_all_is_refused() {
         )
         .await;
 
-        assert_eq!(answer.status, 400, "`{query}` was answered rather than refused");
+        assert_eq!(
+            answer.status, 400,
+            "`{query}` was answered rather than refused"
+        );
     }
 }

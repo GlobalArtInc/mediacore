@@ -1960,7 +1960,6 @@ impl PeerActor {
     }
 }
 
-
 /// An sdp line without the line ending it arrived with.
 fn bare(line: &str) -> &str {
     line.trim_end_matches(['\r', '\n'])

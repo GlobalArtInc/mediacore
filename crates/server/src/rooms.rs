@@ -1040,30 +1040,56 @@ fn room_named(codec: Codec, method: &str, body: &Bytes) -> Option<String> {
     let named = |room: String| (!room.is_empty()).then_some(room);
 
     match method {
-        "CreateRoom" => named(twirp::decode::<mediacore::CreateRoomRequest>(codec, body).ok()?.name),
-        "DeleteRoom" => named(twirp::decode::<mediacore::DeleteRoomRequest>(codec, body).ok()?.room),
-        "ListParticipants" => {
-            named(twirp::decode::<mediacore::ListParticipantsRequest>(codec, body).ok()?.room)
-        }
-        "GetParticipant" => {
-            named(twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body).ok()?.room)
-        }
-        "RemoveParticipant" => {
-            named(twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body).ok()?.room)
-        }
-        "MutePublishedTrack" => {
-            named(twirp::decode::<mediacore::MuteRoomTrackRequest>(codec, body).ok()?.room)
-        }
-        "UpdateParticipant" => {
-            named(twirp::decode::<mediacore::UpdateParticipantRequest>(codec, body).ok()?.room)
-        }
-        "UpdateSubscriptions" => {
-            named(twirp::decode::<mediacore::UpdateSubscriptionsRequest>(codec, body).ok()?.room)
-        }
-        "SendData" => named(twirp::decode::<mediacore::SendDataRequest>(codec, body).ok()?.room),
-        "UpdateRoomMetadata" => {
-            named(twirp::decode::<mediacore::UpdateRoomMetadataRequest>(codec, body).ok()?.room)
-        }
+        "CreateRoom" => named(
+            twirp::decode::<mediacore::CreateRoomRequest>(codec, body)
+                .ok()?
+                .name,
+        ),
+        "DeleteRoom" => named(
+            twirp::decode::<mediacore::DeleteRoomRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "ListParticipants" => named(
+            twirp::decode::<mediacore::ListParticipantsRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "GetParticipant" => named(
+            twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "RemoveParticipant" => named(
+            twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "MutePublishedTrack" => named(
+            twirp::decode::<mediacore::MuteRoomTrackRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "UpdateParticipant" => named(
+            twirp::decode::<mediacore::UpdateParticipantRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "UpdateSubscriptions" => named(
+            twirp::decode::<mediacore::UpdateSubscriptionsRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "SendData" => named(
+            twirp::decode::<mediacore::SendDataRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
+        "UpdateRoomMetadata" => named(
+            twirp::decode::<mediacore::UpdateRoomMetadataRequest>(codec, body)
+                .ok()?
+                .room,
+        ),
         _ => None,
     }
 }
@@ -1194,7 +1220,9 @@ async fn gathered(
             Ok((200, _, bytes)) => {
                 match twirp::decode::<mediacore::ListRoomsResponse>(codec, &bytes) {
                     Ok(theirs) => rooms.extend(theirs.rooms),
-                    Err(error) => tracing::warn!(node = %id, message = %error.message, "a node answered ListRooms with something this one could not read"),
+                    Err(error) => {
+                        tracing::warn!(node = %id, message = %error.message, "a node answered ListRooms with something this one could not read")
+                    }
                 }
             }
             Ok((status, _, _)) => {
@@ -1213,16 +1241,25 @@ async fn gathered(
     rooms.sort_by(|left, right| left.name.cmp(&right.name));
     rooms.dedup_by(|left, right| left.name == right.name);
 
-    Some(encode(codec, mediacore::ListRoomsResponse { rooms }).unwrap_or_else(|error| error.into_response()))
+    Some(
+        encode(codec, mediacore::ListRoomsResponse { rooms })
+            .unwrap_or_else(|error| error.into_response()),
+    )
 }
 
 /// This node's own answer to `ListRooms`, decoded back out of the response it
 /// would have sent. Going through `serve` rather than around it keeps the
 /// filtering and the grant check in exactly one place.
-fn local_rooms(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Option<Vec<mediacore::Room>> {
+fn local_rooms(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Vec<mediacore::Room>> {
     let codec = Codec::from_headers(headers).ok()?;
     let claims = mediacore_auth::verify(twirp::bearer(headers).ok()?, &state.config.keys).ok()?;
     let request = twirp::decode::<mediacore::ListRoomsRequest>(codec, body).ok()?;
 
-    list_rooms(state, &claims, request).ok().map(|answer| answer.rooms)
+    list_rooms(state, &claims, request)
+        .ok()
+        .map(|answer| answer.rooms)
 }

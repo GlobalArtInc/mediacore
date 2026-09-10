@@ -82,7 +82,10 @@ async fn policy_of(addr: SocketAddr) -> String {
     head_of(addr, "/")
         .await
         .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-security-policy:"))
+        .find(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("content-security-policy:")
+        })
         .expect("the page carries a content security policy")
         .to_owned()
 }

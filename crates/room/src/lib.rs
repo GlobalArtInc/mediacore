@@ -1828,11 +1828,7 @@ impl Registry {
     /// the time it really stopped -- because in both cases somebody watched it
     /// end. What must not happen is the meeting being left unfinished for a
     /// reaper to close later as a restart, with an end time nobody observed.
-    pub fn close(
-        &self,
-        name: &str,
-        reason: mediacore::DisconnectReason,
-    ) -> Option<Arc<Room>> {
+    pub fn close(&self, name: &str, reason: mediacore::DisconnectReason) -> Option<Arc<Room>> {
         // Taking the room away and closing its meeting are one step. Between
         // the two, an arrival would find no room, build another under the same
         // name and open a second meeting in it -- which the close would then

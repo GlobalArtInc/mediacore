@@ -14,12 +14,12 @@ use mediacore_transport::{Bitrate, BweSettings, DataSettings};
 
 use crate::bandwidth::Subscribers;
 use crate::caretaker::Caretaker;
+use crate::cluster::Cluster;
 use crate::data::DataRouter;
 use crate::events;
 use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
-use crate::cluster::Cluster;
 use crate::recording::Recording;
 
 #[derive(Clone)]
