@@ -1618,9 +1618,11 @@ name = "mediacore-auth"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "hmac 0.12.1",
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "sha1",
  "thiserror",
 ]
 
@@ -1694,6 +1696,19 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "mediacore-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mediacore-auth",
+ "mediacore-client",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

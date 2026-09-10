@@ -5,6 +5,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
+pub mod turn;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("token is malformed")]

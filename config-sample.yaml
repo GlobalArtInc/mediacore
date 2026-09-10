@@ -403,6 +403,68 @@ rtc:
   node_ip: ""
   ice_disconnected_timeout: 20
 
+  # STUN and TURN servers this server's clients are told to try. Empty, and a
+  # client then gathers host candidates only: it reaches this server from the
+  # network it is on or it does not reach it at all. That is enough on a LAN and
+  # on any client whose own address is routable, and it is not enough behind a
+  # symmetric NAT or a firewall that allows nothing outbound but 443.
+  #
+  # This server runs neither. It is ice-lite -- it answers whoever asks and
+  # gathers nothing of its own -- so a relay needs nothing from it beyond this
+  # list: coturn runs as its own process, and a relayed packet arrives here from
+  # the relay's address like any other.
+  #
+  # THE TRAP, and it is the whole of what goes wrong with an external relay: the
+  # relay has to be able to reach the addresses this server puts in its own
+  # candidates. coturn opens a socket towards them on the client's behalf, so
+  # advertise_addresses above pointing at 10.x while coturn sits outside means
+  # the relay leg is set up, allocated, and then never carries a packet. Nothing
+  # errors. The call connects, both sides show as connected, and the room is
+  # silent -- which is indistinguishable from everybody being muted, and is why
+  # this is written down here rather than found out at three in the morning.
+  #
+  # Every url here is checked at startup against the grammar a browser parses,
+  # and the reason it is checked rather than passed through is the ?transport=
+  # on the turn: lines below: it belongs to a turn: url and to nothing else. A
+  # stun: url carrying one, or a transport that is neither udp nor tcp, throws
+  # out of the RTCPeerConnection constructor -- so it does not cost the
+  # deployment that one line, it costs it every other ice server in this list at
+  # the same time and nobody in the room connects at all.
+  #
+  # ice_servers:
+  #   - urls:
+  #       - stun:stun.example.com:3478
+  #
+  #   # A coturn with a user in its database: one pair, the same for everybody,
+  #   # good until somebody changes it. Fine for a closed deployment, and it is
+  #   # a password in a config file that reaches every client that ever joins.
+  #   - urls:
+  #       - turn:turn.example.com:3478?transport=udp
+  #       - turns:turn.example.com:5349?transport=tcp
+  #     username: mediacore
+  #     credential: the-password-coturn-knows
+  #
+  #   # A coturn started with use-auth-secret, which is what a deployment of any
+  #   # size wants: this server mints a fresh credential for each person as they
+  #   # join, out of a secret it shares with the relay and sends to nobody. The
+  #   # username carries the expiry and the person's identity, so coturn's own
+  #   # logs and per-user limits name who is holding an allocation.
+  #   #
+  #   # ttl_seconds has to outlive the longest call, not the join: coturn checks
+  #   # the expiry when the allocation is made and again on every refresh, so a
+  #   # credential that runs out mid-meeting takes the relay away mid-sentence.
+  #   # A day by default.
+  #   #
+  #   # One or the other. An entry carrying both a fixed pair and a secret is
+  #   # refused at startup rather than resolved by a precedence rule nobody
+  #   # would remember, and so is a turn: entry carrying neither, which would be
+  #   # offered to every client and refused by the relay every time.
+  #   - urls:
+  #       - turn:turn.example.com:3478?transport=udp
+  #       - turns:turn.example.com:5349?transport=tcp
+  #     secret: the-value-of-coturn-static-auth-secret
+  #     ttl_seconds: 86400
+
 video:
   dynacast_pause_delay_ms: 5000
   layer_upgrade_hold_ms: 2000

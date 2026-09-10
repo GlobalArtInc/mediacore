@@ -632,6 +632,239 @@ fn rejects_a_bandwidth_block_that_cannot_run() {
     assert!(Config::parse("keys:\n  key1: secret1\nvideo:\n  bwe:\n    nope: 1\n").is_err());
 }
 
+/// Nothing is offered until somebody names a relay. A client that is handed an
+/// empty list gathers host candidates and reaches this server directly, which
+/// is what every deployment did before any of this existed.
+#[test]
+fn no_ice_server_is_offered_until_one_is_configured() {
+    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+
+    assert!(config.rtc.ice_servers.is_empty());
+}
+
+#[test]
+fn a_relay_can_be_named_with_a_fixed_pair_or_with_a_secret() {
+    let config = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         stun:stun.example.test:3478\n    - urls:\n        - \
+         turn:turn.example.test:3478?transport=udp\n        - \
+         turns:turn.example.test:5349?transport=tcp\n      username: mediacore\n      \
+         credential: relay-password\n    - urls:\n        - turn:turn.example.test:3478\n      \
+         secret: coturn-shared-secret\n      ttl_seconds: 3600\n",
+    )
+    .expect("a deployment with a stun server and two relays");
+
+    assert_eq!(config.rtc.ice_servers.len(), 3);
+
+    let stun = &config.rtc.ice_servers[0];
+    assert_eq!(stun.urls, vec!["stun:stun.example.test:3478"]);
+    assert!(!stun.mints_credentials());
+
+    let fixed = &config.rtc.ice_servers[1];
+    assert_eq!(
+        fixed.urls.len(),
+        2,
+        "one relay reachable two ways is one entry"
+    );
+    assert_eq!(fixed.username, "mediacore");
+    assert_eq!(fixed.credential, "relay-password");
+    assert!(!fixed.mints_credentials());
+
+    let minted = &config.rtc.ice_servers[2];
+    assert!(minted.mints_credentials());
+    assert_eq!(minted.credential_ttl(), 3_600);
+    assert!(
+        minted.username.is_empty() && minted.credential.is_empty(),
+        "a secret entry carries no fixed pair, and the join is what fills these in"
+    );
+}
+
+/// A credential's life has to outlive the longest call, so it is not something
+/// a deployment should have to write down to get a working relay.
+#[test]
+fn a_minted_credential_outlives_a_meeting_without_being_asked_to() {
+    let config = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478\n      secret: coturn-shared-secret\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.rtc.ice_servers[0].credential_ttl(),
+        u64::from(DEFAULT_ICE_CREDENTIAL_TTL_SECONDS)
+    );
+}
+
+/// Every one of these parses, installs and quietly relays nothing, which from
+/// inside a room is indistinguishable from everybody being silent.
+#[test]
+fn rejects_an_ice_server_that_would_never_relay_anything() {
+    let refused =
+        Config::parse("keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - username: u\n")
+            .expect_err("an entry with no address at all is not an ice server");
+    assert!(refused.to_string().contains("no urls"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         https://turn.example.test\n",
+    )
+    .expect_err("a browser refuses the whole list over a scheme it does not know");
+    assert!(
+        refused.to_string().contains("https://turn.example.test"),
+        "the refusal has to name the url somebody has to fix: {refused}"
+    );
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478\n",
+    )
+    .expect_err("a relay offered with no credentials refuses every allocation");
+    assert!(refused.to_string().contains("no credentials"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478\n      username: mediacore\n      credential: \
+         relay-password\n      secret: coturn-shared-secret\n",
+    )
+    .expect_err("an entry that holds its credential both ways names no single answer");
+    assert!(refused.to_string().contains("both"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478\n      username: mediacore\n",
+    )
+    .expect_err("half a pair is a pair a relay refuses");
+    assert!(refused.to_string().contains("half"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         stun:stun.example.test:3478\n      username: mediacore\n      credential: \
+         relay-password\n",
+    )
+    .expect_err("stun has nothing to authenticate, so credentials on one are a mistake");
+    assert!(refused.to_string().contains("stun"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         stun:stun.example.test:3478\n      secret: coturn-shared-secret\n",
+    )
+    .expect_err("a stun server given a minting secret is the same mistake");
+    assert!(refused.to_string().contains("stun"), "{refused}");
+
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478\n      secret: coturn-shared-secret\n      ttl_seconds: 0\n",
+    )
+    .expect_err("a credential that has expired when it arrives was never a credential");
+    assert!(refused.to_string().contains("ttl_seconds"), "{refused}");
+
+    assert!(
+        Config::parse(
+            "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+             turn:turn.example.test:3478\n      secret: s\n      nope: 1\n"
+        )
+        .is_err(),
+        "a setting this server does not have must not be read as one it does"
+    );
+}
+
+/// Every url here was put through `new RTCPeerConnection` in Chrome and threw a
+/// `SyntaxError`, which is not the same failure as a bad relay: the constructor
+/// never returns, so the deployment's other ice servers go with it and no client
+/// gets media at all. A list is only as good as its worst line, which is why
+/// these are refused at startup instead.
+#[test]
+fn rejects_an_ice_url_no_browser_will_parse() {
+    for url in [
+        // The whole reason this is checked: `?transport=` is copied off a
+        // turn: line onto the stun: line above it, where stun has no use for
+        // it and a browser will not have it.
+        "stun:stun.example.test:3478?transport=udp",
+        "stuns:stun.example.test:5349?transport=tcp",
+        // `tls` is how somebody who knows what turns: is for writes it, and
+        // udp and tcp are the only two transports a client can ask for.
+        "turn:turn.example.test:3478?transport=tls",
+        "turn:turn.example.test:3478?transport=xyz",
+        "turn:turn.example.test:3478?TRANSPORT=udp",
+        "turn:turn.example.test:3478?transport=udp&anything=else",
+        "turn:turn.example.test:3478?",
+        "turn:",
+        "stun:",
+        "stun:stun.example.test:3478/",
+        "stun:stun.example.test/rtc",
+        "turn:turn.example.test:0",
+        "turn:turn.example.test:99999",
+        "turn:turn.example.test:34a8",
+        "turn:turn.example.test:3478:3479",
+        // An ipv6 address needs its brackets, or its own colons are read as
+        // the one before the port.
+        "turn:2001:db8::1",
+        "turn:[2001:db8::1",
+        "turn:mediacore@turn.example.test:3478",
+        "turn:turn.example.test :3478",
+    ] {
+        let refused =
+            check_ice_url(url).expect_err("a browser throws on this url and gathers nothing");
+
+        assert!(
+            refused.to_string().contains(url),
+            "the refusal has to name the url somebody has to fix: {refused}"
+        );
+    }
+}
+
+/// The other half of the same check, and the half that matters more: refusing a
+/// url a browser would have accepted takes a working relay away from a
+/// deployment that wrote it in a form this server did not expect. Every one of
+/// these parses in Chrome.
+#[test]
+fn takes_every_ice_url_shape_a_browser_takes() {
+    for url in [
+        "stun:stun.example.test",
+        "stun:stun.example.test:3478",
+        "stuns:stun.example.test:5349",
+        "turn:turn.example.test",
+        "turn:turn.example.test:3478?transport=udp",
+        "turn:turn.example.test:3478?transport=UDP",
+        "turns:turn.example.test:5349?transport=tcp",
+        "STUN:stun.example.test:3478",
+        "Turns:turn.example.test:5349?transport=tcp",
+        "turn:203.0.113.7:3478?transport=udp",
+        "turn:[2001:db8::1]:3478?transport=udp",
+        "turn:[2001:db8::1]",
+        // A trailing dot is a fully qualified name, an underscore is legal in
+        // plenty of internal zones, and a non-ascii hostname resolves wherever
+        // the client's resolver says it does. None of the three is this
+        // server's business.
+        "turn:turn.example.test.:3478",
+        "turn:turn_relay.example.test:3478",
+        "turn:реле.example.test:3478",
+    ] {
+        check_ice_url(url).unwrap_or_else(|refused| {
+            panic!("a browser takes this url and so must this server: {refused}")
+        });
+    }
+}
+
+/// A url is checked before the credentials are, because a url a browser refuses
+/// is the more expensive of the two mistakes and because the entry is named by
+/// its first url in every other refusal here.
+#[test]
+fn an_unparseable_url_is_refused_wherever_it_sits_in_an_entry() {
+    let refused = Config::parse(
+        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+         turn:turn.example.test:3478?transport=udp\n        - \
+         turns:turn.example.test:5349?transport=tls\n      username: mediacore\n      \
+         credential: relay-password\n",
+    )
+    .expect_err("the second url of an otherwise sound entry is still a url every client parses");
+
+    assert!(
+        refused.to_string().contains("transport=tls"),
+        "the refusal has to name the url somebody has to fix: {refused}"
+    );
+}
+
 #[test]
 fn rejects_addresses_that_are_not_addresses() {
     assert!(Config::parse("keys:\n  key1: secret1\nrtc:\n  bind_address: nowhere\n").is_err());

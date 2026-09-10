@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
-use mediacore_auth::{Claims, VideoGrant};
+use mediacore_auth::{Claims, VideoGrant, turn};
 use mediacore_proto::mediacore::{self, signal_request, signal_response};
 use mediacore_proto::{PROTOCOL_VERSION, SERVER_VERSION};
 use mediacore_room::{Joined, ParticipantKind, ParticipantSpec, ProfileUpdate};
@@ -124,11 +124,7 @@ pub async fn handler(
 /// has been carried once already. That last one is the loop guard: a marked
 /// connection is served or refused where it lands, never passed on again, so a
 /// view two nodes briefly disagree about costs one wrong hop rather than a ring.
-fn elsewhere(
-    state: &AppState,
-    room: &str,
-    raw_query: &str,
-) -> Option<mediacore_session::Node> {
+fn elsewhere(state: &AppState, room: &str, raw_query: &str) -> Option<mediacore_session::Node> {
     if !state.cluster.joined() || relay::already_relayed(raw_query) {
         return None;
     }
@@ -652,6 +648,7 @@ fn build_join_response(state: &AppState, joined: &Joined) -> mediacore::JoinResp
                 .to_proto(mediacore::participant_info::State::Joined),
         ),
         other_participants: joined.others.clone(),
+        ice_servers: ice_servers(state, &joined.participant.identity),
         server_version: SERVER_VERSION.to_owned(),
         subscriber_primary: false,
         ping_timeout: PING_TIMEOUT_SECONDS,
@@ -666,6 +663,50 @@ fn build_join_response(state: &AppState, joined: &Joined) -> mediacore::JoinResp
         }),
         ..Default::default()
     }
+}
+
+/// Where this client should look for a way through, and what to say when it
+/// gets there.
+///
+/// Without this the field went out empty, every client built an
+/// `RTCConfiguration` with no ice servers on it, and a coturn running perfectly
+/// well next door was never tried once -- there was nothing in the answer to
+/// tell a client it existed.
+///
+/// **Minted per join, not per configuration.** An entry holding a coturn's
+/// shared secret gets a credential made here and now, carrying this
+/// participant's identity and an expiry: a credential that leaks is good for
+/// bandwidth through one relay under one name until it runs out, coturn's logs
+/// and its per-user limits say who was holding an allocation, and the secret
+/// itself never leaves this process. An entry holding a fixed pair is passed
+/// through as it stands, because that pair is what its relay knows.
+///
+/// [`mediacore::ReconnectResponse`] carries this same field and nothing in this
+/// tree builds one yet. Whoever implements resume fills it from here as well,
+/// or a client that resumes comes back with the relay it joined with dropped.
+fn ice_servers(state: &AppState, identity: &str) -> Vec<mediacore::IceServer> {
+    let now = now_ms().max(0) as u64 / 1_000;
+
+    state
+        .config
+        .rtc
+        .ice_servers
+        .iter()
+        .map(|server| {
+            let (username, credential) = if server.mints_credentials() {
+                let minted = turn::mint(&server.secret, identity, now, server.credential_ttl());
+                (minted.username, minted.credential)
+            } else {
+                (server.username.clone(), server.credential.clone())
+            };
+
+            mediacore::IceServer {
+                urls: server.urls.clone(),
+                username,
+                credential,
+            }
+        })
+        .collect()
 }
 
 fn permission_from(grant: &VideoGrant) -> mediacore::ParticipantPermission {

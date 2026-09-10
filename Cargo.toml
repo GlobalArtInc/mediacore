@@ -62,6 +62,11 @@ serde = { version = "1", features = ["derive"] }
 # sit next to each other and ListRooms is somewhere else.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
+# Only ever paired with `hmac`, and only to mint TURN credentials: coturn's
+# shared-secret mode is draft-uberti-behave-turn-rest-00, which is fixed at
+# HMAC-SHA1 and has no variant on anything newer. Nothing else in this
+# workspace hashes with it.
+sha1 = "0.10"
 sha2 = "0.10"
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tempfile = "3"

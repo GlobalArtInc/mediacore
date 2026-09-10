@@ -8,6 +8,15 @@ use serde::Deserialize;
 
 pub const DEFAULT_END_GRACE_SECONDS: u32 = 90;
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
+/// A day, which is not a session length but an outer bound on one.
+///
+/// A minted TURN credential has to still be valid when the relay is asked for
+/// an allocation and every time that allocation is refreshed, which is for as
+/// long as the call lasts. A number chosen to be tight -- an hour, say -- ends
+/// a meeting that ran long by taking its relay away mid-sentence, and the
+/// credential is worth nothing to anybody who steals it beyond bandwidth
+/// through one coturn under one identity.
+pub const DEFAULT_ICE_CREDENTIAL_TTL_SECONDS: u32 = 24 * 60 * 60;
 pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
 pub const MAX_DATA_PACKET_BYTES: u32 = 64 * 1024;
 /// Three beats at ten seconds. Long enough that a node paused by a slow
@@ -801,6 +810,313 @@ pub struct RtcConfig {
     pub node_ip: String,
     pub ice_disconnected_timeout: u32,
     pub negotiation_timeout: u32,
+
+    /// The STUN and TURN servers a client is told to try, in the order they
+    /// are written here.
+    ///
+    /// **This server runs none of them.** It is ice-lite: it answers whoever
+    /// asks and never gathers a candidate of its own, so a relay is nothing
+    /// more than another address a client's packets arrive from. What lives
+    /// here is where somebody else's coturn is and what to say to it, and an
+    /// empty list -- the default, and what every deployment had before this
+    /// existed -- means a client gathers host candidates only and reaches this
+    /// server directly or not at all.
+    pub ice_servers: Vec<IceServerConfig>,
+}
+
+/// One entry in `rtc.ice_servers`: an address, and the credentials for it.
+///
+/// **Two ways to hold a credential, and never both at once.** `username` and
+/// `credential` are a fixed pair, the same for every client, matching a coturn
+/// with a static user in its database. `secret` is the other mode -- coturn's
+/// `use-auth-secret` -- where this server mints a fresh, expiring credential
+/// for each person as they join, out of a secret it shares with the relay and
+/// hands to nobody. An entry that carries both is a configuration whose author
+/// did not know which one applies, so it is refused rather than resolved by a
+/// precedence rule nobody would remember.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IceServerConfig {
+    /// `turn:turn.example.com:3478?transport=udp`,
+    /// `turns:turn.example.com:5349?transport=tcp`,
+    /// `stun:stun.example.com:3478`. Several of them are one server reachable
+    /// several ways, and a client tries them in order.
+    pub urls: Vec<String>,
+
+    /// The fixed pair, for a relay with a user in its database.
+    pub username: String,
+    pub credential: String,
+
+    /// The secret this deployment's coturn was started with, for a relay in
+    /// `use-auth-secret` mode. Never sent anywhere: what reaches a client is
+    /// one credential derived from it, and it is not logged, exactly as an api
+    /// key and a database password are not.
+    pub secret: String,
+
+    /// How long a minted credential is good for. Only read when `secret` is
+    /// set, and it has to outlive the longest call this deployment expects --
+    /// coturn checks the expiry when the allocation is made and again on every
+    /// refresh of it.
+    pub ttl_seconds: u32,
+}
+
+impl Default for IceServerConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            username: String::new(),
+            credential: String::new(),
+            secret: String::new(),
+            ttl_seconds: DEFAULT_ICE_CREDENTIAL_TTL_SECONDS,
+        }
+    }
+}
+
+impl IceServerConfig {
+    /// Whether this entry's credential is minted per join rather than fixed.
+    pub fn mints_credentials(&self) -> bool {
+        !self.secret.trim().is_empty()
+    }
+
+    /// The life of a minted credential, as the minting wants it.
+    pub fn credential_ttl(&self) -> u64 {
+        u64::from(self.ttl_seconds)
+    }
+
+    /// Whether anything here is a relay, as opposed to a plain reflexive
+    /// lookup. Credentials belong to one and not the other.
+    fn relays(&self) -> bool {
+        self.urls
+            .iter()
+            .any(|url| starts_with_scheme(url, "turn:") || starts_with_scheme(url, "turns:"))
+    }
+
+    fn names_credentials(&self) -> bool {
+        !self.username.is_empty() || !self.credential.is_empty() || self.mints_credentials()
+    }
+
+    /// What the refusals name the entry by, since a list has no other handle
+    /// on one.
+    fn label(&self) -> &str {
+        self.urls.first().map(String::as_str).unwrap_or("")
+    }
+
+    /// Every shape refused here is a deployment that starts, hands its clients
+    /// an ice server, and relays nothing -- which looks from the room exactly
+    /// like ordinary silence and is found out by nobody. A url no browser will
+    /// parse, refused by [`check_ice_url`], is worse than that again: it takes
+    /// every other ice server in the list down with it.
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.urls.is_empty(),
+            "an rtc.ice_servers entry has no urls; an ice server is its address, so give the \
+             entry a stun:, stuns:, turn: or turns: url or take it out of the list"
+        );
+
+        for url in &self.urls {
+            check_ice_url(url)?;
+        }
+
+        anyhow::ensure!(
+            self.relays() || !self.names_credentials(),
+            "rtc.ice_servers entry `{}` is a stun server carrying credentials, and stun has \
+             nothing to authenticate: drop the username, credential and secret, or give the \
+             entry a turn: url if a relay was what was meant",
+            self.label()
+        );
+
+        if self.relays() {
+            anyhow::ensure!(
+                !(self.mints_credentials()
+                    && (!self.username.is_empty() || !self.credential.is_empty())),
+                "rtc.ice_servers entry `{}` carries both a fixed username/credential and a \
+                 secret, and only one of them can apply: keep the pair for a coturn with a user \
+                 in its database, keep the secret for one started with use-auth-secret",
+                self.label()
+            );
+
+            anyhow::ensure!(
+                self.username.is_empty() == self.credential.is_empty(),
+                "rtc.ice_servers entry `{}` names half of a username/credential pair; a relay \
+                 checks both, so set the other one or use secret instead",
+                self.label()
+            );
+
+            anyhow::ensure!(
+                self.mints_credentials() || !self.username.is_empty(),
+                "rtc.ice_servers entry `{}` is a turn server with no credentials, so every \
+                 allocation asked of it would be refused: give it a username and credential \
+                 pair, or the secret its coturn was started with",
+                self.label()
+            );
+        }
+
+        anyhow::ensure!(
+            !self.mints_credentials() || self.ttl_seconds > 0,
+            "rtc.ice_servers entry `{}` mints credentials with ttl_seconds of 0, so every one \
+             of them has expired before the client it was minted for receives it; give it the \
+             length of the longest call this deployment expects",
+            self.label()
+        );
+
+        Ok(())
+    }
+}
+
+/// Case-insensitively, because a url scheme is, and `STUN:` in a config file is
+/// a typo nobody should have to see a silent relay over. `get` rather than a
+/// slice, because a url whose first bytes are not ascii is exactly the kind of
+/// thing this refuses and must not panic on the way to saying so.
+fn starts_with_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+}
+
+/// The url shapes a browser will take, which is a far smaller set than "begins
+/// with a scheme this server knows".
+///
+/// **A url a client cannot parse costs it the whole list, not one entry.**
+/// `new RTCPeerConnection` parses every url of every ice server it was handed
+/// before it does anything else, and one it cannot parse throws a `SyntaxError`
+/// out of the constructor: no peer connection is built at all, so the perfectly
+/// good stun server written above the typo does not save the call, and every
+/// client of the deployment fails to join rather than one of them gathering
+/// badly. Checked in Chrome, which throws on a list holding
+/// `stun:good.example:3478` beside `stun:bad.example:3478?transport=udp` and
+/// gathers nothing.
+///
+/// So the grammar of RFC 7064 (`stun:`, `stuns:`) and RFC 7065 (`turn:`,
+/// `turns:`) is checked here, at startup, where the answer is a message naming
+/// the line to fix. The shape worth all of this code is
+/// `stun:stun.example.com:3478?transport=udp`: the `?transport=udp` belongs to
+/// the `turn:` line it was copied from, a stun url takes no parameters at all,
+/// and a browser refuses the pair of them rather than ignoring the one it has
+/// no use for.
+///
+/// What is deliberately *not* refused is anything a browser accepts. An
+/// uppercase scheme, a host with no port, a trailing dot, an underscore, a
+/// non-ascii hostname and a bracketed ipv6 literal are all urls Chrome parses,
+/// so a deployment that writes one keeps its relay.
+fn check_ice_url(url: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !url.contains(char::is_whitespace),
+        "rtc.ice_servers url `{url}` has whitespace in it; a url is one word, and a client that \
+         reads a space as part of a hostname looks up a name that does not exist"
+    );
+
+    let Some(scheme) = ["stun:", "stuns:", "turn:", "turns:"]
+        .into_iter()
+        .find(|scheme| starts_with_scheme(url, scheme))
+    else {
+        anyhow::bail!(
+            "rtc.ice_servers url `{url}` is not a stun:, stuns:, turn: or turns: url; a browser \
+             refuses the whole ice server list over one url it cannot parse, so this costs the \
+             deployment every relay in it and not just this line"
+        );
+    };
+
+    let relays = matches!(scheme, "turn:" | "turns:");
+    let rest = &url[scheme.len()..];
+    let address = match rest.split_once('?') {
+        None => rest,
+        Some((address, query)) => {
+            anyhow::ensure!(
+                relays,
+                "rtc.ice_servers url `{url}` is a stun url carrying `?{query}`; stun is a host \
+                 and a port and nothing else -- the transport parameter belongs to the turn: \
+                 line it was copied from, and a browser refuses this url and every ice server \
+                 beside it"
+            );
+
+            let Some(transport) = query.strip_prefix("transport=") else {
+                anyhow::bail!(
+                    "rtc.ice_servers url `{url}` carries `?{query}`; `transport`, spelled in \
+                     lower case, is the only parameter a turn url takes, and a browser refuses a \
+                     url with anything else after the `?`"
+                );
+            };
+
+            anyhow::ensure!(
+                transport.eq_ignore_ascii_case("udp") || transport.eq_ignore_ascii_case("tcp"),
+                "rtc.ice_servers url `{url}` asks for transport `{transport}`; udp and tcp are \
+                 the only two a client can ask a relay for. `tls` is the common way to write this \
+                 one wrong: a turns: url is how tls is asked for, and it carries \
+                 `?transport=tcp`"
+            );
+
+            address
+        }
+    };
+
+    // Bracketed because the colons of an ipv6 literal are otherwise the colon
+    // before the port, which is how `turn:2001:db8::1` becomes a url with a
+    // port of `db8::1` and no browser will have it.
+    let (host, port) = if let Some(literal) = address.strip_prefix('[') {
+        let Some((host, tail)) = literal.split_once(']') else {
+            anyhow::bail!(
+                "rtc.ice_servers url `{url}` opens a `[` for an ipv6 address and never closes it"
+            );
+        };
+
+        anyhow::ensure!(
+            host.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.'),
+            "rtc.ice_servers url `{url}` puts `{host}` in brackets; brackets are how an ipv6 \
+             address is written, and a hostname goes without them"
+        );
+
+        match tail {
+            "" => (host, None),
+            tail => {
+                let Some(port) = tail.strip_prefix(':') else {
+                    anyhow::bail!(
+                        "rtc.ice_servers url `{url}` has `{tail}` after the closing bracket; an \
+                         ipv6 address is followed by its port or by nothing at all"
+                    );
+                };
+
+                (host, Some(port))
+            }
+        }
+    } else {
+        match address.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (address, None),
+        }
+    };
+
+    anyhow::ensure!(
+        !host.is_empty(),
+        "rtc.ice_servers url `{url}` names no host; an ice server is an address, and a scheme on \
+         its own resolves to nothing"
+    );
+
+    anyhow::ensure!(
+        !host.contains('@'),
+        "rtc.ice_servers url `{url}` puts a name in front of its host; browsers refused the \
+         `user@host` form years ago, and the username and credential of a relay are fields of \
+         this entry rather than part of its address"
+    );
+
+    anyhow::ensure!(
+        !host.contains(['/', '?', '#', '[', ']']),
+        "rtc.ice_servers url `{url}` has a path, a query or a stray bracket on it; a stun or turn \
+         url is a host and a port, and it is not an http url -- a trailing `/` alone is enough to \
+         have it refused"
+    );
+
+    if let Some(port) = port {
+        anyhow::ensure!(
+            port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port > 0),
+            "rtc.ice_servers url `{url}` has `{port}` where a port belongs; a port is a number \
+             from 1 to 65535, and an ipv6 address needs brackets around it \
+             (`turn:[2001:db8::1]:3478`) so that its own colons are not read as the one before \
+             the port"
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1077,6 +1393,7 @@ impl Default for RtcConfig {
             node_ip: String::new(),
             ice_disconnected_timeout: DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS,
             negotiation_timeout: DEFAULT_NEGOTIATION_TIMEOUT_SECONDS,
+            ice_servers: Vec::new(),
         }
     }
 }
@@ -1140,6 +1457,10 @@ impl RtcConfig {
                 self.port_range_start <= self.port_range_end,
                 "rtc.port_range_start must not be above rtc.port_range_end"
             );
+        }
+
+        for server in &self.ice_servers {
+            server.validate()?;
         }
 
         Ok(())
