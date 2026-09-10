@@ -10,6 +10,7 @@ pub mod openapi;
 pub mod peer;
 pub mod publisher;
 pub mod recording;
+pub mod relay;
 pub mod rooms;
 pub mod sessions;
 pub mod signal;

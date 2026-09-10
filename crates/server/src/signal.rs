@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::SinkExt;
@@ -15,6 +15,7 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::peer::PublisherSession;
+use crate::relay;
 use crate::state::AppState;
 use crate::subscriber::SubscriberSession;
 
@@ -69,6 +70,7 @@ impl SignalQuery {
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<SignalQuery>,
+    RawQuery(raw): RawQuery,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
@@ -94,7 +96,50 @@ pub async fn handler(
         }
     };
 
+    // Where this room lives. A node that is alone answers itself for every
+    // room, so this costs a lookup in an empty view and nothing else.
+    let raw = raw.unwrap_or_default();
+    if let Some(owner) = elsewhere(&state, &claims.video.room, &raw) {
+        let url = relay::inner_url(&owner.signal_url, &raw);
+        let room = claims.video.room.clone();
+        let node = owner.id.clone();
+        let pass = token.to_owned();
+
+        tracing::info!(%room, holder = %node, "carrying a connection to the node that holds this room");
+
+        return upgrade.on_upgrade(move |socket| async move {
+            if let Err(error) = relay::carry(socket, url, pass).await {
+                tracing::warn!(%room, holder = %node, %error, "a connection could not be carried");
+            }
+        });
+    }
+
     upgrade.on_upgrade(move |socket| session(state, claims, query, socket))
+}
+
+/// The node holding this room, when it is not this one.
+///
+/// `None` means serve it here, which covers a node on its own, a room this node
+/// already holds, a room the cluster scores to this node, and a connection that
+/// has been carried once already. That last one is the loop guard: a marked
+/// connection is served or refused where it lands, never passed on again, so a
+/// view two nodes briefly disagree about costs one wrong hop rather than a ring.
+fn elsewhere(
+    state: &AppState,
+    room: &str,
+    raw_query: &str,
+) -> Option<mediacore_session::Node> {
+    if !state.cluster.joined() || relay::already_relayed(raw_query) {
+        return None;
+    }
+
+    let view = state.cluster.view();
+    let owner = view.should_hold(room)?;
+
+    match owner.id == state.cluster.id() {
+        true => None,
+        false => Some(owner.clone()),
+    }
 }
 
 async fn session(state: AppState, claims: Claims, query: SignalQuery, socket: WebSocket) {

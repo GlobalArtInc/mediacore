@@ -60,6 +60,24 @@ impl View {
             .filter(|node| node.takes_work(self.read_at_ms, self.lease_ms))
     }
 
+    /// Which node should hold this room, whether or not anybody holds it yet.
+    ///
+    /// A room somebody publishes belongs to them: what is happening beats what
+    /// ought to be. A room nobody holds is scored, and the highest score wins
+    /// -- every node computing the same answer from the same table without
+    /// asking anybody, which is what stops two nodes both opening a meeting for
+    /// the same name in the window before either has published it.
+    ///
+    /// A draining node is not offered an unheld room, and keeps the ones it
+    /// has: people are still in those meetings.
+    pub fn should_hold(&self, room: &str) -> Option<&Node> {
+        if let Some(owner) = self.owner_of(room) {
+            return Some(owner);
+        }
+
+        self.taking_work().max_by_key(|node| score(room, &node.id))
+    }
+
     /// Every node still beating, draining ones included.
     pub fn alive(&self) -> impl Iterator<Item = &Node> {
         self.nodes
@@ -283,6 +301,26 @@ async fn beat(
             });
         }
     }
+}
+
+/// How well one node suits one room.
+///
+/// Rendezvous hashing: the score depends on the pair and on nothing else, so
+/// every node ranks the same candidates the same way, and a node arriving or
+/// leaving moves only the rooms that were scored highest for it rather than
+/// reshuffling the lot.
+///
+/// Sha-256 rather than the standard hasher, whose output is explicitly not
+/// stable between Rust versions -- two nodes on two builds scoring differently
+/// is exactly the split this exists to prevent.
+fn score(room: &str, node: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(room.as_bytes());
+    hasher.update([0]);
+    hasher.update(node.as_bytes());
+    hasher.finalize().into()
 }
 
 /// This node's clock, in the same units every record here is kept in.

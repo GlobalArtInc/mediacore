@@ -1711,11 +1711,30 @@ into its row; a beat that finds a different one is another process wearing this 
 is a mistake no lease resolves. Without the check they would claim each other's uploads and write
 each other's meetings with nothing anywhere saying so.
 
-**What this does not do yet.** A client still has to reach the node holding its room: nothing
-forwards a signalling connection to another node, and nothing moves a room from one node to
-another. Two replicas today are two independent servers that can see each other — useful for an
-operator and for everything built on top of it, and not yet a cluster a client can be pointed at
-blindly.
+**A client can be pointed at any node.** The one it reaches looks up which node holds the room its
+token names and, when that is somebody else, carries the websocket there. Nothing is redirected: the
+protocol's `alternative_url` is decoded and thrown away by every SDK in this tree, so telling a
+client to go elsewhere is telling it nothing.
+
+Only signalling comes that way. The join response the client receives is the owner's, so the ICE
+candidates in it are the owner's addresses and **media goes straight to the owner** — a few kilobytes
+a minute pass through the node that was reached, and not one RTP packet.
+
+A room nobody holds yet is scored rather than claimed: every node ranks the live nodes for that room
+name the same way, by hashing the pair, so two clients arriving at two nodes in the same second are
+carried to the same place instead of opening two meetings under one name. A room somebody already
+holds belongs to them — what is happening beats what ought to be. Draining nodes keep what they have
+and are offered nothing new.
+
+**One hop, never two.** The inner connection is marked, and a node that receives a marked one serves
+it or refuses it but never passes it on again, so two nodes that briefly disagree cost one wrong hop
+rather than a ring.
+
+**What this does not do yet.** The room service still answers for the node it was asked. Everything
+under `/twirp` — `ListParticipants`, `RemoveParticipant`, `MutePublishedTrack`, `SendData` — reads
+the rooms of one process, so a backoffice that asks the wrong node about a room is told the room is
+empty. Nothing moves a room from one node to another either: a room stays where it opened until it
+ends.
 
 ## Stopping a node
 
