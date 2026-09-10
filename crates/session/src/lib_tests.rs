@@ -856,3 +856,25 @@ fn a_store_that_is_away_costs_records_and_not_calls() {
         Some(started.id)
     );
 }
+
+/// The strings are the record's public surface: a backoffice reads them out of
+/// the JSON and a query filters the `kind` column on them, so every kind has
+/// one and reading one back gives the kind it was written from.
+#[test]
+fn every_participant_kind_survives_the_round_trip_through_a_record() {
+    for kind in [Kind::Standard, Kind::Egress, Kind::Sip, Kind::Agent] {
+        assert_eq!(
+            Kind::parse(kind.as_str()),
+            Some(kind),
+            "{} did not read back as itself",
+            kind.as_str()
+        );
+    }
+
+    assert!(
+        Kind::Sip.is_human(),
+        "a meeting held over the telephone would have no attendees at all"
+    );
+    assert!(!Kind::Egress.is_human());
+    assert!(!Kind::Agent.is_human());
+}

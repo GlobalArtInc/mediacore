@@ -83,6 +83,13 @@ fn recorder(identity: &str) -> ParticipantSpec {
     }
 }
 
+fn caller(identity: &str) -> ParticipantSpec {
+    ParticipantSpec {
+        kind: ParticipantKind::Sip,
+        ..spec(identity)
+    }
+}
+
 fn leaves(rx: &mut SignalRx) -> Vec<mediacore::LeaveRequest> {
     let mut requests = Vec::new();
 
@@ -1528,6 +1535,48 @@ fn a_recorder_is_not_one_of_the_humans_the_policy_counts() {
     assert_eq!(
         expect_leave(&mut recorder_rx).reason,
         mediacore::DisconnectReason::RoomClosed as i32
+    );
+}
+
+/// A telephone is not a browser and the person holding it is still a person.
+/// `livekit-sip` joins with `sip` in its token's `kind`, and it also reads
+/// that field back off the roster: a call that arrives looking like an
+/// ordinary participant makes two calls in one room each wait for the other's
+/// audio until the ringing timeout gives up on both.
+#[test]
+fn a_caller_on_a_telephone_is_one_of_the_humans_the_policy_counts() {
+    let registry = registry(session_policy(2, 90));
+    let (alice_tx, mut alice_rx) = signal_channel();
+    let (caller_tx, _caller_rx) = signal_channel();
+
+    let alice = registry.join("demo", spec("alice"), alice_tx).unwrap();
+    let dialled = registry
+        .join("demo", caller("+3612345678"), caller_tx)
+        .unwrap();
+
+    assert_eq!(
+        dialled
+            .participant
+            .to_proto(mediacore::participant_info::State::Active)
+            .kind,
+        mediacore::participant_info::Kind::Sip as i32,
+        "a call announced as an ordinary participant deadlocks against a second one"
+    );
+    assert_eq!(
+        alice.room.human_count(),
+        2,
+        "the caller was not counted as somebody who came to talk"
+    );
+    assert_eq!(
+        alice.room.session_ends_at_ms(),
+        None,
+        "the room had the two people it asked for and was on its way out anyway"
+    );
+
+    drain(&mut alice_rx);
+    assert!(
+        registry.sweep(now_ms() + 3_600_000).ended.is_empty(),
+        "a meeting held over the telephone was closed underneath the people in it"
     );
 }
 

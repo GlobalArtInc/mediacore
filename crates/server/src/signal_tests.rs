@@ -61,6 +61,13 @@ fn a_recorder_and_an_agent_are_not_counted_as_people() {
         kind_from(&claims(VideoGrant::default(), "")).is_human(),
         "an ordinary token is somebody who came to talk"
     );
+    assert_eq!(
+        kind_from(&claims(VideoGrant::default(), "sip")),
+        ParticipantKind::Sip,
+        "`livekit-sip` reads this back off the roster to tell a second call from a person, \
+         and two calls that both look like people wait for each other's audio until the \
+         ringing timeout gives up on both"
+    );
     assert!(
         kind_from(&claims(VideoGrant::default(), "sip")).is_human(),
         "a caller on a phone is still a person in the room"

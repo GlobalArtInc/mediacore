@@ -57,6 +57,7 @@ pub enum ParticipantKind {
     #[default]
     Standard,
     Egress,
+    Sip,
     Agent,
 }
 
@@ -65,11 +66,12 @@ impl ParticipantKind {
         match self {
             Self::Standard => mediacore::participant_info::Kind::Standard,
             Self::Egress => mediacore::participant_info::Kind::Egress,
+            Self::Sip => mediacore::participant_info::Kind::Sip,
             Self::Agent => mediacore::participant_info::Kind::Agent,
         }
     }
 
-    /// The same three kinds as they are spelled in a session record.
+    /// The same kinds as they are spelled in a session record.
     ///
     /// The record has an enum of its own because the crate that writes records
     /// knows nothing about rooms -- the dependency runs one way -- so the two
@@ -78,12 +80,19 @@ impl ParticipantKind {
         match self {
             Self::Standard => mediacore_session::Kind::Standard,
             Self::Egress => mediacore_session::Kind::Egress,
+            Self::Sip => mediacore_session::Kind::Sip,
             Self::Agent => mediacore_session::Kind::Agent,
         }
     }
 
+    /// Whether this one is a person who came to the meeting.
+    ///
+    /// Somebody on a telephone is somebody in the room: a call that dialled in
+    /// has to count towards the floor a room opens on, or a meeting held
+    /// entirely over the phone is a meeting the server never starts and never
+    /// records.
     pub fn is_human(self) -> bool {
-        matches!(self, Self::Standard)
+        matches!(self, Self::Standard | Self::Sip)
     }
 }
 

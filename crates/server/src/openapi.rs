@@ -778,9 +778,9 @@ fn attendance_schema() -> Value {
             "name": { "type": "string", "description": "The display name, or empty." },
             "kind": {
                 "type": "string",
-                "enum": ["standard", "egress", "agent"],
+                "enum": ["standard", "egress", "sip", "agent"],
                 "description":
-                    "A person, a recorder or a bot. Only `standard` counts towards the number of                      people a room needs, which is why a room of recorders is not a meeting.",
+                    "A person in a browser, a recorder, somebody on a telephone or a bot.                      `standard` and `sip` count towards the number of people a room needs,                      which is why a room of recorders is not a meeting.",
             },
             "joinedAtMs": {
                 "type": "integer",

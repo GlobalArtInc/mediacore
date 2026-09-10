@@ -107,10 +107,10 @@ const RETRY_AT_MOST: Duration = Duration::from_secs(30);
 /// What a participant was, which is what decides whether they count towards a
 /// quorum.
 ///
-/// The same three kinds `ParticipantInfo.kind` carries. They are spelled out
-/// again here rather than borrowed from the room crate because the dependency
-/// runs the other way -- the registry writes records, the records know nothing
-/// about a registry -- and because these three strings are part of the JSON a
+/// The same kinds `ParticipantInfo.kind` carries. They are spelled out again
+/// here rather than borrowed from the room crate because the dependency runs
+/// the other way -- the registry writes records, the records know nothing
+/// about a registry -- and because these strings are part of the JSON a
 /// backoffice parses and of the `kind` column a query filters on, so they
 /// should be nailed down where the record is defined.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,8 @@ pub enum Kind {
     Standard,
     /// A recorder.
     Egress,
+    /// Somebody on a telephone.
+    Sip,
     /// A bot.
     Agent,
 }
@@ -129,15 +131,17 @@ impl Kind {
     /// Whether this one counts as somebody who came to the meeting.
     ///
     /// A recorder sitting in an empty room is not a meeting, and a room of
-    /// bots is not one either: a session opens and closes on people.
+    /// bots is not one either: a session opens and closes on people. Somebody
+    /// who dialled in is one of those people.
     pub fn is_human(self) -> bool {
-        matches!(self, Self::Standard)
+        matches!(self, Self::Standard | Self::Sip)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Egress => "egress",
+            Self::Sip => "sip",
             Self::Agent => "agent",
         }
     }
@@ -146,6 +150,7 @@ impl Kind {
         match value {
             "standard" => Some(Self::Standard),
             "egress" => Some(Self::Egress),
+            "sip" => Some(Self::Sip),
             "agent" => Some(Self::Agent),
             _ => None,
         }

@@ -599,6 +599,7 @@ fn permission_from(grant: &VideoGrant) -> mediacore::ParticipantPermission {
 fn kind_from(claims: &Claims) -> ParticipantKind {
     match claims.kind.trim().to_ascii_lowercase().as_str() {
         "egress" | "recorder" => return ParticipantKind::Egress,
+        "sip" => return ParticipantKind::Sip,
         "agent" => return ParticipantKind::Agent,
         _ => {}
     }
