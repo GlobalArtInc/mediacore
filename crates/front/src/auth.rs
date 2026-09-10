@@ -52,6 +52,7 @@ use crate::session::{
     LOGIN_COOKIE, Login, NotFinished, Session, fingerprint, login_cookie, random_token,
     same_secret, session_cookie, spent_login_cookie, spent_session_cookie,
 };
+use crate::brand::Brand;
 use crate::state::{Front, Shared};
 
 /// The redirect URI registered with the provider. It is a constant because the
@@ -153,6 +154,7 @@ pub async fn start_sign_in(
 ) -> Response {
     let Some(provider) = front.provider.as_ref() else {
         return page(
+            &front.config.brand,
             StatusCode::NOT_FOUND,
             "Not found",
             "This server does not sign anybody in.",
@@ -161,6 +163,7 @@ pub async fn start_sign_in(
 
     if !somebody_arriving(method, headers) {
         return page(
+            &front.config.brand,
             StatusCode::UNAUTHORIZED,
             "Not signed in",
             "This page signs you in when you open it yourself. Nothing was started for whatever \
@@ -198,15 +201,17 @@ pub async fn start_sign_in(
         Err(error) => {
             tracing::error!(error = %quoted(&error), "nobody can be sent to sign in");
 
-            return unreachable_page();
+            return unreachable_page(&front.config.brand);
         }
     };
 
     if !front.sessions.start_login(&state, login) {
-        return busy_page();
+        return busy_page(&front.config.brand);
     }
 
-    with_cookie(found(&url), &login_cookie(&secret))
+    let brand = &front.config.brand;
+
+    with_cookie(brand, found(brand, &url), &login_cookie(&secret))
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +230,7 @@ pub async fn callback(
     let Some(state) = present(query.state.as_deref()) else {
         tracing::warn!("a callback arrived with no state, so it belongs to no sign-in here");
 
-        return refused_page();
+        return refused_page(&front.config.brand);
     };
 
     // The browser is checked and the login is spent in that order, under one
@@ -244,7 +249,7 @@ pub async fn callback(
                 "a callback arrived with a state this process never issued or has spent"
             );
 
-            return refused_page();
+            return refused_page(&front.config.brand);
         }
         Err(NotFinished::WrongBrowser) => {
             tracing::warn!(
@@ -257,7 +262,7 @@ pub async fn callback(
             // made to fetch the callback by a page somewhere else -- clearing
             // the login cookie there would take away the proof its own sign-in
             // is about to need.
-            return refused_page();
+            return refused_page(&front.config.brand);
         }
     };
 
@@ -268,7 +273,7 @@ pub async fn callback(
     // with a login of its own whose proof is this same secret.
     match front.sessions.another_login_in(&login.browser) {
         true => answer,
-        false => with_cookie(answer, &spent_login_cookie()),
+        false => with_cookie(&front.config.brand, answer, &spent_login_cookie()),
     }
 }
 
@@ -286,11 +291,13 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
 
         return match error {
             ACCESS_DENIED => page(
+                &front.config.brand,
                 StatusCode::FORBIDDEN,
                 "Not signed in",
                 "The sign-in was cancelled, so nobody was signed in here.",
             ),
             _ => page(
+                &front.config.brand,
                 StatusCode::FORBIDDEN,
                 "Not signed in",
                 "The identity provider would not sign you in. Try again, and if it keeps \
@@ -303,7 +310,7 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
     else {
         tracing::warn!("a callback arrived with neither a code nor an error");
 
-        return refused_page();
+        return refused_page(&front.config.brand);
     };
 
     let identity = match provider.complete(code, login).await {
@@ -313,9 +320,10 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
             tracing::warn!(error = %quoted(&error), "this sign-in could not be finished");
 
             return if unreachable {
-                unreachable_page()
+                unreachable_page(&front.config.brand)
             } else {
                 page(
+                    &front.config.brand,
                     StatusCode::FORBIDDEN,
                     "Not signed in",
                     "This sign-in did not check out, so nobody was signed in. Go back to the \
@@ -334,7 +342,8 @@ async fn complete(front: &Front, login: &Login, query: &CallbackQuery) -> Respon
     let cookie = front.sessions.open(identity);
 
     with_cookie(
-        found(&login.return_to),
+        &front.config.brand,
+        found(&front.config.brand, &login.return_to),
         &session_cookie(&cookie, front.sessions.ttl().as_secs()),
     )
 }
@@ -365,6 +374,7 @@ pub async fn logout(
 ) -> Response {
     let Some(oidc) = front.config.oidc.as_ref() else {
         return page(
+            &front.config.brand,
             StatusCode::NOT_FOUND,
             "Not found",
             "This server does not sign anybody in.",
@@ -383,6 +393,7 @@ pub async fn logout(
         tracing::warn!(site = %quoted(site), "a sign-out was asked for by another site");
 
         return page(
+            &front.config.brand,
             StatusCode::FORBIDDEN,
             "Not signed out",
             "Signing out has to be something you do here. Open this server's own page and press \
@@ -405,7 +416,11 @@ pub async fn logout(
         _ => here,
     };
 
-    with_cookie(found(&target), &spent_session_cookie())
+    with_cookie(
+        &front.config.brand,
+        found(&front.config.brand, &target),
+        &spent_session_cookie(),
+    )
 }
 
 /// Every cookie of one name a request carries, in the order the browser sent
@@ -425,7 +440,7 @@ fn present(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn found(url: &str) -> Response {
+fn found(brand: &Brand, url: &str) -> Response {
     match HeaderValue::from_str(url) {
         Ok(location) => (
             StatusCode::FOUND,
@@ -439,6 +454,7 @@ fn found(url: &str) -> Response {
             tracing::error!(%error, "the redirect target is not something a header can carry");
 
             page(
+                brand,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",
                 "This server could not work out where to send you next.",
@@ -447,7 +463,7 @@ fn found(url: &str) -> Response {
     }
 }
 
-fn with_cookie(mut response: Response, cookie: &str) -> Response {
+fn with_cookie(brand: &Brand, mut response: Response, cookie: &str) -> Response {
     match HeaderValue::from_str(cookie) {
         Ok(value) => {
             response.headers_mut().append(SET_COOKIE, value);
@@ -457,6 +473,7 @@ fn with_cookie(mut response: Response, cookie: &str) -> Response {
             tracing::error!(%error, "a cookie is not something a header can carry");
 
             page(
+                brand,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",
                 "This server could not set the cookie this sign-in needs.",
@@ -465,8 +482,9 @@ fn with_cookie(mut response: Response, cookie: &str) -> Response {
     }
 }
 
-fn refused_page() -> Response {
+fn refused_page(brand: &Brand) -> Response {
     page(
+        brand,
         StatusCode::BAD_REQUEST,
         "Not signed in",
         "This sign-in did not start here, or it has already finished. Go back to the front page \
@@ -482,8 +500,9 @@ fn refused_page() -> Response {
 /// callback for whoever was halfway through typing a password. A person who
 /// tries again in a minute gets in; a person thrown out mid-sign-in has no idea
 /// what happened.
-fn busy_page() -> Response {
+fn busy_page(brand: &Brand) -> Response {
     page(
+        brand,
         StatusCode::SERVICE_UNAVAILABLE,
         "Nobody can sign in",
         "This server is already holding as many sign-ins as it will hold at once, so this one \
@@ -491,8 +510,9 @@ fn busy_page() -> Response {
     )
 }
 
-fn unreachable_page() -> Response {
+fn unreachable_page(brand: &Brand) -> Response {
     page(
+        brand,
         StatusCode::SERVICE_UNAVAILABLE,
         "Nobody can sign in",
         "This server could not reach the identity provider, so nobody can be signed in right \
@@ -506,20 +526,22 @@ fn unreachable_page() -> Response {
 /// No inline style and no inline script: the content security policy this
 /// binary sets allows neither, and an error page that trips it would be a blank
 /// screen with a console message.
-fn page(status: StatusCode, heading: &str, sentence: &str) -> Response {
+fn page(brand: &Brand, status: StatusCode, heading: &str, sentence: &str) -> Response {
     let body = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\
-         <title>{heading} · mediacore</title>\n\
+         <title>{heading} · {name}</title>\n\
          <link rel=\"stylesheet\" href=\"/app.css\" />\n</head>\n<body>\n\
          <main class=\"page\">\n<section class=\"lobby\">\n<div class=\"card\">\n\
          <header class=\"brand\"><span class=\"brand-dot\"></span>\
-         <span class=\"brand-name\">mediacore</span></header>\n\
+         <span class=\"brand-mark\">{mark}</span></header>\n\
          <h1>{heading}</h1>\n<p class=\"lede\">{sentence}</p>\n\
          <p class=\"status\"><a href=\"/\">Back to the front page</a></p>\n\
          </div>\n</section>\n</main>\n</body>\n</html>\n",
         heading = escaped(heading),
         sentence = escaped(sentence),
+        name = crate::brand::escape(&brand.name),
+        mark = brand.mark(),
     );
 
     (

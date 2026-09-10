@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use base64::Engine as _;
+use mediacore_front::brand::Brand;
 use mediacore_front::config::{Config, TOKEN_TTL};
 use mediacore_front::http;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +22,7 @@ fn config() -> Config {
         room: ROOM.to_owned(),
         port: 0,
         token_ttl: TOKEN_TTL,
+        brand: Brand::default(),
         oidc: None,
     }
 }
@@ -29,15 +32,59 @@ fn keys() -> HashMap<String, String> {
 }
 
 async fn spawn() -> SocketAddr {
+    spawn_with(config()).await
+}
+
+async fn spawn_with(config: Config) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = http::router(config());
+    let router = http::router(config);
 
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
     addr
+}
+
+/// A picture is not text, so this one reads the body as the bytes it is.
+async fn get_bytes(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+    let exchange = async {
+        let mut socket = TcpStream::connect(addr).await.expect("connect");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        socket.write_all(request.as_bytes()).await.expect("request");
+
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).await.expect("response");
+        raw
+    };
+
+    let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("http response did not arrive in time");
+
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("http response without a body");
+    let head = String::from_utf8_lossy(&response[..split]).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .expect("http status line")
+        .parse()
+        .expect("numeric http status");
+
+    (status, response[split + 4..].to_vec())
+}
+
+async fn policy_of(addr: SocketAddr) -> String {
+    head_of(addr, "/")
+        .await
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("content-security-policy:"))
+        .expect("the page carries a content security policy")
+        .to_owned()
 }
 
 async fn request(addr: SocketAddr, head: &str, body: &str) -> (u16, String) {
@@ -575,9 +622,76 @@ async fn a_tab_is_named_after_the_product() {
          not the one the markup promised"
     );
     assert!(
-        js.contains("el.roomName.textContent = address;"),
+        js.contains("el.roomAddress.textContent = address;"),
         "the roster header no longer carries the room this tab is in"
     );
+    assert!(
+        page.contains(r#"<h1 class="brand-mark room-brand">MediaCore</h1>"#),
+        "the heading over the roster is not the brand, so a deployment cannot put its own \
+         name there"
+    );
+}
+
+/// The three places a visitor reads whose product this is have to agree, and
+/// none of them may be left saying ours on a deployment that bought its own.
+#[tokio::test]
+async fn a_deployment_puts_its_own_name_on_every_part_of_the_page() {
+    let mut config = config();
+    config.brand = Brand::new(Some("Acme Rooms"), None, None).unwrap();
+    let addr = spawn_with(config).await;
+
+    let (_, page) = get(addr, "/").await;
+
+    assert!(page.contains("<title>Acme Rooms</title>"));
+    assert!(page.contains(r#"<span class="brand-mark">Acme Rooms</span>"#));
+    assert!(page.contains(r#"<h1 class="brand-mark room-brand">Acme Rooms</h1>"#));
+    assert!(
+        !page.contains("MediaCore"),
+        "our own name is still somewhere on a page branded for somebody else"
+    );
+}
+
+/// The logo is served by this process from this origin, which is the whole
+/// reason the content security policy does not have to move: `img-src 'self'`
+/// already covers it, and a customer's cdn would not be covered by anything.
+#[tokio::test]
+async fn a_logo_is_served_from_this_origin_and_the_policy_does_not_move() {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01];
+
+    let mut branded = config();
+    branded.brand = Brand::new(
+        Some("Acme"),
+        Some(&base64::engine::general_purpose::STANDARD.encode(PNG)),
+        None,
+    )
+    .unwrap();
+    let path = branded.brand.logo.as_ref().unwrap().path.clone();
+
+    let plain_policy = policy_of(spawn_with(config()).await).await;
+    let addr = spawn_with(branded).await;
+
+    let (status, body) = get_bytes(addr, &path).await;
+    assert_eq!(status, 200, "the logo route was not registered");
+    assert_eq!(body, PNG, "the bytes served are not the bytes configured");
+
+    let (_, page) = get(addr, "/").await;
+    assert!(page.contains(&format!(r#"src="{path}""#)));
+
+    assert_eq!(
+        policy_of(addr).await,
+        plain_policy,
+        "branding a deployment changed its content security policy"
+    );
+}
+
+/// A deployment with no logo of its own registers no route for one, the same
+/// way it registers no sign-in route when it does not sign anybody in.
+#[tokio::test]
+async fn a_deployment_with_no_logo_serves_nothing_under_the_logo_path() {
+    let addr = spawn().await;
+    let (status, _) = get_bytes(addr, "/brand/logo-0011223344556677.png").await;
+
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]

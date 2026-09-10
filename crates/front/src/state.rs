@@ -17,6 +17,13 @@ pub struct Front {
     pub config: Config,
     pub sessions: Sessions,
     pub provider: Option<Provider>,
+    /// The page with this deployment's brand already in it.
+    ///
+    /// Rendered once here rather than per request, and rendered at all rather
+    /// than painted by a script, because `/api/config` lands after the first
+    /// paint: a brand painted from it would show our wordmark for one round
+    /// trip on the one screen whose job is to say whose product this is.
+    pub page: String,
 }
 
 pub type Shared = Arc<Front>;
@@ -37,10 +44,13 @@ impl Front {
             .as_ref()
             .map_or(crate::session::DEFAULT_SESSION_TTL, |oidc| oidc.session_ttl);
 
+        let page = config.brand.render(crate::http::INDEX_HTML).into_owned();
+
         Self {
             config,
             sessions: Sessions::new(ttl),
             provider,
+            page,
         }
     }
 

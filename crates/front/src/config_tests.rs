@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use base64::Engine as _;
+
 use super::*;
 
 fn env(pairs: &[(&str, &str)]) -> impl Environment {
@@ -356,4 +358,69 @@ fn the_debug_rendering_keeps_the_client_secret_out_of_the_logs() {
         rendered.contains("a-client") && rendered.contains("https://sso.mcn.test"),
         "the debug rendering says nothing useful about the provider: {rendered}"
     );
+}
+
+#[test]
+fn the_brand_is_ours_until_a_deployment_says_otherwise() {
+    let config = Config::from_source(&env(&complete())).unwrap();
+
+    assert_eq!(config.brand.name, crate::brand::DEFAULT_NAME);
+    assert!(config.brand.logo.is_none());
+}
+
+#[test]
+fn a_deployment_can_put_its_own_name_and_its_own_logo_on_the_page() {
+    let png = base64::engine::general_purpose::STANDARD
+        .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    let mut pairs = complete();
+    pairs.push((BRAND_NAME, "Acme Rooms"));
+    let png: &'static str = Box::leak(png.into_boxed_str());
+    pairs.push((BRAND_LOGO, png));
+
+    let config = Config::from_source(&env(&pairs)).unwrap();
+
+    assert_eq!(config.brand.name, "Acme Rooms");
+    assert_eq!(config.brand.logo.expect("a logo was configured").content_type, "image/png");
+}
+
+/// A refusal has to say which variable to go and fix, because the message says
+/// what is wrong with the value and not where the value came from.
+#[test]
+fn a_brand_that_cannot_be_one_names_the_variable_that_holds_it() {
+    let cases: [(&'static str, &'static str); 3] = [
+        (BRAND_NAME, "n"),
+        (BRAND_LOGO, "not base64 at all !!"),
+        (BRAND_LOGO_FILE, "/no/such/logo.png"),
+    ];
+
+    for (variable, value) in cases {
+        let mut pairs = complete();
+        let value = match variable == BRAND_NAME {
+            true => Box::leak(value.repeat(crate::brand::MAX_NAME_CHARS + 1).into_boxed_str()),
+            false => value,
+        };
+        pairs.push((variable, value));
+
+        match Config::from_source(&env(&pairs)) {
+            Err(ConfigError::BadBrand { name, .. }) => assert_eq!(
+                name, variable,
+                "the refusal pointed at {name} instead of {variable}"
+            ),
+            other => panic!("{variable} was answered with {other:?}"),
+        }
+    }
+}
+
+/// Giving a logo both ways is refused rather than resolved: a server that
+/// silently picked one would put a picture nobody chose on the page.
+#[test]
+fn a_logo_given_twice_is_refused() {
+    let mut pairs = complete();
+    pairs.push((BRAND_LOGO, "AAAA"));
+    pairs.push((BRAND_LOGO_FILE, "/logo.png"));
+
+    assert!(matches!(
+        Config::from_source(&env(&pairs)),
+        Err(ConfigError::BadBrand { .. })
+    ));
 }

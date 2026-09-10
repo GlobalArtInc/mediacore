@@ -20,7 +20,7 @@ use crate::name::{NameError, RoomError, clean_name, identity_for, room_for};
 use crate::session::Session;
 use crate::state::{Front, Shared};
 
-const INDEX_HTML: &str = include_str!("../assets/index.html");
+pub(crate) const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const MEDIA_JS: &str = include_str!("../assets/media.js");
@@ -100,6 +100,15 @@ pub fn router(config: Config) -> Router {
         false => Router::new(),
     };
 
+    // On the same terms: a deployment with no logo of its own registers no
+    // route for one, and the path a deployment with one registers carries the
+    // hash of its bytes, so a changed logo is a changed address rather than a
+    // cache to bust.
+    let branding = match front.config.brand.logo.as_ref() {
+        Some(configured) => Router::new().route(&configured.path, get(logo)),
+        None => Router::new(),
+    };
+
     Router::new()
         .route("/", get(index))
         // Every room name serves the same page, including one that cannot be a
@@ -135,6 +144,7 @@ pub fn router(config: Config) -> Router {
             post(token).layer(DefaultBodyLimit::max(TOKEN_BODY_LIMIT)),
         )
         .merge(sign_in)
+        .merge(branding)
         .with_state(Arc::new(front))
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
@@ -204,7 +214,42 @@ async fn index(
         return auth::start_sign_in(&front, &method, &headers, &uri).await;
     }
 
-    asset("text/html; charset=utf-8", NO_CACHE, INDEX_HTML).into_response()
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static(NO_CACHE)),
+        ],
+        front.page.clone(),
+    )
+        .into_response()
+}
+
+/// The deployment's own logo, served by this process from this origin.
+///
+/// Same-origin is the entire design. `img-src 'self'` already covers it, so the
+/// content security policy is not touched -- pointing the page at a customer's
+/// CDN instead would have made a security header a function of a configuration
+/// string, put a third party on the path of the first paint, and been dead on
+/// arrival in an install with no egress.
+///
+/// The path carries a hash of the bytes, so it is safe to cache for a year: a
+/// new logo is a new path, and no browser is left holding the last one.
+async fn logo(State(front): State<Shared>) -> Response {
+    let Some(logo) = front.config.brand.logo.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, logo.content_type),
+            (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        logo.bytes.clone(),
+    )
+        .into_response()
 }
 
 async fn stylesheet() -> impl IntoResponse {

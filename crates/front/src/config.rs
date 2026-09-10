@@ -3,6 +3,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::auth::CALLBACK_PATH;
+use crate::brand::{Brand, BrandError};
 use crate::name::{RoomError, clean_room};
 use crate::oidc::DEFAULT_SCOPES;
 use crate::session::DEFAULT_SESSION_TTL;
@@ -12,6 +13,14 @@ pub const API_SECRET: &str = "MEDIACORE_API_SECRET";
 pub const WS_URL: &str = "MEDIACORE_FRONT_WS_URL";
 pub const ROOM: &str = "MEDIACORE_FRONT_ROOM";
 pub const PORT: &str = "MEDIACORE_FRONT_PORT";
+
+/// Whose product this is. The name is the words, and the logo is the picture a
+/// header draws instead of them -- inline or from a path, the same two ways in
+/// a licence key is offered, because a picture pasted into a Kubernetes Secret
+/// and a picture in a file on a VM are both things people do.
+pub const BRAND_NAME: &str = "MEDIACORE_FRONT_BRAND_NAME";
+pub const BRAND_LOGO: &str = "MEDIACORE_FRONT_BRAND_LOGO";
+pub const BRAND_LOGO_FILE: &str = "MEDIACORE_FRONT_BRAND_LOGO_FILE";
 
 /// The one variable that turns signing in on. Everything else about it is
 /// required only because this one is set, which is what makes the feature a
@@ -50,6 +59,12 @@ pub enum ConfigError {
         name: &'static str,
         #[source]
         source: RoomError,
+    },
+    #[error("{name}: {source}")]
+    BadBrand {
+        name: &'static str,
+        #[source]
+        source: BrandError,
     },
     #[error("{name} must be at least {MIN_SECRET_BYTES} bytes long")]
     ShortSecret { name: &'static str },
@@ -123,6 +138,7 @@ pub struct Config {
     pub room: String,
     pub port: u16,
     pub token_ttl: Duration,
+    pub brand: Brand,
     pub oidc: Option<OidcConfig>,
 }
 
@@ -135,6 +151,7 @@ impl fmt::Debug for Config {
             .field("room", &self.room)
             .field("port", &self.port)
             .field("token_ttl", &self.token_ttl)
+            .field("brand", &self.brand)
             .field("oidc", &self.oidc)
             .finish()
     }
@@ -199,6 +216,16 @@ impl Config {
             None => DEFAULT_PORT,
         };
 
+        let brand = Brand::new(
+            optional(BRAND_NAME)?.as_deref(),
+            optional(BRAND_LOGO)?.as_deref(),
+            optional(BRAND_LOGO_FILE)?.as_deref(),
+        )
+        .map_err(|source| ConfigError::BadBrand {
+            name: brand_variable(&source),
+            source,
+        })?;
+
         let oidc = Self::sign_in_from(&optional)?;
 
         Ok(Self {
@@ -208,6 +235,7 @@ impl Config {
             room,
             port,
             token_ttl: TOKEN_TTL,
+            brand,
             oidc,
         })
     }
@@ -321,6 +349,19 @@ fn process_env(name: &'static str) -> Result<Option<String>, ConfigError> {
         Ok(value) => Ok(Some(value)),
         Err(env::VarError::NotPresent) => Ok(None),
         Err(env::VarError::NotUnicode(_)) => Err(ConfigError::NotUnicode(name)),
+    }
+}
+
+/// Which variable an operator has to go and fix.
+///
+/// The message says what is wrong with the value; this says where the value
+/// came from, which is the half that turns a refusal to start into something
+/// somebody can act on without reading the source.
+fn brand_variable(error: &BrandError) -> &'static str {
+    match error {
+        BrandError::NameTooLong { .. } | BrandError::NameControl => BRAND_NAME,
+        BrandError::LogoUnreadable { .. } => BRAND_LOGO_FILE,
+        _ => BRAND_LOGO,
     }
 }
 

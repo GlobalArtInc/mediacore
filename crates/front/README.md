@@ -27,6 +27,9 @@ mediacore-front
 | `MEDIACORE_FRONT_WS_URL` | yes | | What the browser is told to connect to, e.g. `wss://rooms.example.com`. `ws://` or `wss://` followed by a bare host; a path, a userinfo or a second scheme is refused, because those are what a `MEDIACORE_PUBLIC_HOST` holding a URL turns into. |
 | `MEDIACORE_FRONT_ROOM` | no | `demo` | The room `/` offers, and the namespace every other room hangs off. `/r/standup` reaches `demo.standup`; `/` and `/r/demo` are the same room. Letters, digits, `-`, `_`, `.`. |
 | `MEDIACORE_FRONT_PORT` | no | `8080` | TCP port for the page and the token endpoint. |
+| `MEDIACORE_FRONT_BRAND_NAME` | no | `MediaCore` | Whose product this is. It is the tab's name, the wordmark on the lobby card, the heading over the roster, and the `alt` on a logo. At most 64 characters and no control characters; `&`, `<` and `"` are accepted and escaped when rendered, because `Bloom & Wild` is a real company. |
+| `MEDIACORE_FRONT_BRAND_LOGO` | no | | A logo inline, as base64 or as a whole `data:` URI. png, jpeg, gif, webp or svg, at most 256 KiB, and the type is read from the bytes rather than from any name or declared type. |
+| `MEDIACORE_FRONT_BRAND_LOGO_FILE` | no | | The same logo as a path on disk, read once at startup. Setting both this and the one above is refused rather than resolved. |
 | `MEDIACORE_FRONT_OIDC_ISSUER` | no | | **The switch.** Set it and the page signs people in against that provider; leave it unset and nothing below is read, no sign-in route exists, and the page is exactly what it was. An `https://` URL, a realm path allowed, no query. |
 | `MEDIACORE_FRONT_OIDC_CLIENT_ID` | with the issuer | | The client registered with the provider. |
 | `MEDIACORE_FRONT_OIDC_CLIENT_SECRET` | with the issuer | | The client secret. Read from the environment, never written anywhere, and rendered `<redacted>` by `Debug` exactly as `MEDIACORE_API_SECRET` is. No minimum length: the provider chose it, not this process. |
@@ -397,6 +400,54 @@ That gap is deliberate rather than overlooked. There is no model here of which r
 one, and inventing a rule — "a room named after a role needs that role" — would be a guess that is
 worse than the gap, because it would look like an answer. When there is a real rule it goes next to
 `room_for` in `src/name.rs`, which is already the one place that decides which room a request reaches.
+
+## Whose product this is
+
+A deployment that runs this on its own hardware puts its own name and its own logo on the page.
+Three places show one -- the tab, the wordmark on the lobby card, and the heading over the roster --
+and they all read the same two variables, so there is nowhere left saying `MediaCore` on an install
+that bought its own name.
+
+```
+MEDIACORE_FRONT_BRAND_NAME=Acme Rooms
+MEDIACORE_FRONT_BRAND_LOGO_FILE=/etc/mediacore/logo.png
+```
+
+The name is not optional and does not go away when a logo is set. A tab cannot show a picture and a
+screen reader cannot read one, so the logo is only ever what a header draws *instead of* the words:
+the words stay, as the tab's name and as the logo's `alt`.
+
+**The heading over the roster used to be the room.** It is the brand now, and the room moved to the
+line under it, beside the count -- so a person can still see which room they are in, and a
+deployment whose rooms are named `gh_a1b2c3` by a platform above is not showing that as a title. On
+a narrow screen the count leaves, because the button that opens the list already carries the number;
+the separator belongs to the count, so it leaves with it and the room is not left trailing a dot.
+
+**The logo is served by this binary from this origin**, at `/brand/logo-<hash of its bytes>.<ext>`.
+That is the whole design: `img-src 'self'` in the policy above already covers it, so the content
+security policy does not move a character, and there is a test asserting that a branded deployment
+and a default one send byte-identical headers. Pointing the page at a customer's CDN was considered
+and rejected -- it would make a security header a function of a configuration string, put a third
+party on the path of the first paint, and be dead on arrival in an install with no route to the
+internet. The path carries a hash of the bytes, so the response is `immutable` for a year and a new
+logo is a new address rather than a cache to argue with.
+
+The type is read from the bytes and not from the file name or from what a `data:` URI claims, so a
+renamed or mislabelled file is served correctly or refused, never served as something it is not.
+png, jpeg, gif, webp and svg are accepted. Svg is safe here for a reason worth stating, because it
+is not obvious: inside an `<img>` a browser renders it with no scripting and no external fetches at
+all, and reached directly it is a document on this origin -- where `default-src 'none'` with
+`script-src 'self'` and no `'unsafe-inline'` leaves a script inside one nothing it is allowed to run.
+
+Everything is read once at startup. A logo that is not there, is not an image, or is over 256 KiB is
+a refusal to start naming the variable that holds it, in the same shape as every other bad value
+here -- because a deployment that silently served no logo would look like a deployment whose logo
+simply never renders. A caption and a logo given at the same time is fine; the *same logo* given
+both inline and as a path is refused rather than resolved, because a server that quietly picked one
+would put a picture nobody chose on the page.
+
+Setting the name to `MediaCore` is the same as not setting it: the page is shipped byte for byte as
+it was built, so an unbranded deployment is not paying for a feature it did not ask for.
 
 ## Nothing is fetched at runtime
 

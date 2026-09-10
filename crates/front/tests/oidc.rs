@@ -30,6 +30,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use mediacore_front::brand::Brand;
 use mediacore_front::config::{Config, OidcConfig, TOKEN_TTL};
 use mediacore_front::http;
 use mediacore_front::log::MAX_LOGGED_CHARS;
@@ -590,6 +591,7 @@ fn config(oidc: Option<OidcConfig>) -> Config {
         room: ROOM.to_owned(),
         port: 0,
         token_ttl: TOKEN_TTL,
+        brand: Brand::default(),
         oidc,
     }
 }

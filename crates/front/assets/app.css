@@ -140,12 +140,28 @@ button:disabled {
   box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
-.brand-name {
+.brand-mark {
   font-weight: 600;
   letter-spacing: 0.14em;
-  text-transform: uppercase;
   font-size: 0.72rem;
   color: var(--muted);
+}
+
+/* Our dot is our decoration, and it has no business sitting next to somebody
+   else's logo. It stays where the brand is words. */
+.brand:has(.brand-logo) .brand-dot {
+  display: none;
+}
+
+/* A logo stands in for the words, so it is bounded by the line it replaces
+   rather than by its own pixels: a customer who uploads a 900px banner gets a
+   header, not a broken page. */
+.brand-logo {
+  display: block;
+  height: 1.15rem;
+  width: auto;
+  max-width: 12rem;
+  object-fit: contain;
 }
 
 .lobby .lede {
@@ -285,6 +301,32 @@ select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.room-brand {
+  letter-spacing: normal;
+  color: var(--text);
+}
+
+.room-brand .brand-logo {
+  height: 1.4rem;
+  max-width: 14rem;
+}
+
+.room-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The separator belongs to the count, so it leaves with it on a narrow screen
+   and the address is not left trailing a stray middle dot. */
+#room-count::before {
+  content: " \00b7 ";
+}
+
+#room-address:empty::after {
+  content: "\2026";
 }
 
 .pill {

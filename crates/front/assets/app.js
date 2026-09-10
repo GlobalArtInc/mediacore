@@ -188,7 +188,7 @@ const el = {
   join: document.getElementById("join"),
   withVideo: document.getElementById("with-video"),
   room: document.getElementById("room"),
-  roomName: document.getElementById("room-name"),
+  roomAddress: document.getElementById("room-address"),
   roomCount: document.getElementById("room-count"),
   roomState: document.getElementById("room-state"),
   roomError: document.getElementById("room-error"),
@@ -927,7 +927,7 @@ function enterRoom(credentials) {
     settings.roomNamespaceSeparator,
   );
 
-  el.roomName.textContent = address;
+  el.roomAddress.textContent = address;
   showAddress(address);
   remember({ room: address });
   el.footUrl.textContent = `${credentials.url} - ${credentials.room} - ${credentials.identity}`;
