@@ -39,7 +39,41 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// SIGTERM as well as ctrl-c.
+///
+/// SIGTERM is the one a deploy sends, and this binary is PID 1 in its
+/// container. Without it the process ignored the signal and ran until SIGKILL:
+/// nothing was lost -- this server holds no meetings and no records, only a
+/// page and the tokens it mints -- but every rollout waited out the grace
+/// period for every pod before anything moved.
+///
+/// There is nothing to drain. The connections here are ordinary HTTP requests
+/// and they end by themselves, which is why this stops at catching the signal
+/// while the server's own stop has an order to it.
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => tracing::info!("SIGTERM received"),
+                    _ = tokio::signal::ctrl_c() => tracing::info!("interrupted"),
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "cannot listen for SIGTERM; only ctrl-c will stop this server");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("interrupted");
+    }
+
     tracing::info!("shutting down");
 }
