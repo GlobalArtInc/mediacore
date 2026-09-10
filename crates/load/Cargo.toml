@@ -1,0 +1,25 @@
+[package]
+name = "mediacore-load"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A crate of its own rather than a `[[bin]]` in `crates/client`, because a bin
+# there is compiled by everybody who embeds the client as an SDK: clap and the
+# token minter would become dependencies of a library whose whole point is to be
+# small enough to embed. `members = ["crates/*"]`, so this needed no workspace
+# edit to appear.
+[[bin]]
+name = "mediacore-load"
+path = "src/main.rs"
+
+[dependencies]
+mediacore-auth.workspace = true
+mediacore-client.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
