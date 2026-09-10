@@ -769,7 +769,7 @@ impl SubscriberSession {
         let spec = MediaSpec {
             kind: media_kind(kind),
             direction: Direction::SendOnly,
-            stream_id: Some(publisher.sid.clone()),
+            stream_id: Some(stream_id(&publisher.sid, &track.sid)),
             track_id: Some(track.sid.clone()),
             simulcast: None,
         };
@@ -1181,6 +1181,26 @@ fn payload_type(params: &[PayloadParams], mime_type: &str) -> Option<(Pt, u32)> 
         })
         .map(|params| (params.pt(), params.spec().clock_rate.get()))
 }
+
+/// The `msid` stream a subscription is announced under.
+///
+/// Both halves, joined by a pipe, because that is what a client takes apart to
+/// learn who is talking. The browser is forgiving about it -- when the stream
+/// does not split in two it falls back to the track id in the second half of
+/// the `msid` -- and `@livekit/rtc-node` is not: its `unpack_stream_id` returns
+/// nothing for a stream without the separator, and the track is dropped on the
+/// floor before it ever reaches the room. The publication shows up on the
+/// roster, `subscribed` stays false for ever, and no frame arrives, with
+/// nothing said about why on either side of the wire.
+///
+/// So the participant is not the stream. The stream is the participant and the
+/// track together.
+fn stream_id(publisher_sid: &str, track_sid: &str) -> String {
+    format!("{publisher_sid}{STREAM_SEPARATOR}{track_sid}")
+}
+
+/// What both client SDKs split an `msid` stream on.
+const STREAM_SEPARATOR: char = '|';
 
 #[cfg(test)]
 #[path = "subscriber_tests.rs"]

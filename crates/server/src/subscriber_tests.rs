@@ -260,3 +260,86 @@ async fn a_subscriber_that_never_answers_is_asked_to_reconnect() {
     assert!(rx.try_recv().is_err(), "nothing follows the leave request");
     assert!(session.pending.is_none());
 }
+
+/// The `msid` a subscription is offered under carries the participant and the
+/// track, joined by a pipe. It is what a client takes apart to learn who is
+/// talking, and `@livekit/rtc-node` drops the track on the floor when it does
+/// not come apart: `unpack_stream_id` returns nothing for a stream without the
+/// separator and the receiver returns before the room ever hears about it. The
+/// publication sits on the roster with `subscribed` false for ever and no
+/// frame arrives, with nothing said about why on either side of the wire. The
+/// browser survives it only because it falls back to the track id.
+#[tokio::test]
+async fn a_subscription_is_offered_under_the_participant_and_the_track_together() {
+    let state = app_state(0).await;
+    let publisher = state
+        .media
+        .spawn_publisher()
+        .expect("a publisher transport");
+
+    let (alice_tx, _alice_rx) = mediacore_room::signal_channel();
+    let (bob_tx, mut bob_rx) = mediacore_room::signal_channel();
+    let alice = state
+        .registry
+        .join(ROOM, spec("alice"), alice_tx)
+        .expect("alice joins");
+    let bob = state
+        .registry
+        .join(ROOM, spec("bob"), bob_tx)
+        .expect("bob joins");
+
+    let track = alice
+        .room
+        .publish_track(&alice.participant.sid, &add_track("cid-camera"))
+        .expect("alice publishes");
+    state.router.register_source(
+        &track.sid,
+        TrackSource::new(
+            publisher.handle.clone(),
+            Mid::from("0"),
+            TrackKind::Video,
+            "video/VP8",
+            &alice.participant.sid,
+            LayerMap::build(&track.layers, &[]),
+            state.source_config(track.source),
+        ),
+    );
+
+    let mut session = SubscriberSession::new(false);
+    bob.participant
+        .add_desired_subscriptions([track.sid.clone()]);
+    drain(&mut bob_rx);
+
+    session.reconcile(&state, &bob).await;
+
+    let offered = offers(&mut bob_rx);
+    assert_eq!(offered.len(), 1, "the subscription was never offered");
+
+    let stream = format!("{}|{}", alice.participant.sid, track.sid);
+    assert!(
+        offered[0].sdp.contains(&format!("a=msid:{stream} ")),
+        "the offer does not name the participant and the track together, so a client that \
+         takes the stream apart learns nothing and never surfaces the track:\n{}",
+        offered[0].sdp
+    );
+    assert_eq!(
+        offered[0].mid_to_track_id.values().collect::<Vec<&String>>(),
+        vec![&track.sid],
+        "the mid the track was offered on is not the one it was announced under"
+    );
+
+    publisher.handle.close();
+}
+
+/// Both halves, and only one separator: the sids carry none of their own, so a
+/// client splitting on the first pipe gets exactly the two it was promised.
+#[test]
+fn a_stream_name_comes_apart_into_the_two_sids_it_was_made_from() {
+    let packed = stream_id("PA_a1b2c3d4e5f6", "TR_AM9f8e7d6c5b4a");
+
+    assert_eq!(packed, "PA_a1b2c3d4e5f6|TR_AM9f8e7d6c5b4a");
+    assert_eq!(
+        packed.split(STREAM_SEPARATOR).collect::<Vec<&str>>(),
+        vec!["PA_a1b2c3d4e5f6", "TR_AM9f8e7d6c5b4a"]
+    );
+}

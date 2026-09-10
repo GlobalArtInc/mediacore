@@ -482,6 +482,24 @@ API carries the same types as protobuf or as protobuf's JSON mapping, whose seri
 beside the Rust ones from the same descriptors. Neither wire is written by hand, so neither can drift
 from the `.proto`.
 
+### Two things the `.proto` does not say
+
+A subscription is offered under an `msid` whose stream names the participant **and** the track,
+joined by a pipe: `a=msid:PA_a1b2c3|TR_AM9f8e7d TR_AM9f8e7d`. Nothing in the schema says so, and it
+is not optional. Both client SDKs take that stream apart on the pipe to learn who is talking;
+`@livekit/rtc-node` gives up when it does not come apart, returning before the room ever hears about
+the track, so the publication sits on the roster with `subscribed` false for ever and no frame
+arrives — with nothing said about why on either side of the wire. The browser survives a stream
+without it only because it falls back to the track id in the other half of the `msid`.
+
+A client may open media sections it has no track for. `@livekit/rtc-node` opens three audio and
+three video `a=recvonly` sections before it has published or subscribed to anything, holding them
+for subscriptions it expects later. Those are answered `a=inactive`: the direction in an answer is
+the offer's inverted, so the honest-looking `a=sendonly` would promise a track on every one of them
+and leave the client holding six slots open for media this server sends over the subscriber
+transport instead. `crates/transport/src/peer.rs` keys that on what the transport actually writes
+to, so a real track is never caught by it.
+
 ## Data channels
 
 ```yaml

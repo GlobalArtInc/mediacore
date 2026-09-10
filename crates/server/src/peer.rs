@@ -546,10 +546,17 @@ impl PublisherSession {
         let mid = info.mid.to_string();
 
         let Some(cid) = self.cid_by_mid.get(&mid) else {
-            tracing::warn!(
+            // Not a fault, and nothing arrived: a client is entitled to open
+            // sections it has no track for yet, and `@livekit/rtc-node` opens
+            // six of them before it has published or subscribed to anything.
+            // The transport answers those `inactive`; this is only the other
+            // end of the same event, and saying `media arrived` about it put
+            // six warnings in the log for every such client.
+            tracing::debug!(
                 identity = %joined.participant.identity,
                 %mid,
-                "media arrived on a section no track was offered on"
+                direction = ?info.direction,
+                "a section was opened that carries no track of ours"
             );
             return;
         };
