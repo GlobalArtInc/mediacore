@@ -61,6 +61,16 @@ import {
 import { claimsOf, passFrom, passProblem, whoFrom } from "/pass.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
+const SVG_NS = "http://www.w3.org/2000/svg";
+/**
+ * Where "this person cannot hear the room" is carried.
+ *
+ * An attribute rather than a message, because it is a state and not an event:
+ * somebody who joins a minute later has to find it already true rather than
+ * having missed the moment it changed. The server carries attributes without
+ * reading them, so nothing about this needed a release of it.
+ */
+const DEAF_ATTRIBUTE = "deaf";
 
 // Served from this binary, with the build's version in the path, so upgrading
 // it can never hand a browser a stale cached copy of the old one.
@@ -883,6 +893,7 @@ async function connect(credentials) {
     .on(lk.RoomEvent.TrackStreamStateChanged, render)
     .on(lk.RoomEvent.LocalTrackPublished, render)
     .on(lk.RoomEvent.LocalTrackUnpublished, render)
+    .on(lk.RoomEvent.ParticipantAttributesChanged, render)
     .on(lk.RoomEvent.ChatMessage, onChatMessage)
     .on(lk.RoomEvent.ParticipantPermissionsChanged, onPermissions)
     .on(lk.RoomEvent.ConnectionStateChanged, onConnectionState)
@@ -1182,6 +1193,25 @@ function listeningLine(reason) {
  * zero on to the next person's track, and screen-share audio is not covered by
  * a participant's volume at all.
  */
+/**
+ * Tells the room this person has stopped listening, and shrugs if it cannot.
+ *
+ * Awaited by nothing: a badge on other people's screens is not worth holding
+ * up the silence somebody just asked for, and a token minted without
+ * `canUpdateOwnMetadata` makes this a refusal rather than a failure -- the
+ * page still goes quiet, the others simply do not see why.
+ */
+function publishDeafened() {
+  if (!room) return;
+
+  room.localParticipant
+    .setAttributes({ ...room.localParticipant.attributes, [DEAF_ATTRIBUTE]: deafened ? "1" : "" })
+    .then(render)
+    .catch((error) => {
+      console.debug("the room would not carry the deafened flag", error);
+    });
+}
+
 function silenceIncoming() {
   for (const element of el.audio.children) element.muted = deafened;
 }
@@ -1191,6 +1221,7 @@ async function onDeafen() {
 
   deafened = !deafened;
   silenceIncoming();
+  publishDeafened();
 
   const state = media.state();
   const muted = Boolean(state.microphone.muted);
@@ -2036,10 +2067,14 @@ function render() {
   // and, because only two of them went through `describeParticipant` at all,
   // three different opinions about a muted person.
   const described = new Map(
-    people.map((participant) => [
-      participant.identity,
-      describeParticipant(participant, participant === room.localParticipant),
-    ]),
+    people.map((participant) => {
+      const isLocal = participant === room.localParticipant;
+
+      return [
+        participant.identity,
+        { ...describeParticipant(participant, isLocal), deaf: deafFor(participant, isLocal) },
+      ];
+    }),
   );
 
   arriving.clear();
@@ -2658,6 +2693,58 @@ function microphoneOf(participant) {
  * alternative -- printing "listening" for a track nobody is receiving -- is the
  * page telling a comfortable lie.
  */
+/**
+ * Whether this person has silenced the room, which is a thing only they know.
+ *
+ * A muted microphone travels on its own -- it is a track event, and every page
+ * is told -- but nothing in the protocol says "this person cannot hear you".
+ * So it rides in the participant's attributes, where the server carries it
+ * without reading it, and where somebody who joins later finds it already
+ * there rather than having missed the announcement.
+ */
+function deafFor(participant, isLocal) {
+  if (isLocal) return deafened;
+
+  return participant.attributes?.[DEAF_ATTRIBUTE] === "1";
+}
+
+/**
+ * The one or two badges beside a name.
+ *
+ * Two independent questions, so two independent marks: somebody can be muted,
+ * deaf, both or neither, and a single icon that tried to mean either would be
+ * a worse lie the more it was needed. Built out of the symbols the control bar
+ * already uses, so the badge on a row and the button in the bar are the same
+ * picture.
+ */
+function marksFor(described) {
+  const found = [];
+
+  if (described.muted) found.push(mark("#icon-mic-off", "Microphone off"));
+  if (described.deaf) found.push(mark("#icon-speaker-off", "Cannot hear the room"));
+
+  return found;
+}
+
+function mark(href, label) {
+  const wrap = document.createElement("span");
+  wrap.className = "mark";
+  wrap.title = label;
+
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.classList.add("icon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+
+  const use = document.createElementNS(SVG_NS, "use");
+  use.setAttribute("href", href);
+
+  svg.appendChild(use);
+  wrap.appendChild(svg);
+
+  return wrap;
+}
+
 function describeParticipant(participant, isLocal) {
   const identity = participant.identity;
   const status = media ? media.state().microphone : null;
@@ -2738,6 +2825,7 @@ function renderParticipant(participant, isLocal, label, described) {
   const row = document.createElement("li");
   row.dataset.speaking = String(described.speaking);
   row.dataset.muted = String(described.muted);
+  row.dataset.deaf = String(described.deaf);
   row.dataset.state = described.state;
 
   const dot = document.createElement("span");
@@ -2762,7 +2850,11 @@ function renderParticipant(participant, isLocal, label, described) {
   const note = described.reason || described.detail;
   if (note) state.title = note;
 
-  row.append(dot, who, state);
+  const marks = document.createElement("span");
+  marks.className = "marks";
+  marks.append(...marksFor(described));
+
+  row.append(dot, who, marks, state);
 
   const publication = isLocal ? null : microphoneOf(participant);
   if (publication) {
@@ -2864,16 +2956,21 @@ function buildCard(key) {
   const state = document.createElement("span");
   state.className = "state";
 
-  foot.append(who, state);
+  const marks = document.createElement("span");
+  marks.className = "marks";
+
+  foot.append(who, marks, state);
   node.append(press, foot);
 
-  return { node, press, frame, avatar, who, state, track: null, video: null };
+  return { node, press, frame, avatar, who, marks, state, track: null, video: null };
 }
 
 function paintCard(card, entry, middle) {
   card.node.dataset.speaking = String(entry.speaking);
   card.node.dataset.muted = String(entry.muted);
+  card.node.dataset.deaf = String(entry.deaf);
   card.node.dataset.state = entry.state;
+  card.marks.replaceChildren(...marksFor(entry));
   card.node.dataset.middle = String(middle);
 
   const who = entry.local ? "yourself" : entry.label;

@@ -513,6 +513,22 @@ li[data-speaking="true"] .state {
   border-color: #38424e;
 }
 
+.marks {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.mark {
+  display: inline-flex;
+  color: var(--danger);
+}
+
+.mark .icon {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
 .unread {
   min-width: 1.15rem;
   padding: 0 0.3rem;

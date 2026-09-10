@@ -530,6 +530,10 @@ async fn token(
             can_publish: Some(true),
             can_subscribe: Some(true),
             can_publish_data: Some(true),
+            // What lets somebody tell the room they have stopped listening.
+            // The page writes one attribute and reads everybody else's; the
+            // server carries them without reading any.
+            can_update_own_metadata: Some(true),
             can_publish_sources: PUBLISH_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             ..VideoGrant::default()
         },

@@ -1674,6 +1674,63 @@ async fn the_speaker_button_says_what_it_does_and_what_it_does_not() {
 /// somebody out of the room altogether, and the one control that could have
 /// asked for it again was the one control that was switched off.
 #[tokio::test]
+async fn a_muted_microphone_and_a_silenced_room_are_two_badges_and_can_both_be_lit() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (_, page) = get(addr, "/").await;
+
+    let marks = body_of(&js, "\nfunction marksFor(");
+    assert!(
+        marks.contains("if (described.muted)") && marks.contains("if (described.deaf)"),
+        "two independent questions get two independent marks: somebody can be muted, deaf, both \
+         or neither, and one icon meaning either would be a worse lie the more it was needed"
+    );
+    assert!(
+        !marks.contains("else"),
+        "the second badge is not the other half of the first: {marks}"
+    );
+
+    for symbol in ["#icon-mic-off", "#icon-speaker-off"] {
+        assert!(
+            page.contains(&format!("id=\"{}\"", symbol.trim_start_matches('#'))),
+            "the badge names {symbol}, which the sprite has to carry"
+        );
+    }
+
+    let deaf = body_of(&js, "\nfunction deafFor(");
+    assert!(
+        deaf.contains("participant.attributes?.[DEAF_ATTRIBUTE]"),
+        "a muted microphone travels on its own, and nothing in the protocol says a person cannot \
+         hear you, so it rides in the attributes -- where somebody who joins later finds it \
+         already true rather than having missed the moment"
+    );
+
+    let publish = body_of(&js, "\nfunction publishDeafened(");
+    assert!(
+        publish.contains(".catch("),
+        "a token minted without canUpdateOwnMetadata makes this a refusal rather than a failure: \
+         the page still goes quiet and the others simply do not see why"
+    );
+    assert!(
+        js.contains("lk.RoomEvent.ParticipantAttributesChanged, render"),
+        "a badge nobody repaints is a badge that is right once"
+    );
+
+    let card = body_of(&js, "\nfunction paintCard(");
+    let position = card
+        .find("card.marks.replaceChildren(")
+        .expect("a tile carries the badges too");
+    let bail = card
+        .find("if (card.track === entry.track) return;")
+        .unwrap_or(usize::MAX);
+    assert!(
+        position < bail,
+        "the badges are painted above the early return, or they stop updating for everybody who \
+         did not change a track -- which is almost everybody, almost always"
+    );
+}
+
+#[tokio::test]
 async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
     let addr = spawn().await;
     let (_, js) = get(addr, "/app.js").await;

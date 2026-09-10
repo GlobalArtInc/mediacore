@@ -1568,6 +1568,21 @@ time it runs, so a participant who joins after the button was pressed, a resubsc
 reconnect, and `room.startAudio()` behind the playback banner each hand the room back at full
 volume. All three go through one funnel, and a test asserts on each of them by name.
 
+**Both states show up beside the name, and either can be lit on its own.** A muted microphone was
+already visible — it travels as a track event, so every page is told — but nothing in the protocol
+says *this person cannot hear you*, and a room where somebody keeps talking at a person who switched
+them off is worse than one where nobody knows anybody is muted. So the flag rides in the
+participant's attributes, which the server carries without reading, and which somebody joining a
+minute later finds already true rather than having missed the moment it changed.
+
+Two questions, two badges. Somebody can be muted, deaf, both or neither, and one icon that tried to
+mean either would be a worse lie the more it was needed. They are the same two symbols the control
+bar uses, so the badge on a row and the button in the bar are the same picture.
+
+Publishing it is not awaited and not required: a token minted without `canUpdateOwnMetadata` turns
+this into a refusal rather than a failure, and the page still goes quiet — the others simply do not
+see why.
+
 What it deliberately does not do is save bandwidth. Unsubscribing would: it would also turn every
 roster row into `not subscribed`, put out the speaking rings, and cost a renegotiation per track on
 the way back, so a button pressed to get some quiet would take the room's own display with it. The
