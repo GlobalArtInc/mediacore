@@ -1,10 +1,12 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::Router;
+use axum::{Json, Router};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
+use serde::Serialize;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 use crate::rooms;
@@ -20,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route(CLUSTER_PATH, get(cluster))
         .route("/rtc", get(signal::handler))
         .route("/rtc/validate", get(validate))
         .route(rooms::SERVICE_PATH, any(rooms::handler))
@@ -76,6 +79,81 @@ fn cors() -> CorsLayer {
 
 async fn index() -> &'static str {
     "mediacore"
+}
+
+/// Who is running this, and what each of them is holding.
+pub const CLUSTER_PATH: &str = "/api/cluster";
+
+/// The cluster as this node last saw it.
+///
+/// Read out of the snapshot the beat keeps, never out of the database, so
+/// asking costs nothing and a database that is briefly away costs the answer
+/// its freshness rather than its existence. `readAtMs` says when it was true,
+/// which is the field a reader needs to know how much to trust the rest.
+///
+/// Behind the same grant that reads a meeting: it says which rooms are running
+/// where, and a token that may not read a room's history may not learn that
+/// the room is on node three either.
+async fn cluster(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = sessions::reading_cluster(&state, &headers) {
+        return error.into_response();
+    }
+
+    let view = state.cluster.view();
+
+    Json(ClusterView {
+        node: state.cluster.id().to_owned(),
+        joined: state.cluster.joined(),
+        read_at_ms: view.read_at_ms,
+        nodes: view
+            .nodes
+            .iter()
+            .map(|node| NodeView {
+                id: node.id.clone(),
+                signal_url: node.signal_url.clone(),
+                advertise: node.advertise.clone(),
+                version: node.version.clone(),
+                region: node.region.clone(),
+                state: node.state.as_str(),
+                alive: node.alive(view.read_at_ms, view.lease_ms()),
+                started_at_ms: node.started_at_ms,
+                kept_alive_at_ms: node.kept_alive_at_ms,
+                rooms: node.rooms.clone(),
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterView {
+    /// This node, so a caller reading one of several answers knows which it
+    /// reached.
+    node: String,
+    /// Whether this node registers at all. `false` is a deployment running one
+    /// replica, and then `nodes` is empty -- which is a different thing from a
+    /// cluster whose nodes have all stopped.
+    joined: bool,
+    read_at_ms: i64,
+    nodes: Vec<NodeView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeView {
+    id: String,
+    signal_url: String,
+    advertise: String,
+    version: String,
+    region: String,
+    state: &'static str,
+    /// Whether it was still beating when this was read. Computed here rather
+    /// than left to the caller, which would need the lease to work it out.
+    alive: bool,
+    started_at_ms: i64,
+    kept_alive_at_ms: i64,
+    rooms: Vec<String>,
 }
 
 /// Whether this node should be sent new arrivals.

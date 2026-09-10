@@ -462,3 +462,18 @@ video:
     # as congestion on its own. This is the signal that catches the failure
     # pacing introduces: over-subscription becomes latency, not loss.
     queue_pressure_ms: 150
+
+cluster:
+  # More than one process, sharing one Postgres. Empty means this node is on
+  # its own, which is what every single-replica deployment wants and what this
+  # server has always done.
+  #
+  # The address is how ANOTHER NODE reaches this one -- not what a browser is
+  # told. Setting it without sessions.postgres.url is refused at startup: three
+  # processes cannot share a directory of files.
+  advertise_url: ""
+
+  # How long a node may go quiet before the others stop counting it. Beats are
+  # sent every third of this, so two can be lost without a live node being read
+  # as dead.
+  lease_seconds: 30

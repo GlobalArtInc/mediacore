@@ -19,6 +19,7 @@ use crate::events;
 use crate::forward::{MediaRouter, SourceConfig, tracker_config};
 use crate::media::MediaEngine;
 use crate::publisher::Publishers;
+use crate::cluster::Cluster;
 use crate::recording::Recording;
 
 #[derive(Clone)]
@@ -46,6 +47,10 @@ pub struct AppState {
     /// so that the media path can find a track's tap without a lookup through
     /// the registry, and so that the last clone going takes the tasks with it.
     pub recording: Option<Arc<Recording>>,
+    /// Who else is running this, and what they hold. Present whether or not
+    /// this node registers: a node on its own answers that it is alone rather
+    /// than making every caller ask whether there is a cluster first.
+    pub cluster: Arc<Cluster>,
     /// Whether this node has been told to stop.
     ///
     /// Raised once, never lowered: a node that has begun letting go of its
@@ -73,7 +78,16 @@ impl AppState {
     /// would otherwise walk the rooms twice and close meetings that the first
     /// walk had already ended.
     pub fn begin_draining(&self) -> bool {
-        !self.draining.swap(true, Ordering::AcqRel)
+        let first = !self.draining.swap(true, Ordering::AcqRel);
+
+        // On the next beat, so the rest of the cluster stops offering this node
+        // work while it is still finishing what it has, rather than finding out
+        // only when it stops beating at all.
+        if first {
+            self.cluster.begin_draining();
+        }
+
+        first
     }
 
     pub async fn start(config: Config) -> anyhow::Result<Self> {
@@ -142,6 +156,13 @@ impl AppState {
             ))
         });
         let caretaker = Caretaker::start(Arc::clone(&registry), config.room.sweep_interval());
+        // Before the config moves, and holding its own clones: the beat lives
+        // as long as this state does and takes what it needs with it.
+        let cluster = Arc::new(Cluster::start(
+            &config,
+            Arc::clone(&sessions),
+            Arc::clone(&registry),
+        ));
 
         Ok(Self {
             config: Arc::new(config),
@@ -154,6 +175,7 @@ impl AppState {
             events,
             delivery,
             recording,
+            cluster,
             draining: Arc::new(AtomicBool::new(false)),
             _caretaker: Arc::new(caretaker),
         })

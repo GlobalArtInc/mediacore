@@ -1662,6 +1662,61 @@ identity, and the `video` claim carries the grants. Any LiveKit token generator 
 `lk token create`. A token for the server API is the same token with a different grant and no `sub`
 at all.
 
+## More than one node
+
+Off unless asked. With `cluster.advertise_url` empty this server behaves exactly as it always
+has -- one process, holding its own rooms, telling nobody -- which is what a deployment running one
+replica gets and what every test here runs against.
+
+```yaml
+cluster:
+  # How another node reaches this one. Not what a browser is told: a browser
+  # comes through whatever is in front of the cluster, and the nodes reach each
+  # other on the cluster network.
+  advertise_url: ws://10.251.10.7:7880
+  lease_seconds: 30
+```
+
+**One setting, not two.** There is no `enabled` beside the address, for the same reason
+`sessions.postgres.url` has none: a switch and an address can disagree, and a deployment that set
+one and forgot the other would run alone while its operator believed otherwise. Setting it without
+`sessions.postgres.url` is refused at startup and named — three processes cannot share a directory
+of files, and a cluster on one would corrupt its own records.
+
+**Each node publishes what it holds; nobody claims anything.** Every `lease_seconds / 3` a node
+rewrites its own row in `mediacore_node` with the whole set of rooms it is holding at that moment.
+Nobody writes anybody else's row. The alternative — a row per room, claimed on join and released
+when the room ends — was tried on paper and does not survive contact with this code: a room leaves
+the registry in four places and only one of them announces it, so the table would keep a row for
+every room that ended quietly and pin that name to its first node for ever. A published set has
+nothing to forget.
+
+**Reading it costs nothing on the join path.** Each node keeps the last read of the table in
+memory and replaces it whole on its own beat, so steering is a lookup in a snapshot. A database
+that is briefly away costs the cluster its freshness and costs a call in progress nothing at all —
+which is the same bargain the rest of this server makes with its store.
+
+`GET /api/cluster` answers what this node last saw: every row, whether it was still beating, and
+what each was holding. It is behind `roomList` alone and not `roomAdmin`, because the answer names
+every room on every node and there is no single room to scope it to.
+
+A node that stops beating is not deleted — the row is the evidence of what it was holding — and
+every reader can tell it is gone. A node that stops **on purpose** takes its own row away as the
+last thing it does, after its rooms are closed, so the cluster converges in a beat rather than in a
+lease.
+
+**Two processes under one `node_id`** — one value in a shared ConfigMap is all it takes — is caught
+and refused rather than left to be discovered. Each node mints a boot id at startup and writes it
+into its row; a beat that finds a different one is another process wearing this node's name, which
+is a mistake no lease resolves. Without the check they would claim each other's uploads and write
+each other's meetings with nothing anywhere saying so.
+
+**What this does not do yet.** A client still has to reach the node holding its room: nothing
+forwards a signalling connection to another node, and nothing moves a room from one node to
+another. Two replicas today are two independent servers that can see each other — useful for an
+operator and for everything built on top of it, and not yet a cluster a client can be pointed at
+blindly.
+
 ## Stopping a node
 
 `SIGTERM` and `ctrl-c` both stop this server, and both stop it the same way. `SIGTERM` is the one

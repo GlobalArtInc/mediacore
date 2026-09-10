@@ -1,4 +1,5 @@
 pub mod bandwidth;
+pub mod cluster;
 pub mod caretaker;
 pub mod data;
 pub mod events;

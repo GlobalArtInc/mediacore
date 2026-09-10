@@ -579,6 +579,25 @@ fn reading_room(state: &AppState, headers: &HeaderMap, room: &str) -> Result<(),
     )))
 }
 
+/// Who may read the shape of the cluster.
+///
+/// Behind `roomList` alone, and deliberately not behind `roomAdmin`: the
+/// answer names every room running on every node, so a token scoped to one
+/// room would learn the names of all the others. There is nothing to scope it
+/// to -- the question is about the server, not about a room.
+pub fn reading_cluster(state: &AppState, headers: &HeaderMap) -> Result<(), Error> {
+    let claims = authenticate(state, headers)?;
+
+    match claims.video.room_list.unwrap_or(false) {
+        true => Ok(()),
+        false => Err(Error::permission_denied(
+            "reading the cluster needs roomList; it names every room on every node, so there is \
+             no single room to scope it to"
+                .to_owned(),
+        )),
+    }
+}
+
 /// Who may read what happened in a room.
 ///
 /// Two grants, and the split is the one `rooms.rs` already makes. `roomList`

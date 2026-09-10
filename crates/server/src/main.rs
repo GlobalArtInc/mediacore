@@ -140,6 +140,10 @@ async fn drain(state: AppState) {
     if !rooms.is_empty() {
         tracing::info!(rooms = rooms.len(), "every meeting on this node was closed");
     }
+
+    // Last, and after the rooms: a node that took its row away while it still
+    // held meetings would have the others believe those rooms were free.
+    state.cluster.leave();
 }
 
 /// SIGTERM as well as ctrl-c.

@@ -10,6 +10,11 @@ pub const DEFAULT_END_GRACE_SECONDS: u32 = 90;
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
 pub const DEFAULT_NEGOTIATION_TIMEOUT_SECONDS: u32 = 15;
 pub const MAX_DATA_PACKET_BYTES: u32 = 64 * 1024;
+/// Three beats at ten seconds. Long enough that a node paused by a slow
+/// database is not read as dead, short enough that a node that really died
+/// stops being counted before anybody notices it in a room list.
+pub const DEFAULT_CLUSTER_LEASE_SECONDS: u32 = 30;
+
 pub const DEFAULT_DATA_MAX_PACKET_BYTES: u32 = 64_000;
 pub const DEFAULT_DATA_RATE: u32 = 60;
 pub const DEFAULT_DATA_BURST: u32 = 120;
@@ -62,6 +67,80 @@ pub struct Config {
     pub sessions: SessionConfig,
     pub recording: RecordingConfig,
     pub events: EventConfig,
+    pub cluster: ClusterConfig,
+}
+
+/// Whether this node is one of several, and how the others reach it.
+///
+/// **One setting decides, and there is no `enabled` beside it.** A switch and
+/// an address can disagree, and a deployment that set one and forgot the other
+/// would get a server that quietly ran alone while its operator believed it
+/// was clustered -- the same reasoning `sessions.postgres.url` is written down
+/// with. An empty `advertise_url` is a node on its own, behaving exactly as
+/// every node behaved before any of this existed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// How **another node** reaches this one's signalling port, e.g.
+    /// `ws://10.251.10.7:7880`. Not what a browser is told: a browser reaches
+    /// this server through whatever is in front of it, and the nodes reach
+    /// each other on the cluster network.
+    ///
+    /// Empty means this node is alone.
+    pub advertise_url: String,
+    /// How long a node may go without saying it is alive before the others
+    /// stop counting it. Three beats, so a missed one is not a death.
+    pub lease_seconds: u32,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            advertise_url: String::new(),
+            lease_seconds: DEFAULT_CLUSTER_LEASE_SECONDS,
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// A cluster on a store only one process can use is a deployment that will
+    /// corrupt its own records: three nodes cannot share a directory -- each
+    /// holds its own index of it and they overwrite each other -- and a node
+    /// that dies takes its unfinished meetings out of reach of the ones still
+    /// up. Refused at startup, named, rather than discovered on the day a
+    /// second replica appears.
+    fn validate(&self, sessions: &SessionConfig) -> anyhow::Result<()> {
+        if !self.joined() {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            !sessions.postgres.url.trim().is_empty(),
+            "cluster.advertise_url is set, so this node expects company, but sessions.postgres.url              is empty and a directory of files belongs to one process; name a database or leave              the cluster alone"
+        );
+
+        anyhow::ensure!(
+            self.lease_seconds >= 3,
+            "cluster.lease_seconds must be at least 3, or a node is read as dead between two of              its own heartbeats"
+        );
+
+        Ok(())
+    }
+
+    /// Whether this node registers at all.
+    pub fn joined(&self) -> bool {
+        !self.advertise_url.trim().is_empty()
+    }
+
+    pub fn lease_ms(&self) -> i64 {
+        i64::from(self.lease_seconds) * 1_000
+    }
+
+    /// How often to say so. A third of the lease, so two beats can be lost
+    /// without a live node being read as dead.
+    pub fn beat(&self) -> std::time::Duration {
+        std::time::Duration::from_millis((self.lease_ms() / 3).max(1_000) as u64)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -848,6 +927,7 @@ impl Default for Config {
             sessions: SessionConfig::default(),
             recording: RecordingConfig::default(),
             events: EventConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -1028,6 +1108,7 @@ impl Config {
         self.video.bwe.validate()?;
         self.data.validate()?;
         self.events.validate(&self.keys)?;
+        self.cluster.validate(&self.sessions)?;
         Ok(())
     }
 }
