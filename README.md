@@ -1730,11 +1730,24 @@ and are offered nothing new.
 it or refuses it but never passes it on again, so two nodes that briefly disagree cost one wrong hop
 rather than a ring.
 
-**What this does not do yet.** The room service still answers for the node it was asked. Everything
-under `/twirp` — `ListParticipants`, `RemoveParticipant`, `MutePublishedTrack`, `SendData` — reads
-the rooms of one process, so a backoffice that asks the wrong node about a room is told the room is
-empty. Nothing moves a room from one node to another either: a room stays where it opened until it
-ends.
+**The room service answers for the cluster.** A call that names one room — `ListParticipants`,
+`RemoveParticipant`, `MutePublishedTrack`, `SendData`, `DeleteRoom` and the rest — is posted on to
+the node holding it, and that node's answer comes back untouched, refusals included. A backoffice
+can hold one address and be right about every meeting; without this it would be told, correctly for
+one process and wrongly for the cluster, that a room is empty.
+
+`ListRooms` names no room, so it cannot be forwarded: it is asked of every node and the answers are
+put together, deduplicated by name. A node that does not answer is left out of the list and named in
+the log rather than failing the call — a partial list somebody can see is more use than an error, and
+one sick node must not make the cluster unreadable.
+
+Both carry the same mark the relayed websocket does, so a node that receives a forwarded call answers
+it and asks nobody: one round, never a storm.
+
+**What this does not do yet.** Nothing moves a room from one node to another. A room stays where it
+opened until it ends, so a node that is draining holds its meetings until the last person leaves
+rather than handing them over, and a room whose node died is simply gone — whoever comes back opens
+a new meeting under the same name, somewhere else.
 
 ## Stopping a node
 

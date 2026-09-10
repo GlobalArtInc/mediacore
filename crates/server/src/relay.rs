@@ -138,6 +138,66 @@ pub async fn carry(client: WebSocket, url: String, token: String) -> Result<(), 
     Ok(())
 }
 
+/// How long the owner has to answer a forwarded room service call.
+///
+/// Longer than the websocket dial, because this is one request and answer
+/// rather than the start of a conversation, and shorter than any caller's own
+/// patience: a backoffice waiting on a node that is not answering should be
+/// told so rather than held.
+const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Posts a room service call to the node that holds the room, and hands back
+/// what it said.
+///
+/// The body, the content type and the pass go over untouched, and so does the
+/// answer -- including a refusal. The owner decides; this node is a wire. A
+/// call that reached the wrong node otherwise gets a correct-looking answer
+/// about a room that is empty here and full there, which is worse than an
+/// error because nobody doubts it.
+pub async fn forward(
+    signal_url: &str,
+    service: &str,
+    method: &str,
+    content_type: &str,
+    token: &str,
+    body: bytes::Bytes,
+) -> Result<(u16, String, bytes::Bytes), String> {
+    let base = signal_url.trim_end_matches('/');
+    let http = base.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    let url = format!("{http}/twirp/{service}/{method}");
+
+    let answer = reqwest::Client::new()
+        .post(&url)
+        .timeout(CALL_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        // The mark the signalling path uses, for the same reason: a node that
+        // receives a forwarded call answers it or refuses it, and never passes
+        // it on again.
+        .header(RELAY_HEADER, "1")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| format!("the node holding this room did not answer: {error}"))?;
+
+    let status = answer.status().as_u16();
+    let kind = answer
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+    let bytes = answer
+        .bytes()
+        .await
+        .map_err(|error| format!("the answer from the node holding this room broke off: {error}"))?;
+
+    Ok((status, kind, bytes))
+}
+
+/// The header that says a room service call has already been forwarded once.
+pub const RELAY_HEADER: &str = "x-mediacore-relayed";
+
 /// `key=value` pairs out of a query string, percent-decoding nothing.
 ///
 /// Enough for the one flag read here, whose value is `1`. The token is read by

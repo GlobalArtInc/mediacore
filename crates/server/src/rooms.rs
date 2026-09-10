@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, Method as Verb, Uri};
+use axum::http::{HeaderMap, Method as Verb, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use mediacore_auth::Claims;
 use mediacore_proto::mediacore;
 use mediacore_room::{Adoption, Participant, ProfileUpdate, Room, RoomOptions};
 
 use crate::data::distribute;
+use crate::relay;
 use crate::state::AppState;
 use crate::twirp::{self, Codec, Error};
 
@@ -355,6 +356,18 @@ pub async fn handler(
     body: Bytes,
 ) -> Response {
     let service = service_for(uri.path());
+
+    // Whoever holds the room answers about it. A call that landed on the wrong
+    // node would otherwise be told, correctly for this process and wrongly for
+    // the cluster, that the room is empty -- which is worse than an error,
+    // because nobody doubts it.
+    if let Some(answer) = forwarded(&state, service, &method, &headers, &body).await {
+        return answer;
+    }
+
+    if let Some(answer) = gathered(&state, service, &method, &headers, &body).await {
+        return answer;
+    }
 
     match serve(&state, service, &method, &verb, &headers, &body) {
         Ok(response) => response,
@@ -1016,3 +1029,200 @@ where
 #[cfg(test)]
 #[path = "rooms_tests.rs"]
 mod tests;
+
+/// The room one call is about, when it is about exactly one.
+///
+/// Only the shapes that name a room are read, and only the field is taken --
+/// the body itself goes over untouched, so nothing here has to keep up with
+/// the rest of the request. `ListRooms` is absent on purpose: it names a set,
+/// and answering it needs every node rather than one.
+fn room_named(codec: Codec, method: &str, body: &Bytes) -> Option<String> {
+    let named = |room: String| (!room.is_empty()).then_some(room);
+
+    match method {
+        "CreateRoom" => named(twirp::decode::<mediacore::CreateRoomRequest>(codec, body).ok()?.name),
+        "DeleteRoom" => named(twirp::decode::<mediacore::DeleteRoomRequest>(codec, body).ok()?.room),
+        "ListParticipants" => {
+            named(twirp::decode::<mediacore::ListParticipantsRequest>(codec, body).ok()?.room)
+        }
+        "GetParticipant" => {
+            named(twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body).ok()?.room)
+        }
+        "RemoveParticipant" => {
+            named(twirp::decode::<mediacore::RoomParticipantIdentity>(codec, body).ok()?.room)
+        }
+        "MutePublishedTrack" => {
+            named(twirp::decode::<mediacore::MuteRoomTrackRequest>(codec, body).ok()?.room)
+        }
+        "UpdateParticipant" => {
+            named(twirp::decode::<mediacore::UpdateParticipantRequest>(codec, body).ok()?.room)
+        }
+        "UpdateSubscriptions" => {
+            named(twirp::decode::<mediacore::UpdateSubscriptionsRequest>(codec, body).ok()?.room)
+        }
+        "SendData" => named(twirp::decode::<mediacore::SendDataRequest>(codec, body).ok()?.room),
+        "UpdateRoomMetadata" => {
+            named(twirp::decode::<mediacore::UpdateRoomMetadataRequest>(codec, body).ok()?.room)
+        }
+        _ => None,
+    }
+}
+
+/// The answer from the node that holds this room, or `None` to serve it here.
+///
+/// `None` covers a node on its own, a call about a room this node holds, a call
+/// that names no room, and a call that has already been forwarded once. That
+/// last one is the loop guard, and it is the same rule the signalling relay
+/// uses: a forwarded call is answered or refused where it lands.
+///
+/// A `CreateRoom` for a room nobody holds is forwarded to whichever node the
+/// cluster scores highest for that name, so the room is made where the next
+/// arrival will be carried, rather than here and then relayed away.
+async fn forwarded(
+    state: &AppState,
+    service: &str,
+    method: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Response> {
+    if !state.cluster.joined() || headers.contains_key(relay::RELAY_HEADER) {
+        return None;
+    }
+
+    let codec = Codec::from_headers(headers).ok()?;
+    let room = room_named(codec, method, body)?;
+    let view = state.cluster.view();
+    let owner = view.should_hold(&room)?;
+
+    if owner.id == state.cluster.id() {
+        return None;
+    }
+
+    let token = twirp::bearer(headers).ok()?;
+    let outcome = relay::forward(
+        &owner.signal_url,
+        service,
+        method,
+        codec.content_type(),
+        token,
+        body.clone(),
+    )
+    .await;
+
+    match outcome {
+        Ok((status, content_type, answer)) => {
+            tracing::debug!(%room, holder = %owner.id, %method, status, "a room service call was answered elsewhere");
+
+            Some(
+                (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    [(header::CONTENT_TYPE, content_type)],
+                    answer,
+                )
+                    .into_response(),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%room, holder = %owner.id, %method, %error, "a room service call could not be forwarded");
+
+            Some(Error::unavailable(error).into_response())
+        }
+    }
+}
+
+/// `ListRooms` across the whole cluster.
+///
+/// The one call that is about no room in particular, so it cannot be forwarded
+/// to an owner: it is asked of everybody and the answers are put together. A
+/// backoffice that saw only the rooms of whichever node the load balancer
+/// picked would show a third of the meetings on a cluster of three and have no
+/// way of telling.
+///
+/// Each node is asked with the same mark a forwarded call carries, so it
+/// answers for itself and asks nobody -- one round, never a storm. A node that
+/// does not answer is left out and said so in the log rather than failing the
+/// call: a partial list with a line in the log is more use to whoever is
+/// looking than an error, and the alternative is one sick node making the
+/// cluster unreadable.
+async fn gathered(
+    state: &AppState,
+    service: &str,
+    method: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Response> {
+    if method != "ListRooms" || !state.cluster.joined() || headers.contains_key(relay::RELAY_HEADER)
+    {
+        return None;
+    }
+
+    let codec = Codec::from_headers(headers).ok()?;
+    let token = twirp::bearer(headers).ok()?.to_owned();
+    let view = state.cluster.view();
+
+    let elsewhere: Vec<(String, String)> = view
+        .alive()
+        .filter(|node| node.id != state.cluster.id())
+        .map(|node| (node.id.clone(), node.signal_url.clone()))
+        .collect();
+
+    // Nobody else to ask. Serving it here is the same answer and one fewer
+    // decode, so the ordinary single-node case pays nothing for this.
+    if elsewhere.is_empty() {
+        return None;
+    }
+
+    let mut rooms = match serve(state, service, method, &Verb::POST, headers, body) {
+        Ok(_) => local_rooms(state, headers, body)?,
+        Err(error) => return Some(error.into_response()),
+    };
+
+    let asked = elsewhere.iter().map(|(id, url)| {
+        let token = token.clone();
+        let body = body.clone();
+
+        async move {
+            let answer =
+                relay::forward(url, service, method, codec.content_type(), &token, body).await;
+
+            (id.clone(), answer)
+        }
+    });
+
+    for (id, answer) in futures_util::future::join_all(asked).await {
+        match answer {
+            Ok((200, _, bytes)) => {
+                match twirp::decode::<mediacore::ListRoomsResponse>(codec, &bytes) {
+                    Ok(theirs) => rooms.extend(theirs.rooms),
+                    Err(error) => tracing::warn!(node = %id, message = %error.message, "a node answered ListRooms with something this one could not read"),
+                }
+            }
+            Ok((status, _, _)) => {
+                tracing::warn!(node = %id, status, "a node refused ListRooms; its rooms are missing from this answer")
+            }
+            Err(error) => {
+                tracing::warn!(node = %id, %error, "a node did not answer ListRooms; its rooms are missing from this answer")
+            }
+        }
+    }
+
+    // One name can only be in one place -- a room belongs to the node holding
+    // it -- but a node whose view is a beat stale can publish a name another
+    // has taken over, and the same room twice in a list is a backoffice showing
+    // a meeting twice.
+    rooms.sort_by(|left, right| left.name.cmp(&right.name));
+    rooms.dedup_by(|left, right| left.name == right.name);
+
+    Some(encode(codec, mediacore::ListRoomsResponse { rooms }).unwrap_or_else(|error| error.into_response()))
+}
+
+/// This node's own answer to `ListRooms`, decoded back out of the response it
+/// would have sent. Going through `serve` rather than around it keeps the
+/// filtering and the grant check in exactly one place.
+fn local_rooms(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Option<Vec<mediacore::Room>> {
+    let codec = Codec::from_headers(headers).ok()?;
+    let claims = mediacore_auth::verify(twirp::bearer(headers).ok()?, &state.config.keys).ok()?;
+    let request = twirp::decode::<mediacore::ListRoomsRequest>(codec, body).ok()?;
+
+    list_rooms(state, &claims, request).ok().map(|answer| answer.rooms)
+}
