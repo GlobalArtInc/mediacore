@@ -1020,3 +1020,128 @@ async fn an_audio_stream_gets_an_rtx_ssrc_only_when_the_codec_negotiated_one() {
              what lets an audio only subscriber probe at all"
     );
 }
+
+/// What `@livekit/rtc-node` offers before it has subscribed to anything: three
+/// audio and three video receive slots, held open in advance.
+fn preallocating_offer(crypto: &TransportCrypto, port: u16) -> String {
+    let mut client = Rtc::builder()
+        .set_rtp_mode(true)
+        .set_dtls_cert(crypto.dtls_cert())
+        .build(Instant::now());
+    client.add_local_candidate(
+        Candidate::host(SocketAddr::from(([127, 0, 0, 1], port)), "udp")
+            .expect("client host candidate"),
+    );
+
+    let mut api = client.sdp_api();
+    for _ in 0..3 {
+        api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+    }
+    for _ in 0..3 {
+        api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+    }
+
+    api.apply().expect("client offer").0.to_sdp_string()
+}
+
+fn directions(sdp: &str) -> Vec<&str> {
+    sdp.lines()
+        .filter(|line| {
+            matches!(
+                line.trim(),
+                "a=sendonly" | "a=recvonly" | "a=sendrecv" | "a=inactive"
+            )
+        })
+        .map(str::trim)
+        .collect()
+}
+
+/// A slot the client opened in advance is a slot we have nothing for, and
+/// answering it `sendonly` is a promise this transport cannot keep: media
+/// reaches a client over the subscriber transport, which this server offers
+/// itself. The client that believed the promise holds six slots open for
+/// tracks that never arrive, and the msid echoed back at it names its own
+/// streams as if they were ours.
+#[tokio::test]
+async fn receive_slots_a_client_opened_in_advance_are_answered_inactive() {
+    let crypto = TransportCrypto::new().unwrap();
+    let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+    let peer = spawn_peer(&crypto, &udp, PeerConfig::publisher()).unwrap();
+
+    let offer = preallocating_offer(&crypto, 40200);
+    assert_eq!(
+        directions(&offer),
+        vec!["a=recvonly"; 6],
+        "the offer under test is not the one this is about"
+    );
+
+    let answer = peer.handle.accept_offer(offer).await.unwrap();
+
+    assert_eq!(
+        directions(&answer),
+        vec!["a=inactive"; 6],
+        "we promised to send on a slot we have nothing for"
+    );
+    assert!(
+        !answer.contains("a=msid:"),
+        "the answer names streams on sections it sends nothing on:\n{answer}"
+    );
+    assert_eq!(
+        answer.matches("a=mid:").count(),
+        6,
+        "a silenced section still has to be in the bundle it was offered in"
+    );
+}
+
+/// The rule is about sections with nothing on them, and a track arriving is
+/// not one of those. A publisher's own media must come back untouched, or
+/// silencing the empty slots would silence the meeting.
+#[tokio::test]
+async fn a_track_a_client_is_publishing_is_answered_exactly_as_it_was_offered() {
+    let crypto = TransportCrypto::new().unwrap();
+    let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+    let peer = spawn_peer(&crypto, &udp, PeerConfig::publisher()).unwrap();
+
+    let answer = peer
+        .handle
+        .accept_offer(client_offer(&crypto))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        directions(&answer),
+        vec!["a=recvonly"; 2],
+        "a track being published was not answered as one being received"
+    );
+}
+
+/// Both in one offer, which is what a client that publishes and pre-allocates
+/// actually sends: the track it is publishing is answered, the slots it is
+/// holding are silenced, and neither decision reaches the other.
+#[tokio::test]
+async fn a_publisher_that_also_opens_slots_gets_one_answer_for_each() {
+    let crypto = TransportCrypto::new().unwrap();
+    let udp = UdpRouter::bind(loopback_router_config()).await.unwrap();
+    let peer = spawn_peer(&crypto, &udp, PeerConfig::publisher()).unwrap();
+
+    let mut client = Rtc::builder()
+        .set_rtp_mode(true)
+        .set_dtls_cert(crypto.dtls_cert())
+        .build(Instant::now());
+    client.add_local_candidate(
+        Candidate::host(SocketAddr::from(([127, 0, 0, 1], 40210)), "udp").unwrap(),
+    );
+
+    let mut api = client.sdp_api();
+    api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+    api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+    api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+    let offer = api.apply().expect("client offer").0.to_sdp_string();
+
+    let answer = peer.handle.accept_offer(offer).await.unwrap();
+
+    assert_eq!(
+        directions(&answer),
+        vec!["a=recvonly", "a=inactive", "a=inactive"]
+    );
+}

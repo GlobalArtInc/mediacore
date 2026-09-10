@@ -1156,7 +1156,77 @@ impl PeerActor {
         let answer: SdpAnswer = self.rtc.sdp_api().accept_offer(offer)?;
         self.sync_ice_credentials()?;
 
-        Ok(answer.to_sdp_string())
+        Ok(self.silence_idle_sections(&answer.to_sdp_string()))
+    }
+
+    /// Answer `inactive` on the sections we have nothing to send on.
+    ///
+    /// The direction in an answer is the offer's, inverted, and nothing in that
+    /// arithmetic knows whether there is anything to put on the section. So a
+    /// client that pre-allocates receive slots -- `@livekit/rtc-node` offers
+    /// three audio and three video `a=recvonly` sections before it has
+    /// subscribed to anything -- is answered `a=sendonly` on every one of them,
+    /// with the `a=msid` it sent echoed back at it. The answer then names
+    /// streams belonging to the client and promises six tracks that do not
+    /// exist, and the client holds those slots open for media that is never
+    /// coming.
+    ///
+    /// `send_streams` is the list of what this transport actually writes to, so
+    /// a section whose mid is not in it is one we have nothing for -- which is
+    /// every section on a publisher transport, and the pre-allocated ones on
+    /// any other. A section we do send on is left exactly as str0m wrote it,
+    /// simulcast rids included, because the mid is what both are keyed by.
+    ///
+    /// Only sections that were going to say `sendonly` are touched, and only
+    /// their own `a=msid` goes with them: `recvonly` is a track arriving, and
+    /// none of this is about those.
+    fn silence_idle_sections(&self, answer: &str) -> String {
+        let mut out = String::with_capacity(answer.len());
+        let mut section: Vec<&str> = Vec::new();
+        let mut session = true;
+
+        for line in answer.split_inclusive('\n') {
+            if bare(line).starts_with("m=") {
+                match session {
+                    true => session = false,
+                    false => self.flush_section(&mut section, &mut out),
+                }
+            }
+
+            match session {
+                true => out.push_str(line),
+                false => section.push(line),
+            }
+        }
+
+        self.flush_section(&mut section, &mut out);
+
+        out
+    }
+
+    fn flush_section(&self, section: &mut Vec<&str>, out: &mut String) {
+        let mid = section
+            .iter()
+            .find_map(|line| bare(line).strip_prefix("a=mid:"));
+        let sends = mid.is_some_and(|mid| {
+            self.send_streams
+                .iter()
+                .any(|(declared, _)| declared.to_string() == mid)
+        });
+        let idle = !sends && section.iter().any(|line| bare(line) == "a=sendonly");
+
+        for line in section.drain(..) {
+            if idle && bare(line) == "a=sendonly" {
+                out.push_str("a=inactive");
+                out.push_str(&line[bare(line).len()..]);
+                continue;
+            }
+            if idle && bare(line).starts_with("a=msid:") {
+                continue;
+            }
+
+            out.push_str(line);
+        }
     }
 
     fn advance_negotiation(&mut self) {
@@ -1888,6 +1958,12 @@ impl PeerActor {
     fn media_info(&self, added: MediaAdded) -> MediaInfo {
         self.media_layers(added.mid, added.kind, added.direction)
     }
+}
+
+
+/// An sdp line without the line ending it arrived with.
+fn bare(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
 }
 
 #[cfg(test)]
