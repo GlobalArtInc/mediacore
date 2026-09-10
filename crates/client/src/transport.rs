@@ -357,11 +357,24 @@ impl Transport {
                 self.rtc.disconnect();
             }
             Event::KeyframeRequest(request) => {
-                let sender = self
-                    .senders
-                    .iter_mut()
-                    .find(|sender| sender.mid == request.mid);
-                if let Some(sender) = sender {
+                // Matched on the rid as well as the mid. Under simulcast three
+                // senders share one mid, and matching on the mid alone always
+                // found the first rung of the ladder: a request for the layer a
+                // subscriber was actually being forwarded re-keyed `q` instead,
+                // and the subscriber waited out the source's periodic keyframe.
+                // With `keyframe_interval` at thirty frames that is up to a
+                // whole second before the first picture, which is what the new
+                // time-to-first-packet in the reports made visible.
+                //
+                // A request that names no rid re-keys every layer of the mid: a
+                // PLI arriving without one says the stream needs a picture and
+                // does not say which of the three that is.
+                let wanted = self.senders.iter_mut().filter(|sender| {
+                    sender.mid == request.mid
+                        && (request.rid.is_none() || sender.rid == request.rid)
+                });
+
+                for sender in wanted {
                     sender.source.request_keyframe();
                 }
             }
