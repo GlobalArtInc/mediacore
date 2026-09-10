@@ -2850,11 +2850,14 @@ function renderParticipant(participant, isLocal, label, described) {
   const note = described.reason || described.detail;
   if (note) state.title = note;
 
-  const marks = document.createElement("span");
-  marks.className = "marks";
-  marks.append(...marksFor(described));
+  // The badges and the state travel in one cell rather than as two, because
+  // the row is a three-column grid -- dot, name, the rest -- and a fourth child
+  // wraps onto a second line under the dot. Which is exactly what it did.
+  const tail = document.createElement("span");
+  tail.className = "tail";
+  tail.append(...marksFor(described), state);
 
-  row.append(dot, who, marks, state);
+  row.append(dot, who, tail);
 
   const publication = isLocal ? null : microphoneOf(participant);
   if (publication) {
@@ -2959,7 +2962,11 @@ function buildCard(key) {
   const marks = document.createElement("span");
   marks.className = "marks";
 
-  foot.append(who, marks, state);
+  const tail = document.createElement("span");
+  tail.className = "tail";
+  tail.append(marks, state);
+
+  foot.append(who, tail);
   node.append(press, foot);
 
   return { node, press, frame, avatar, who, marks, state, track: null, video: null };

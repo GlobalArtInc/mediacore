@@ -1716,6 +1716,14 @@ async fn a_muted_microphone_and_a_silenced_room_are_two_badges_and_can_both_be_l
         "a badge nobody repaints is a badge that is right once"
     );
 
+    let row = body_of(&js, "\nfunction renderParticipant(");
+    assert!(
+        row.contains("row.append(dot, who, tail);"),
+        "the row is a three-column grid -- dot, name, the rest -- so the badges travel in the \
+         same cell as the state. A fourth child wraps onto a second line under the dot, which is \
+         what it did the first time"
+    );
+
     let card = body_of(&js, "\nfunction paintCard(");
     let position = card
         .find("card.marks.replaceChildren(")
