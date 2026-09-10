@@ -7,78 +7,64 @@ Estimates are in this project's own units — a milestone here has closed in abo
 so "a day" means a day of work, not a sprint.
 
 M0 through M5 are done and M5.5 (meeting records, events, audio recording and upload) with them.
-M6 is done without the SDKs, and M7 with TURN taken out of it -- a node registry, a signal relay
-and a drain. M8 is not started. See [Status](README.md#status). Nothing below contradicts that
-table: it is the work between the milestones and inside them, ordered by what it costs against
-what it returns.
+M6 is done without the SDKs, M7 with TURN taken out of it -- a node registry, a signal relay and a
+drain -- and M8 with all three of its parts: `/metrics`, an interop job that runs somebody else's
+SDK against this server, and a load bench that has found this node's ceiling on one machine.
+See [Status](README.md#status). Nothing below contradicts that table: it is the work between the
+milestones and inside them, ordered by what it costs against what it returns.
 
 ## The next three
 
-1. **Stop the node on SIGTERM.** Every deploy today loses the tail of what was recorded and closes
-   live meetings as `Ending::Restart`. One day, on bricks that already exist.
-2. **A `/metrics` handler.** The numbers are already counted; they have no history and nothing
-   alerts on them. One day, after which everything else on this page becomes measurable.
-3. **An honest `active_recording`.** A room can be recorded today without one client being told.
+1. **An honest `active_recording`.** A room can be recorded today without one client being told.
    A day and a half, and it is the blocker on turning recording on anywhere else.
+2. **Holding a data packet the SCTP buffer refused.** The first of the three steps under
+   [Images in the chat](#images-in-chat) and the one everything else there waits on. Half a day.
+3. **The first burst is the top rung.** A subscriber's first packets are the largest simulcast
+   layer, because the allocator has not run yet; on a real link that is a burst at the moment the
+   estimator knows least. See [Operations](#operations-the-node-stops-lying). Half a day to a day.
 
-Straight after those: **holding a data packet the SCTP buffer refused**, which is the first of the
-three steps under [Images in the chat](#images-in-chat) and the one everything else there waits on.
+Straight after those: **rewriting the VP8 payload descriptor across a switch**, which is the only
+item here that changes what a participant sees rather than what an operator knows.
 
 ## Operations: the node stops lying
 
-Two days of work that pay for themselves on the first deploy, and make everything else on this
-page measurable. Today the only way to learn that the recorder is gone or the store is away is to
-`curl /healthz` by hand and read the line with your eyes.
+Both items that stood here are done. `/metrics` serves the same snapshot `/healthz` renders, so
+every number this page used to call unmeasurable now has a history; the node catches SIGTERM,
+answers `/readyz` with 503 and lets its rooms go before it exits. What is left of them is not code:
+the `ServiceMonitor` and the alert rules live in the chart, and are off unless the cluster has the
+Prometheus operator's CRDs.
 
-### A Prometheus `/metrics` handler over a shared snapshot
+One thing the load bench found belongs here instead.
 
-Lift the number-gathering out of `healthz` into one snapshot function so the two handlers cannot
-drift, and serve the same quantities in the Prometheus text format: counters for RTP and forwarded
-packets and bytes, `dropped_audio_packets`, `abandoned_recordings` and events; gauges for rooms,
-participants, publishers, tracks, subscriptions, `unwritten_sessions`, `owed_sessions`,
-`undelivered_events`, `stuck_recording_work`, and for the states themselves (store up/down,
-recorder on/stopped/off, bwe on/off). No room, participant or track labels — that is cardinality
-this server cannot afford. Leave `/healthz` byte for byte as it is: the compose healthcheck and the
-tests are pinned to it. The `ServiceMonitor` and the alert rules are a separate commit in gitops;
-there is no chart in this repository.
+### The first burst a subscriber gets is the top rung
 
-The comments in the code already call some of these counters alertable, and `abandoned_recordings`
-and `stuck_recording_work` were written precisely so a rare failure would be visible — which today
-it is not, unless somebody happens to curl at the right minute. Prometheus and Telegram alerting
-already run on prod1; what is missing is the source.
+A subscription starts forwarding before the allocator has run once, so the first packets a
+subscriber receives are the largest simulcast layer, and it is stepped down about fifteen
+milliseconds later when the first real budget arrives. On loopback that is two packets and nobody
+notices. On a real link it is a burst of the biggest layer at exactly the moment the estimator knows
+least about the path -- which is the moment least able to absorb it, and the one whose queue delay
+the estimator will then read as congestion that the subscriber caused itself.
 
-*Effort:* a day for `/metrics` and the snapshot, half a day in gitops.
-*Depends on:* nothing; it opens M8 and gives M7 its observability.
-*Evidence:* `crates/server/src/http.rs:79-202` — the whole of healthz is one `format!` into one
-line, with the comments at :139-146 and :152-157 naming the alertable counters; a grep for
-prometheus, metrics or opentelemetry across the repository returns nothing.
+The fix is to start a new subscription at a rung the allocator would have chosen rather than at the
+top, and to let the first allocation move it up: either the lowest rung until the first budget, or
+the rung the subscriber's existing subscriptions are being granted, which is a better guess when
+there are any. Do not reach for a "wait for the first allocation" gate -- a subscriber that receives
+nothing for the first fifteen milliseconds of every track is a worse trade than one that receives a
+small layer.
 
-### Shut down on SIGTERM: `/readyz` to 503, release the rooms, then flush and exit
+This was invisible until layer switches became prompt. `crates/client` used to re-key the wrong rung
+on a switch, so a client could not complete a move to the top layer inside the estimator's startup
+ramp, and the transient was always over before anything could observe it. Two tests in
+`crates/server/tests/bandwidth.rs` were quietly asserting on that transient and went intermittent
+the moment the client was fixed; they now wait for the allocator's decision rather than for the
+first packet of a layer, which is the precondition they always meant.
 
-Catch SIGTERM through `tokio::signal::unix`, not only `ctrl_c`. A `draining` flag on `AppState`:
-while it is raised a new `/readyz` answers 503 and join is refused — leave `/healthz` alone, it is
-the liveness probe in compose and almost certainly in the chart. Then release the rooms through the
-existing `Registry::rooms`/`delete`, but send the participants a `Leave` carrying `can_reconnect`
-and the reason `SERVER_SHUTDOWN` (the value exists in the protocol and is used nowhere), close the
-meetings as `Ending::Closed` with the time they actually ended, wait with a ceiling measured in
-seconds, and only then `sessions.flush` and exit. In gitops: a readiness probe on `/readyz`, a
-`preStop` hook and `terminationGracePeriodSeconds`.
-
-There is no lossless deploy at all right now. `main.rs` listens for `ctrl_c` only, kubelet sends
-SIGTERM, and the process is started through `exec` — PID 1 without a handler ignores the signal
-outright, so the pod sits there until SIGKILL. The consequences are exactly the ones the code
-promises in prose to prevent: the flush does not run and the last minutes of a meeting are lost,
-participants get a bare socket close, and the reaper later closes those meetings as
-`Ending::Restart`, so every deploy corrupts the statistics. Catching the signal is not enough on
-its own: axum waits for every connection to close and a signalling socket lives for ever.
-
-*Effort:* a day of Rust with tests, plus a small change to the manifests in gitops.
-*Depends on:* nothing, every brick is in the tree; it is the precondition for any multi-replica
-work in M7.
-*Evidence:* `crates/server/src/main.rs:72-75` — `shutdown()` waits on `ctrl_c` alone and
-`sessions.flush` sits behind it; `Dockerfile:50` and `deploy/start-sfu.sh:98` — `exec`, so the
-process is PID 1; `crates/session/src/lib.rs:169-174` — `Ending::Restart`, "Nobody watched this
-meeting end"; `DisconnectReason::SERVER_SHUTDOWN` appears in the protobufs and nowhere else.
+*Effort:* half a day to a day, in `crates/server/src/subscriber.rs` where a sink is first attached,
+plus a test that a first subscription does not start on the top rung.
+*Depends on:* nothing.
+*Evidence:* the ladder run recorded in the load bench work -- bob's forwarder target is layer 2 at
+19ms and layer 1 at 33ms, with the grant only becoming unlimited at 1.04s once the estimator has
+samples.
 
 ## The picture stops freezing when a layer changes
 
@@ -368,8 +354,8 @@ with trace enabled. Finding out whose link is falling apart means opening a debu
 table of rates — a tool for somebody debugging the SFU.
 
 *Effort:* a day on the server, a couple of hours on the front end.
-*Depends on:* nothing, though the right thresholds come off a load bench that does not exist yet,
-so the first ones will be by eye.
+*Depends on:* nothing. `crates/load` is where the thresholds come from now -- it reports jitter and
+loss per rung against a known number of bots, which is the shape a first cut at "poor" needs.
 *Evidence:* `crates/room/src/lib.rs:2092` and `:2115` — the message is named and never built;
 `crates/server/src/peer.rs:190-229` — three `tracing::trace!` calls in a row.
 
@@ -641,55 +627,10 @@ ten is thirty megabytes off that node, on the same path as the audio.
 
 ## Instruments
 
-Things that improve nothing by themselves, but without which neither the node's capacity, nor
-compatibility, nor the right to turn bandwidth estimation on can be demonstrated. The bench is worth
-building after `/metrics`, or there is no telling whether the server or the bots ran out first.
-
-### An interop job in CI: the `lk` CLI and `livekit-server-sdk` against the built server
-
-A separate job in `ci.yml`: build the binary, start it with a config (key, port, webhooks to a local
-receiver), run a pinned release of the `lk` CLI (token create, room create/list/delete, list
-participants, update metadata, mute) and a short Node script on a pinned `livekit-server-sdk`,
-including a webhook signature check through their `WebhookReceiver`. Compare answers through parsed
-types rather than a 200, and refusals as typed Twirp errors rather than a transport failure. Leave
-media alone; RTC ports on a runner are their own story. Stay inside the served surface: egress,
-ingress, SIP and agents are `Support::Refused` and that is not a failure.
-
-Compatibility with other people's SDKs is a declared property of this server — it is why the
-`livekit.RoomService` alias and the lowerCamelCase protobuf JSON exist. The shape of the answers is
-already covered densely by our own tests, so this adds exactly the one thing missing: validation by
-somebody else's code — a token minted by `lk`, a request built by their generator, and their own
-webhook signature check. That is the class of divergence you otherwise hear about from an
-integrator rather than from a build.
-
-*Effort:* a day for the job, plus an unknown tail to fix whatever it finds.
-*Depends on:* nothing; pin both the `lk` release and the npm version, or the build goes red on
-upstream's schedule.
-*Evidence:* `.github/workflows/ci.yml` — fmt, clippy, `cargo test`, and nothing else;
-`crates/server/tests/roomservice.rs:21-47` — the router is raised in-process and driven by our own
-code; greps for the `lk` CLI, `livekit-server-sdk` or interop are empty.
-
-### A `mediacore-load` binary: bots on the client crate, and receive timestamps
-
-Two parts, and the first is not free. Instrument reception: put the arrival time into
-`ReceivedPacket` and into the reports — today the client measures neither jitter, nor time to first
-packet, nor layer-switch latency, only counters. Then the binary in `crates/client` (clap is already
-in the workspace, plus token minting or a "bring your own" flag): N bots across M rooms, each
-publishing synthetic Opus and simulcast VP8 and subscribed to the others, a summary from
-`TrackReport` plus the new timings in CSV, two scenarios — fixed load for a duration, and a ladder
-that prints the ceiling it found — plus CPU and RSS of the bots themselves, so it is visible who ran
-out first. Drop the claim that this unblocks `video.bwe.enabled`: the README asks for a run over a
-constrained link, and a crowd of bots on a fat loop constrains nobody's link.
-
-The production replica has no known ceiling: how many participants and tracks a node holds cannot be
-stated, and the capacity model from M8 has nothing to stand on. The client crate can publish and
-count, but it is a library — there is no way to run it outside `cargo test`.
-
-*Effort:* a day and a half for the binary and the scenarios, half a day for the timestamps and the
-tests that compare whole reports.
-*Depends on:* half-blind without `/metrics`. Run it against a separate instance only.
-*Evidence:* `crates/client/Cargo.toml` — no `[[bin]]` section; `crates/client/src/receiver.rs:12-20`
-— `ReceivedPacket` carries no arrival time.
+Things that improve nothing by themselves, but without which neither the node's capacity nor
+compatibility can be demonstrated. Two of the three are built: `interop/` runs LiveKit's own CLI and
+Node SDK against this server in CI, and `crates/load` builds a bench that has found this node's
+ceiling. One is left, and it is the one that is groundwork rather than an instrument.
 
 ### The client as an SDK: feeding encoded frames in, and packets out
 
@@ -798,8 +739,8 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   version `0.1.0` in `JoinResponse.server_version`, in `ServerInfo.version` and from
   `mediacore --version`, while image tags are `<timestamp>-<sha>`. There is no way to tell which
   commit a running node holds.
-- **SIGTERM is unhandled in the front end too** (`crates/front/src/main.rs:43-46`), and it runs
-  three replicas in production; the drain item above covers the SFU only.
+- ~~**SIGTERM is unhandled in the front end too.**~~ Done with M7: both binaries catch it, and the
+  front end has nothing to drain, so it closes its listener and exits.
 - **Rolling back a release with a migration is undefined.** `README.md:797-799` says there is no
   down migration, and migration 4 is forward-only. Production is on Flux, where a rollback is a
   `git revert` of the image tag — and what to do then is written nowhere. At minimum a README
@@ -825,12 +766,12 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   documented at `README.md:1399+` and the real key is `sessionPolicy.record`
   (`crates/room/src/lib.rs:124,159`). An integrator reading the metadata section straight through
   will set `recordingEnabled: true` and get nothing.
-- **The production deployment shape is undocumented.** Greps for kubernetes, helm, k8s and chart
-  across `README.md` and `deploy/README.md` are empty, while `build.yml` says "Builds the image the
-  Helm chart installs" and production is prod1: chart 0.6.x, hostNetwork, one replica, PVCs. Only
-  the single-host compose stack is documented — which directly obstructs the SIGTERM item above,
-  since it says "a change to the manifests in gitops" and what probes, ports and
-  `terminationGracePeriodSeconds` the chart must set is written nowhere.
+- **The production deployment shape is undocumented here.** Greps for kubernetes, helm, k8s and
+  chart across `README.md` and `deploy/README.md` are still empty, while `build.yml` says "Builds
+  the image the Helm chart installs". The chart itself has caught up — it installs more than one
+  replica, probes `/readyz`, and carries the `ServiceMonitor` and alert rules — but it lives in
+  another repository, and nothing in this one says so or says which of its values this server's
+  own configuration owns. A reader of this repository alone still has only the compose stack.
 
 ## Considered and rejected
 

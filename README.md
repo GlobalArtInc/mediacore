@@ -23,7 +23,7 @@ subscriber gets is the one its own link can carry.
 | M5.5 | Meeting records, events, audio recording and upload | done, recording off by default |
 | M6 | Data channels, permissions, own SDKs | done, without the SDKs |
 | M7 | Node registry, signal relay, drain | done; TURN moved out, see below |
-| M8 | Metrics, load and interop testing | not started |
+| M8 | Metrics, load and interop testing | done; the alert rules live in the chart |
 
 TURN left M7 rather than being skipped in it. It shares nothing with the rest — the registry, the
 relay and the drain are all about which process holds which room, and TURN is about a client whose
@@ -462,6 +462,13 @@ Verified against an unmodified `livekit-client` 2.22.2 in a real browser: two pa
 one publishes audio and video, the other subscribes, and media arrives. Audio forwarded one packet
 for one, with nothing lost. The browser only turns simulcast on above a small resolution, so the
 simulcast tests drive `crates/client`, which publishes the encodings deliberately.
+
+A keyframe request names a rid as well as a mid under simulcast, and `crates/client` re-keys the rung
+that was asked for. Matching on the mid alone always found the first rung of the ladder, so a
+subscriber being moved up re-keyed `q` and then waited out the source's own periodic keyframe — up to
+a second at thirty frames — instead of getting one for the asking. A request that names no rid re-keys
+every rung of the mid, because a PLI without one says the stream needs a picture and does not say
+which of the three that is.
 
 ## Protocol profile
 
@@ -1321,7 +1328,7 @@ receiver.
 ```
 POST /hook HTTP/1.1
 Content-Type: application/webhook+json
-Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…
+Authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…
 
 {"event":"participant_joined",
  "room":{"sid":"RM_hycBMAjmt6Ub","name":"standup","creationTime":"1757155200",…},
@@ -1337,7 +1344,11 @@ is quoted too. Fields at their default value are left out rather than sent as nu
 that is what `protojson` does.
 
 The token is a short-lived JWT signed with the API secret, carrying the base64 SHA-256 of the body in
-its `sha256` claim. A receiver verifies the signature to know the request came from this server and
+its `sha256` claim, and it is the bare token with no `Bearer ` in front of it. That is not a detail:
+`WebhookReceiver` in `livekit-server-sdk` passes the header value to its verifier unchanged, so a
+scheme in front of the token is part of the token as far as it is concerned and no signature over it
+can check out. A *call* to the room service is the opposite — it does carry `Bearer` — and the two
+directions differing is exactly why this is written down. A receiver verifies the signature to know the request came from this server and
 the digest to know the body it read is the body that was signed; without the second half the first
 half is a signature over nothing in particular. `events.webhooks.api_key` says which of the `keys`
 signs, because the receiver reads that name out of the token to know which secret to check — and a
@@ -1647,6 +1658,37 @@ range is `0` as well. The address put into ICE candidates is the first of: `rtc.
 `rtc.use_socket_address` is set and the bind address is not a wildcard, and otherwise the address of
 the interface holding the default route. A wildcard bind never advertises the wildcard.
 
+`rtc.ice_servers` is what a client is told to try when it cannot reach that address directly, and it
+is empty by default — a client then gathers host candidates only, and reaches this server from the
+network it is on or not at all. Each entry is a `urls` list, `stun:`, `stuns:`, `turn:` or `turns:`,
+several of them being one server reachable several ways, and a client tries them in the order they
+are written. A relay holds its credential one of two ways and never both: `username` and `credential`
+are a fixed pair matching a user in coturn's database, and `secret` is coturn's `use-auth-secret`
+mode, where this server mints a fresh credential for each person as they join — the username is
+`<unix expiry>:<identity>` and the credential is that username under HMAC-SHA1 with the secret,
+base64'd, which is draft-uberti-behave-turn-rest-00 and is exactly what coturn recomputes. Minting
+per join and per identity is what makes coturn's own logs and its per-user limits mean anything, and
+what bounds a leaked credential to bandwidth through one relay under one name until it expires.
+`ttl_seconds` is how long a minted one lives, a day by default, and it bounds the longest call rather
+than the join: coturn checks the expiry when the allocation is made and again on every refresh of it.
+
+Six shapes are refused at startup, because each of them installs, hands every client an ICE server
+and relays nothing: an entry with no urls, a url whose scheme is none of the four, a `turn:` entry
+carrying neither a fixed pair nor a secret, an entry carrying both, half a username/credential pair,
+a `stun:` entry carrying credentials at all, and a secret with `ttl_seconds: 0`. Each refusal names
+the entry and what to do about it.
+
+This server runs no STUN or TURN server and needs none: it is ice-lite, so a relayed packet is
+another source address and nothing on the media path changes. What the relay needs is the other
+direction — it has to be able to reach the address this server puts in its own candidates, because
+coturn opens a socket towards it on the client's behalf. So `rtc.advertise_addresses` naming a
+private address while coturn sits outside gives a call that connects, an allocation that is made, and
+a room that stays silent, which from inside is indistinguishable from everybody being muted.
+
+Nothing on the client side has to be configured for any of this. The servers go out in the
+`JoinResponse`, and both LiveKit SDKs and the vendored web client build their `RTCConfiguration` from
+that field unless the embedding application passed ICE servers of its own.
+
 Endpoints:
 
 - `GET /` — service name
@@ -1654,6 +1696,8 @@ Endpoints:
   running, how many events have been announced and how many of them nobody will ever get, whether
   bandwidth estimation is on and how many subscribers it is allocating for, and the ICE socket
   address
+- `GET /metrics` — the same numbers in the Prometheus text exposition format. See
+  [Metrics](#metrics).
 - `GET /rtc/validate?access_token=…` — token check, returns the identity
 - `GET /rtc?access_token=…` — signalling WebSocket. `auto_subscribe=0` joins without subscribing
   to anything; it is on by default.
@@ -1667,6 +1711,68 @@ Tokens are standard LiveKit access tokens: HS256, `iss` is the API key, `sub` is
 identity, and the `video` claim carries the grants. Any LiveKit token generator works, including
 `lk token create`. A token for the server API is the same token with a different grant and no `sub`
 at all.
+
+## Metrics
+
+`GET /metrics` answers the Prometheus text exposition format, version `0.0.4`. It is the same reading
+as `/healthz` — one snapshot, gathered once, rendered twice — so the two cannot disagree about a
+number and cannot drift apart when one of them gains a field. `/healthz` stays exactly as it is: one
+line for an operator's eye and a compose healthcheck, unchanged and pinned by a test.
+
+Counters, all of them `_total`:
+
+| Series | What it counts |
+|---|---|
+| `mediacore_rtp_packets_total`, `mediacore_rtp_bytes_total` | RTP in, from publishers |
+| `mediacore_forwarded_packets_total`, `mediacore_forwarded_bytes_total` | RTP out, to subscribers |
+| `mediacore_events_emitted_total` | events announced |
+| `mediacore_dropped_audio_packets_total` | audio thrown away because the queue to the recording writer was full |
+| `mediacore_abandoned_recordings_total` | recordings the writer gave up on |
+
+Gauges: `mediacore_rooms`, `mediacore_participants`, `mediacore_publishers`, `mediacore_tracks`,
+`mediacore_subscriptions`, `mediacore_allocated_subscribers`; `mediacore_sessions`,
+`mediacore_live_sessions`, `mediacore_resident_sessions`, `mediacore_owed_sessions`,
+`mediacore_unwritten_sessions`; `mediacore_owed_events`; `mediacore_owed_recordings`
+(`unwritten_recordings` on the health line) and `mediacore_stuck_recording_work`.
+
+Two things the health line prints beside those are counters here, not gauges:
+`mediacore_undelivered_events_total` and `mediacore_unwritten_events_total`. Both are lifetime sums
+that only rise, and a rising number typed as a gauge is one an alert writer reaches for with `> 0` —
+which then stays true for the life of the process however long ago the one bad minute was. Alert on
+their `increase()` over a window.
+
+States are gauges at 0 or 1, because an alert is an expression over numbers:
+`mediacore_session_store_up`, `mediacore_bwe_enabled`, `mediacore_draining`,
+`mediacore_cluster_joined`, and the pair `mediacore_recorder_enabled` / `mediacore_recorder_running`.
+The pair is the one to read carefully — `enabled=0` is a node that records nothing, which is either
+what you asked for or a configuration problem you will otherwise discover a week later;
+`enabled=1` with `running=0` is worse and is the one to alert on, because the thread that writes
+files is gone and this node is holding meetings and recording none of them. Nothing restarts it: what
+it was writing is on the disk for the next start to finish, and the answer is to restart the process.
+`mediacore_cluster_nodes` and `mediacore_cluster_nodes_alive` are the node registry as this node last
+read it; a gap between the two is somebody who stopped without taking their row away.
+
+`mediacore_build_info` is a 1 carrying `node`, `version` and `region`, and it is the only series in
+the document with labels. **There are no room, participant or track labels anywhere, and there will
+not be.** Rooms are named by whoever created them: a label per room would write the cardinality of
+the busiest hour into a time series database that keeps it for ever, along with the names of the
+meetings. Everything here is one value for the whole node; join `mediacore_build_info` on to it to
+split a graph by node or region.
+
+The endpoint needs no token, exactly as `/healthz` needs none: a scrape carries what it was
+configured with, and there is no meeting token a collector could hold. It is not published either —
+the proxy in front of a deployment routes `/rtc`, `/twirp` and `/swagger` to this server and hands
+everything else to the front end, so `/metrics` is reached from the cluster network or from the host,
+which is where a collector runs.
+
+Scraping costs one pass over the counters and, where the records are in a database, the two queries
+`/healthz` already makes: `mediacore_sessions` is a `count(*)` and `mediacore_stuck_recording_work`
+walks the work queue. Both are cluster-wide answers and both are recent rather than fresh. Scrape at
+fifteen seconds or slower; nothing here needs to be sampled faster than that.
+
+The `ServiceMonitor` and the alert rules are not here. They are in the chart, at
+`charts/mediacore` in the helm-charts repository, off unless the cluster has the Prometheus
+operator's CRDs.
 
 ## More than one node
 
@@ -1835,6 +1941,62 @@ does, how to get a certificate on a host with no domain name (use
 cover nearly every silent room. `crates/front/README.md` documents the front end
 itself, and the root `Dockerfile` builds both binaries.
 
+## Load
+
+`crates/load` builds `mediacore-load`: a crowd of bots against a server that is already running. A bot
+is a `crates/client` `Client` publishing the same synthetic Opus and simulcast VP8 the M2–M5 tests
+publish, and every number in the report comes out of the same `TrackReport` those tests assert
+against. What the bench adds is the outside — tokens, two scenarios, a summary, and the bots' own cost
+beside the server's:
+
+```
+mediacore-load --api-secret <secret> --rooms 4 --churn-secs 2 fixed --bots 48 --seconds 60
+mediacore-load --api-secret <secret> --rooms 4 --churn-secs 2 ladder --start 24 --step 24 --max 240
+```
+
+`fixed` holds a stated load and reports what it did. `ladder` adds bots a rung at a time until
+something gives, and prints the ceiling and what gave — bots that never got in, bots the server threw
+out, packet loss, a subscribed track that went quiet, or the bots' own cpu. That last one is checked
+before any of the others on purpose: every other reading taken on a pinned generator is suspect, since
+packets arrive late because nothing read the socket and tracks go quiet because nothing polled them,
+so a run that reports loss while its own cpu is at the limit is reporting the wrong thing. `--csv`
+writes the same samples as rows, flushed as each rung finishes, so a run that was killed still leaves
+every rung it completed.
+
+`--churn-secs` is what makes the forwarder move subscribers between simulcast layers, and so the only
+thing in a bench that gives the layer-switch latency anything to measure. Without it that line is
+empty.
+
+### A rung is not the run
+
+A bot's reports never reset: they count from the moment it joined. Read straight, the twelfth rung of
+a ladder would report the packets the fourth one lost and the switches it made, and every rung after
+the first would be a blend of itself and everything below it. So a sample subtracts — but only the
+counters are differences, and the two readings that are not need a clock rather than a baseline.
+
+**Time to first packet** is per track, from the offer that told this client the track was coming to
+the first packet that arrived on it, and a rung reports the subscriptions its own ramp made. That ramp
+runs *before* the rung's measured window opens — the bots have to be in before the load can be
+held — so a rung carries two instants: when its counters were read, and when it started subscribing.
+Timed against the first of those, a rung would throw away every track it had just added and keep the
+handful belonging to whichever bot joined last, which is both a tiny sample and a crooked one: the
+tracks that finish after the ramp are the slow ones.
+
+**Layer-switch latency** is the wall clock between the last packet of the layer being left and the
+first of the layer being joined, and a receiver keeps the last sixty-four of those per track. That is
+a running history rather than a delta, so each switch carries the moment it happened and a rung counts
+only the ones inside its own window. The printed line gives both numbers — `142 switches, 142
+timed` — because they can honestly differ: a switch between packets that carried no arrival time
+cannot be timed, and a track that switched more times than its history is deep has lost its oldest.
+
+Jitter is scoped neither way, and should not be: it is RFC 3550's moving estimate rather than a total,
+so what a track reports is what it is doing now.
+
+Known gaps: the bots' cpu and resident size are read out of `/proc` and are simply absent off Linux,
+where the line says so rather than printing a zero; and a hundred bots on loopback constrain nobody's
+link, so nothing here answers anything about bandwidth estimation — that wants a run over a link that
+is really narrow, which is a different question with a different answer.
+
 ## Layout
 
 | Crate | Contents |
@@ -1849,6 +2011,7 @@ itself, and the root `Dockerfile` builds both binaries.
 | `crates/transport` | ICE, DTLS-SRTP, RTP intake and egress, one task per peer connection |
 | `crates/sfu` | packet forwarding: sequence and timestamp rewriting, keyframe gating, layers |
 | `crates/client` | a programmable client that publishes real RTP, used by the tests |
+| `crates/load` | `mediacore-load`: a crowd of those clients against a running server, and what it costs them |
 | `crates/server` | HTTP and WebSocket endpoints, the `mediacore.RoomService` server API and its `/swagger` page, binary |
 | `crates/front` | the browser front end: one page, an audio room, a token endpoint, and an optional OpenID Connect sign-in |
 
@@ -1895,3 +2058,32 @@ beside the three above, and the image this repository ships is built with the fe
 deployment that names a broker gets a binary that can reach it, and a change that breaks the
 producer is found here rather than in a pod. Everything else about events — the emitter, the outbox,
 the webhooks — is in the default build.
+
+### Interop
+
+`cargo test --workspace` drives this server with code from this repository, which leaves untested the
+one property the server advertises: that a client nobody here wrote can read the answers.
+`interop/run.sh` is that test. It builds the binary, starts it on `127.0.0.1:7880` against
+`interop/config.yaml`, and points LiveKit's own CLI and LiveKit's own Node server SDK at it — both
+pinned, both at versions that only a commit can change — with their `WebhookReceiver` in front of the
+webhooks it posts.
+
+```
+interop/run.sh                                          # build the server and run everything
+MEDIACORE_BIN=target/release/mediacore interop/run.sh   # a binary that is already built
+```
+
+CI runs it as a job of its own rather than as a step inside `check`, because it goes red for a reason
+of its own: somebody else's code stopped understanding our answers, which is a different question
+from whether the workspace compiles.
+
+The run owns the server it tests. It refuses to start when something is already answering
+`127.0.0.1:7880` or the receiver's port, and it stops the moment either process it started exits — a
+mediacore left over from an interrupted run answers `/healthz` exactly as well as the one under test,
+and a job that drove the stranger would report every assertion passed for a binary it never started.
+What the CLI prints is parsed rather than grepped for a related reason: protobuf-go varies the
+whitespace in its JSON output per binary on purpose, so an assertion on that text pins which release
+archive was downloaded and nothing about this server. `interop/README.md` says what is asserted, and
+what the job has already found — the first thing it found was that webhook deliveries carried
+`Authorization: Bearer <jwt>` where LiveKit sends the bare token, so no receiver built on their SDK
+could verify one.
