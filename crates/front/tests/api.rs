@@ -1690,13 +1690,18 @@ async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
     );
 
     assert!(
-        js.contains("const pass = passFrom(location.hash);"),
+        js.contains("const addressed = passFrom(location.hash);"),
         "the address is where a platform puts a pass"
     );
     assert!(
-        js.contains(
-            "if (pass) history.replaceState(null, \"\", location.pathname + location.search);"
-        ),
+        js.contains("rememberPass(sessionStorage, addressed);")
+            && js.contains("recallPass(sessionStorage)"),
+        "wiping the address would also lose the pass on a reload, so the tab keeps a copy for as \
+         long as it is open -- and sessionStorage rather than localStorage, because a token that \
+         outlives the visit buys nobody anything"
+    );
+    assert!(
+        js.contains("history.replaceState(null, \"\", location.pathname + location.search);"),
         "the fragment is wiped as it is read: from here on the credential is the tab's, not the \
          address bar's, not the history entry's and not a screenshot's"
     );
@@ -1722,6 +1727,24 @@ async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
             "with a pass both questions are already answered, so neither is asked: {hidden}"
         );
     }
+    let auto = body_of(&js, "\nfunction joinWithPass(");
+    assert!(
+        auto.contains("el.form.requestSubmit()"),
+        "with both questions answered the button exists only to be pressed, so the page joins on \
+         arrival instead"
+    );
+
+    let leaving = body_of(&js, "\nasync function leave(");
+    assert!(
+        leaving.contains("forgetPass(sessionStorage)"),
+        "leaving is a decision, and a reload after one has to land in the lobby rather than \
+         walking straight back in"
+    );
+
+    assert!(
+        lobby.contains("el.join.hidden = true"),
+        "the button is gone when the page joins by itself"
+    );
     assert!(
         lobby.contains("el.join.disabled = true"),
         "a pass that cannot be used has to stop the press, or the refusal arrives from the \

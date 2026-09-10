@@ -869,11 +869,15 @@ So a pass is accepted from the address:
 https://meet.example.com/r/standup#token=eyJhbGciOiJIUzI1NiIs…
 ```
 
-With one there, nothing is minted and nothing is asked. The name field and the room field both go —
-who this person is was decided by whoever signed the pass, and the room is written into it — and the
-lobby becomes a sentence naming both with the Join button under it. It stays a button rather than
-joining on load, because `getUserMedia` and `AudioContext` both want a gesture and a page that
-joined by itself would be refused by the browser with nothing to blame it on.
+With one there, nothing is minted, nothing is asked and nothing is pressed. The name field and the
+room field both go — who this person is was decided by whoever signed the pass, and the room is
+written into it — the lobby becomes a sentence naming both, and the page joins on arrival.
+
+The button used to be there to buy a gesture, and neither thing that wants one is worth stopping
+for any more. A microphone refused without a gesture is no longer a refusal of the room: the person
+lands as a listener, and `Turn on mic` is itself the gesture. Audio playback held back by the
+browser is what the `Enable audio` banner has always been for, and it is already the path everybody
+who reloads into a room walks.
 
 **After the hash, and nowhere else.** A fragment is never sent to a server: it stays out of access
 logs, out of the `Referer` header sent to whatever the page loads, and out of a proxy's history. A
@@ -884,6 +888,14 @@ one is read.
 person in that room until it expires — so the fragment is removed from the address before anything
 else runs. What is left in the address bar, in the history entry, in a bookmark and in a screenshot
 of any of them is a link that opens the right room and lets nobody in by itself.
+
+Wiping it would also lose it on a reload, dropping somebody who pressed F5 back into a lobby with
+nothing in it, so the tab keeps a copy in `sessionStorage` — never in `localStorage`, for the reason
+written at the top of `prefs.js`: a token that outlives the visit it was minted for buys nobody
+anything. The copy dies when the tab closes, and pressing Leave forgets it on the spot, because
+leaving is a decision and a reload after one should land in the lobby rather than walk straight back
+in. A browser set to block site data throws on the accessor itself; the page opens anyway and a
+reload there asks for a new link.
 
 Nothing here verifies the signature. That is the server's business and it checks it when the socket
 opens. What the page reads out of the claims is who somebody is about to be, and two refusals it can

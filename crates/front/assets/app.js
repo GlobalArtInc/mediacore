@@ -58,7 +58,15 @@ import {
   lineFrom,
   unreadLabel,
 } from "/chat.js";
-import { claimsOf, passFrom, passProblem, whoFrom } from "/pass.js";
+import {
+  claimsOf,
+  forgetPass,
+  passFrom,
+  passProblem,
+  recallPass,
+  rememberPass,
+  whoFrom,
+} from "/pass.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 
@@ -279,8 +287,12 @@ const arrival = addressedRoom(location.pathname, location.search);
  * out of a screenshot of it, out of the history entry, and out of what a
  * bookmark would keep.
  */
-const pass = passFrom(location.hash);
-if (pass) history.replaceState(null, "", location.pathname + location.search);
+const addressed = passFrom(location.hash);
+if (addressed) {
+  history.replaceState(null, "", location.pathname + location.search);
+  rememberPass(sessionStorage, addressed);
+}
+const pass = addressed ?? recallPass(sessionStorage);
 const passClaims = pass ? claimsOf(pass) : null;
 
 /**
@@ -539,6 +551,8 @@ async function start() {
   // remembered engine meets the same probe a chosen one does -- and there is
   // one probe rather than two racing each other for the same wasm.
   media.prepareDenoiser().then(restoreChoices).then(paintControls);
+
+  joinWithPass();
 }
 
 /**
@@ -675,11 +689,29 @@ function paintPass() {
 
   el.nameField.hidden = true;
   el.roomField.hidden = true;
+  el.join.hidden = true;
   el.name.value = "";
   el.joinRoom.value = passClaims.room;
   el.passWho.textContent = whoFrom(passClaims);
   el.passRoom.textContent = passClaims.room;
   el.passNote.hidden = false;
+}
+
+/**
+ * Joining on arrival, when the address carried a pass.
+ *
+ * There is nothing to press: both questions are answered and the button would
+ * be a step that exists only to be clicked. What the press used to buy was a
+ * gesture, and neither thing that wants one is worth stopping for. A
+ * microphone refused without one is no longer a refusal of the room -- the
+ * person lands as a listener and `Turn on mic` is itself the gesture. Audio
+ * playback held back by the browser is what the `Enable audio` banner is for,
+ * and it was already there for everybody who reloads into a room.
+ */
+function joinWithPass() {
+  if (!pass || el.join.disabled) return;
+
+  el.form.requestSubmit();
 }
 
 function offerRoom() {
@@ -945,6 +977,9 @@ async function leave(reason) {
   tiles.clear();
   clearCards();
   clearChat();
+  // Leaving is a decision, and a reload after one should land in the lobby
+  // rather than walking straight back in.
+  forgetPass(sessionStorage);
   leaveFullscreen();
   scheduleShareRecheck(null);
   paintShare(null, false);
