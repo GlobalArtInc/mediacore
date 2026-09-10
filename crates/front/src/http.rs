@@ -29,6 +29,7 @@ const READOUT_JS: &str = include_str!("../assets/readout.js");
 const STAGE_JS: &str = include_str!("../assets/stage.js");
 const ROOM_JS: &str = include_str!("../assets/room.js");
 const CHAT_JS: &str = include_str!("../assets/chat.js");
+const PASS_JS: &str = include_str!("../assets/pass.js");
 const PREFS_JS: &str = include_str!("../assets/prefs.js");
 const VOICE_JS: &str = include_str!("../assets/voice.js");
 const LEVEL_METER_JS: &str = include_str!("../assets/level-meter.js");
@@ -115,6 +116,7 @@ pub fn router(config: Config) -> Router {
         .route("/stage.js", get(stage))
         .route("/room.js", get(room))
         .route("/chat.js", get(chat))
+        .route("/pass.js", get(pass))
         .route("/prefs.js", get(prefs))
         .route("/voice.js", get(voice))
         .route(LEVEL_METER_PATH, get(level_meter))
@@ -235,6 +237,10 @@ async fn room() -> impl IntoResponse {
 
 async fn chat() -> impl IntoResponse {
     asset("text/javascript; charset=utf-8", NO_CACHE, CHAT_JS)
+}
+
+async fn pass() -> impl IntoResponse {
+    asset("text/javascript; charset=utf-8", NO_CACHE, PASS_JS)
 }
 
 async fn prefs() -> impl IntoResponse {

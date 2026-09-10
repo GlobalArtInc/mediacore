@@ -855,6 +855,46 @@ the key is there for the one thing validation cannot do, which is a future layou
 something different by the same field names: it is written under another key and never reads this
 one.
 
+## A pass from somewhere else
+
+This page mints its own token on every load, which is the right shape for a page that is its own
+product: it asks for a name, the server signs it, and nobody outside decides who anybody is. It is
+the wrong shape for a page a platform sends people to. There the platform already knows who this
+is — an account, a contract, a role — and none of that survives a token this page invented for
+itself.
+
+So a pass is accepted from the address:
+
+```
+https://meet.example.com/r/standup#token=eyJhbGciOiJIUzI1NiIs…
+```
+
+With one there, nothing is minted and nothing is asked. The name field and the room field both go —
+who this person is was decided by whoever signed the pass, and the room is written into it — and the
+lobby becomes a sentence naming both with the Join button under it. It stays a button rather than
+joining on load, because `getUserMedia` and `AudioContext` both want a gesture and a page that
+joined by itself would be refused by the browser with nothing to blame it on.
+
+**After the hash, and nowhere else.** A fragment is never sent to a server: it stays out of access
+logs, out of the `Referer` header sent to whatever the page loads, and out of a proxy's history. A
+`?token=` is in all three. Accepting both would mean the safe shape is the one nobody uses, so only
+one is read.
+
+**And it is wiped as it is read.** A pass in a link is a credential — whoever holds the link is that
+person in that room until it expires — so the fragment is removed from the address before anything
+else runs. What is left in the address bar, in the history entry, in a bookmark and in a screenshot
+of any of them is a link that opens the right room and lets nobody in by itself.
+
+Nothing here verifies the signature. That is the server's business and it checks it when the socket
+opens. What the page reads out of the claims is who somebody is about to be, and two refusals it can
+make early and legibly: a pass that has expired, and a pass for a different room than the address
+names. Both would otherwise arrive as a socket that closed without a word, which looks like a broken
+server rather than an old link.
+
+A deployment that signs people in is bypassed by a pass, deliberately: it was signed with the same
+secret this server verifies by, so whoever minted it is as trusted as this page's own `/api/token`.
+If that is not wanted, do not hand the secret out.
+
 ## The interface
 
 The room is the shape a voice chat has settled into, and nothing more: a persistent list of who is

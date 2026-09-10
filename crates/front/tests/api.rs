@@ -391,9 +391,10 @@ async fn the_rooms_url_carries_the_room_and_nothing_else() {
 
     assert_eq!(
         js.matches("history.replaceState(").count(),
-        2,
-        "the page writes the address bar somewhere other than the two places that know what a \
-         room's url is: the correction of a legacy link, and entering a room"
+        3,
+        "the page writes the address bar somewhere other than the three places that may: the \
+         correction of a legacy link, entering a room, and taking a pass out of the fragment. \
+         The last of those removes rather than writes, which is the whole point of it"
     );
     assert!(
         js.contains(r#"history.replaceState(null, "", arrival.canonical);"#)
@@ -1672,6 +1673,63 @@ async fn the_speaker_button_says_what_it_does_and_what_it_does_not() {
 /// somebody out of the room altogether, and the one control that could have
 /// asked for it again was the one control that was switched off.
 #[tokio::test]
+async fn a_pass_in_the_address_is_used_instead_of_one_this_page_would_mint() {
+    let addr = spawn().await;
+    let (_, js) = get(addr, "/app.js").await;
+    let (status, module) = get(addr, "/pass.js").await;
+
+    assert_eq!(
+        status, 200,
+        "the page imports it, so the server has to serve it"
+    );
+    assert!(
+        !module.contains("location.search") && !module.contains("searchParams"),
+        "a pass is read after the hash and nowhere else: a fragment is never sent to a server, \
+         so it stays out of access logs, out of Referer headers and out of a proxy's history, \
+         and accepting `?token=` as well would make the safe shape the one nobody uses"
+    );
+
+    assert!(
+        js.contains("const pass = passFrom(location.hash);"),
+        "the address is where a platform puts a pass"
+    );
+    assert!(
+        js.contains(
+            "if (pass) history.replaceState(null, \"\", location.pathname + location.search);"
+        ),
+        "the fragment is wiped as it is read: from here on the credential is the tab's, not the \
+         address bar's, not the history entry's and not a screenshot's"
+    );
+
+    let join = body_of(&js, "\nasync function onJoin(");
+    assert!(
+        join.contains("pass ? passCredentials() : await mintToken("),
+        "with a pass there is nothing to mint: minting would put this person in the room under a \
+         name this page invented, without the account the pass was signed to carry"
+    );
+
+    let credentials = body_of(&js, "\nfunction passCredentials(");
+    assert!(
+        credentials.contains("url: settings.wsUrl"),
+        "the pass carries everything but the address of the server, and /api/config tells every \
+         load where the socket is"
+    );
+
+    let lobby = body_of(&js, "\nfunction paintPass(");
+    for hidden in ["el.nameField.hidden = true", "el.roomField.hidden = true"] {
+        assert!(
+            lobby.contains(hidden),
+            "with a pass both questions are already answered, so neither is asked: {hidden}"
+        );
+    }
+    assert!(
+        lobby.contains("el.join.disabled = true"),
+        "a pass that cannot be used has to stop the press, or the refusal arrives from the \
+         server as a closed socket"
+    );
+}
+
+#[tokio::test]
 async fn a_browser_that_refuses_the_microphone_does_not_refuse_the_room() {
     let addr = spawn().await;
     let (_, js) = get(addr, "/app.js").await;
@@ -2582,8 +2640,10 @@ async fn the_lobby_asks_for_a_name_only_when_nobody_has_signed_it_in() {
          field somebody will one day believe"
     );
     assert!(
-        js.contains("if (!settings.signIn && !name) {"),
-        "the lobby refuses to join for want of a name it is not asking for"
+        js.contains("if (!pass && !settings.signIn && !name) {"),
+        "the lobby refuses to join for want of a name it is not asking for -- and it asks for \
+         none when the address carried a pass, because who this person is was decided by whoever \
+         signed it"
     );
     assert!(
         js.contains("firstQuestion().focus()"),

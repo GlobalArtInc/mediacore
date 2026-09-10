@@ -82,6 +82,9 @@ const {
   lineFrom,
   unreadLabel,
 } = await import(`file://${assetPath("chat.js")}`);
+const { claimsOf, passFrom, passProblem, whoFrom } = await import(
+  `file://${assetPath("pass.js")}`
+);
 const { createBench } = await import(`file://${assetPath("bench.js")}`);
 const {
   ATTACK_OVER_FLOOR_DB,
@@ -1538,6 +1541,73 @@ describe("a room is an address", () => {
     );
     assert.equal(plainRoom("", "demo", "."), "");
     assert.equal(plainRoom(null, "demo", "."), "");
+  });
+});
+
+describe("a pass minted somewhere else", () => {
+  // `sub`, `name`, `exp` and a room grant, signed with nothing: this module
+  // reads claims and never verifies them, because the signature is the
+  // server's business and it checks it on the socket.
+  const token = (payload) => {
+    const part = (value) =>
+      Buffer.from(JSON.stringify(value))
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    return `${part({ alg: "HS256" })}.${part(payload)}.c2lnbmF0dXJl`;
+  };
+
+  const pass = token({
+    sub: "u-42",
+    name: "Роман",
+    exp: 1_800_000_000,
+    video: { room: "gh_standup", roomJoin: true },
+    attributes: { accountId: "acc-7" },
+  });
+
+  it("is read after the hash and nowhere else", () => {
+    assert.equal(passFrom(`#token=${pass}`), pass);
+    assert.equal(passFrom(`#${pass}`), pass, "a bare fragment is a pass too");
+    assert.equal(passFrom(""), null);
+    assert.equal(passFrom("#"), null);
+    assert.equal(passFrom("#room=gh_standup"), null, "a fragment that carries no pass carries none");
+    assert.equal(passFrom("#token=not-a-token"), null);
+  });
+
+  it("reads who somebody is about to be", () => {
+    const claims = claimsOf(pass);
+
+    assert.equal(claims.identity, "u-42");
+    assert.equal(
+      claims.name,
+      "Роман",
+      "a display name is not ascii, and reading the bytes as anything else puts mojibake in the " +
+        "one place a person looks to check they are themselves",
+    );
+    assert.equal(claims.room, "gh_standup");
+    assert.equal(claims.attributes.accountId, "acc-7");
+    assert.equal(whoFrom(claims), "Роман");
+    assert.equal(whoFrom(claimsOf(token({ sub: "u-9", video: {} }))), "u-9");
+  });
+
+  it("refuses what it cannot read rather than pretending", () => {
+    assert.equal(claimsOf("nonsense"), null);
+    assert.equal(claimsOf("a.b.c"), null);
+    assert.equal(claimsOf(undefined), null);
+  });
+
+  it("says why a pass cannot be used, before the socket does", () => {
+    const claims = claimsOf(pass);
+
+    assert.equal(passProblem(claims, 1_700_000_000, null), null);
+    assert.match(passProblem(claims, 1_900_000_000, null), /expired/);
+    assert.match(passProblem(claims, 1_700_000_000, "gh_other"), /gh_standup/);
+    assert.match(passProblem(null, 1_700_000_000, null), /does not carry a pass/);
+    assert.match(
+      passProblem(claimsOf(token({ sub: "u-1", exp: 1_800_000_000 })), 1_700_000_000, null),
+      /names no room/,
+    );
   });
 });
 

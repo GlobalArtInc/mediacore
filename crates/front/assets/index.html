@@ -118,7 +118,12 @@
           </p>
 
           <form id="join-form" novalidate>
-            <div class="field">
+            <p id="pass-note" class="lede" hidden>
+              Joining <strong id="pass-room">&hellip;</strong> as
+              <strong id="pass-who">&hellip;</strong>, from the link you opened.
+            </p>
+
+            <div class="field" id="room-field">
               <label for="join-room">Room</label>
               <input
                 id="join-room"

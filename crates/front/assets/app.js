@@ -58,6 +58,7 @@ import {
   lineFrom,
   unreadLabel,
 } from "/chat.js";
+import { claimsOf, passFrom, passProblem, whoFrom } from "/pass.js";
 
 const SDK_URL = "/vendor/livekit-client-2.22.2.esm.js";
 
@@ -251,6 +252,10 @@ const el = {
   footUrl: document.getElementById("foot-url"),
   joinRoom: document.getElementById("join-room"),
   nameField: document.getElementById("name-field"),
+  roomField: document.getElementById("room-field"),
+  passNote: document.getElementById("pass-note"),
+  passRoom: document.getElementById("pass-room"),
+  passWho: document.getElementById("pass-who"),
   signedIn: document.getElementById("signed-in"),
   signedInName: document.getElementById("signed-in-name"),
 };
@@ -265,6 +270,18 @@ const wantsSimulcast = query.get("simulcast") !== "0";
  * honoured and then quietly corrected.
  */
 const arrival = addressedRoom(location.pathname, location.search);
+/**
+ * A pass minted by whatever sent this person here, taken out of the address and
+ * removed from it in the same breath.
+ *
+ * Wiped before anything else runs, because from here on it is a credential
+ * this tab holds rather than one the address carries: out of the address bar,
+ * out of a screenshot of it, out of the history entry, and out of what a
+ * bookmark would keep.
+ */
+const pass = passFrom(location.hash);
+if (pass) history.replaceState(null, "", location.pathname + location.search);
+const passClaims = pass ? claimsOf(pass) : null;
 
 /**
  * What this browser is allowed to remember, and where. The offer travels with
@@ -470,6 +487,7 @@ async function start() {
     el.name.value = prefs.name.slice(0, settings.maxNameLength);
   }
   paintSignIn();
+  paintPass();
   offerRoom();
   el.footUrl.textContent = settings.wsUrl;
 
@@ -633,6 +651,37 @@ function paintSignIn() {
  * The person following that link cannot edit the URL they were sent, but they
  * can edit the field, and they cannot fix what they cannot see.
  */
+/**
+ * The lobby, when the address carried a pass.
+ *
+ * There is nothing left to ask. Who this person is was decided by whoever
+ * signed the pass, and the room is written into it, so the two fields become a
+ * sentence naming both and the button is the only thing left to press. It has
+ * to stay a press: `getUserMedia` and `AudioContext` both want a gesture, and
+ * a page that joined on load would be refused by the browser and would have
+ * nothing to blame it on.
+ */
+function paintPass() {
+  if (!pass) return;
+
+  const problem = passProblem(passClaims, Math.floor(Date.now() / 1000), null);
+
+  if (problem) {
+    linkRefused = true;
+    fail(el.lobbyError, problem);
+    el.join.disabled = true;
+    return;
+  }
+
+  el.nameField.hidden = true;
+  el.roomField.hidden = true;
+  el.name.value = "";
+  el.joinRoom.value = passClaims.room;
+  el.passWho.textContent = whoFrom(passClaims);
+  el.passRoom.textContent = passClaims.room;
+  el.passNote.hidden = false;
+}
+
 function offerRoom() {
   const offer = offeredRoom(arrival.room, prefs.room, settings.room);
   el.joinRoom.value = offer.room;
@@ -698,7 +747,7 @@ async function onJoin(event) {
   ensureAudioContext();
 
   const name = el.name.value.trim();
-  if (!settings.signIn && !name) {
+  if (!pass && !settings.signIn && !name) {
     fail(el.lobbyError, "Type a name so other people know who is talking.");
     el.name.focus();
     return;
@@ -725,7 +774,7 @@ async function onJoin(event) {
 
   let credentials;
   try {
-    credentials = await mintToken(name, el.joinRoom.value);
+    credentials = pass ? passCredentials() : await mintToken(name, el.joinRoom.value);
   } catch (error) {
     await media.release();
     busy(false, "");
@@ -747,6 +796,27 @@ async function onJoin(event) {
   enterRoom(credentials);
 
   if (withVideo) await startCamera();
+}
+
+/**
+ * What a minted token would have come back as, assembled from the pass.
+ *
+ * The address of the server is the one thing the pass does not carry, and the
+ * page already has it: `/api/config` tells every load where the socket is,
+ * whether anybody is going to mint anything or not.
+ */
+function passCredentials() {
+  const problem = passProblem(passClaims, Math.floor(Date.now() / 1000), null);
+
+  if (problem) throw new Error(problem);
+
+  return {
+    url: settings.wsUrl,
+    token: pass,
+    room: passClaims.room,
+    identity: passClaims.identity,
+    name: whoFrom(passClaims),
+  };
 }
 
 async function mintToken(name, room) {
