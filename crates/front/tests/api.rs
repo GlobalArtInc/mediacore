@@ -1716,6 +1716,21 @@ async fn a_muted_microphone_and_a_silenced_room_are_two_badges_and_can_both_be_l
         "a badge nobody repaints is a badge that is right once"
     );
 
+    let word = body_of(&js, "\nfunction wordFor(");
+    assert!(
+        word.contains("described.state === \"unknown\""),
+        "`muted` is the badge spelled out and `speaking`/`listening` are the dot spelled out, so \
+         only the states nothing else shows keep their words: a track nobody subscribed to, a \
+         stream the server paused, a microphone never opened"
+    );
+
+    let badge = body_of(&js, "\nfunction mark(");
+    assert!(
+        badge.contains("wrap.setAttribute(\"role\", \"img\")")
+            && badge.contains("wrap.setAttribute(\"aria-label\", label)"),
+        "the word it replaced was read out loud, so the picture has to be too"
+    );
+
     let row = body_of(&js, "\nfunction renderParticipant(");
     assert!(
         row.contains("row.append(dot, who, tail);"),

@@ -1583,6 +1583,16 @@ Publishing it is not awaited and not required: a token minted without `canUpdate
 this into a refusal rather than a failure, and the page still goes quiet — the others simply do not
 see why.
 
+**And the badges took the words with them.** `muted` was the badge spelled out, `speaking` and
+`listening` were the dot spelled out, and three labels repeating what the row already showed, on
+every row, is how a column of names becomes a column of noise. What keeps a word is the half nothing
+else can show: a track nobody subscribed to, a stream the server paused, a microphone that was never
+opened. Those have no icon and no colour of their own.
+
+The numbers behind a reading did not go with the word — they move onto the row, so hovering a name
+still says why it says what it says. And a badge is announced rather than decorative: the word it
+replaced was read out loud, so the picture has to be too.
+
 What it deliberately does not do is save bandwidth. Unsubscribing would: it would also turn every
 roster row into `not subscribed`, put out the speaking rings, and cost a renegotiation per track on
 the way back, so a button pressed to get some quiet would take the room's own display with it. The

@@ -2730,6 +2730,11 @@ function mark(href, label) {
   const wrap = document.createElement("span");
   wrap.className = "mark";
   wrap.title = label;
+  // The word it replaced was read out; a picture with nothing behind it would
+  // not be, and a screen reader would hear a name and then silence where the
+  // row was saying something.
+  wrap.setAttribute("role", "img");
+  wrap.setAttribute("aria-label", label);
 
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.classList.add("icon");
@@ -2743,6 +2748,20 @@ function mark(href, label) {
   wrap.appendChild(svg);
 
   return wrap;
+}
+
+/**
+ * The word beside a name, when a word says something the row does not already.
+ *
+ * `muted` is the mic badge spelled out, and `speaking` and `listening` are the
+ * dot spelled out -- three labels repeating what is already on the row, on
+ * every row, which is how a column of names turns into a column of noise.
+ * What is left is the half nobody can see otherwise: a track nobody
+ * subscribed to, a stream the server paused, a microphone that was never
+ * opened. Those have no icon and no colour, so they keep their words.
+ */
+function wordFor(described) {
+  return described.state === "unknown" ? described.text : "";
 }
 
 function describeParticipant(participant, isLocal) {
@@ -2843,12 +2862,11 @@ function renderParticipant(participant, isLocal, label, described) {
 
   const state = document.createElement("span");
   state.className = "state";
-  state.textContent = described.text;
-  // Why it is unknown when it is, and the two numbers behind it when it is not:
-  // a level on its own cannot be argued with, and neither can a row that only
-  // says "listening".
+  state.textContent = wordFor(described);
+  // The numbers stay whether or not there is a word to hang them on: they are
+  // why a row says what it says, and a level on its own cannot be argued with.
   const note = described.reason || described.detail;
-  if (note) state.title = note;
+  if (note) row.title = note;
 
   // The badges and the state travel in one cell rather than as two, because
   // the row is a three-column grid -- dot, name, the rest -- and a fourth child
@@ -2988,7 +3006,7 @@ function paintCard(card, entry, middle) {
     : "Fills the stage, with everybody else in a strip at the side.";
 
   card.who.textContent = entry.local ? `${entry.label} - you` : entry.label;
-  card.state.textContent = entry.text;
+  card.state.textContent = wordFor(entry);
   const note = entry.reason || entry.detail;
   if (note) {
     card.state.title = note;
