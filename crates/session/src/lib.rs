@@ -286,6 +286,76 @@ impl Attendance {
 
 /// A meeting: when it began, when it ended, and who was in it.
 ///
+/// One process that is up, and what it says it is holding.
+///
+/// Read out of the shared store rather than asked of the process, because the
+/// question is usually asked about a node that has stopped answering. A row is
+/// rewritten whole by its own node on every beat: nobody writes anybody else's,
+/// and a set of rooms is replaced rather than added to, so there is no release
+/// step to be missed and no room name left pinned to a node that let it go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Node {
+    pub id: String,
+    /// Minted at startup. Two processes configured with one `node_id` -- one
+    /// value in a shared ConfigMap is all it takes -- would otherwise share
+    /// this row and each other's work without anything saying so. A beat that
+    /// finds a different boot in its own row is that, proven.
+    pub boot: String,
+    /// How another node reaches this one. Not how a browser does.
+    pub signal_url: String,
+    /// The addresses this node puts in its ICE candidates, for reading by
+    /// somebody diagnosing why media went nowhere.
+    pub advertise: String,
+    pub version: String,
+    pub region: String,
+    pub state: NodeState,
+    pub started_at_ms: i64,
+    pub kept_alive_at_ms: i64,
+    /// Every room this node held when it last beat.
+    pub rooms: Vec<String>,
+}
+
+impl Node {
+    /// Whether this row is still being written.
+    ///
+    /// Evaluated against a clock the caller supplies, so a test can watch a
+    /// lease run out without waiting for one.
+    pub fn alive(&self, now_ms: i64, lease_ms: i64) -> bool {
+        self.kept_alive_at_ms >= now_ms - lease_ms
+    }
+
+    /// Whether this node should be given anything new. A draining node is
+    /// still alive and still holds its rooms; what it must not get is more.
+    pub fn takes_work(&self, now_ms: i64, lease_ms: i64) -> bool {
+        self.alive(now_ms, lease_ms) && self.state == NodeState::Live
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeState {
+    Live,
+    Draining,
+}
+
+impl NodeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Draining => "draining",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "live" => Some(Self::Live),
+            "draining" => Some(Self::Draining),
+            _ => None,
+        }
+    }
+}
+
 /// Enough to answer "was there a meeting in this room, who was in it, how
 /// long", and enough to hang a recording off -- a recording belongs to the
 /// meeting it recorded and not to the room, which will hold another meeting
@@ -457,6 +527,11 @@ pub enum StoreError {
     /// The store answered and the answer made no sense: a row written by hand,
     /// or by a version of this server that spelled something differently.
     Nonsense(String),
+    /// Somebody else holds what this node was writing. There is one of these
+    /// and it is worth its own variant rather than an `Unavailable`, because
+    /// it is never transient: retrying produces the same answer, and the thing
+    /// to do about it is change a configuration.
+    Taken(&'static str),
 }
 
 impl std::fmt::Display for StoreError {
@@ -467,6 +542,7 @@ impl std::fmt::Display for StoreError {
             }
             Self::Unsupported(what) => write!(formatter, "this session store cannot {what}"),
             Self::Nonsense(what) => write!(formatter, "the session store answered with {what}"),
+            Self::Taken(what) => write!(formatter, "{what}"),
         }
     }
 }
@@ -491,6 +567,28 @@ trait Sink: Send + Sync + 'static {
     /// `/healthz` is scraped and the number is a gauge, not a fact anybody
     /// acts on to the meeting.
     fn count(&self) -> usize;
+
+    /// Says this node is up, and what it is holding.
+    ///
+    /// Default: nothing. A store that only one process can use has no cluster
+    /// to describe, and answering with an empty one would have a caller
+    /// believe it had asked and been told there is nobody -- which is a
+    /// different thing from not being able to ask.
+    fn publish_node(&self, _node: &Node) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("say which nodes are up"))
+    }
+
+    /// Every node that has written a row, alive or not. The caller decides
+    /// which are still beating, against its own clock.
+    fn nodes(&self) -> Result<Vec<Node>, StoreError> {
+        Err(StoreError::Unsupported("say which nodes are up"))
+    }
+
+    /// Takes this node's row away on a planned stop, so the cluster converges
+    /// in a beat rather than in a lease.
+    fn forget_node(&self, _id: &str) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("say which nodes are up"))
+    }
 
     /// A meeting has just started.
     ///
@@ -1083,6 +1181,26 @@ impl SessionStore {
             .collect();
 
         self.inner.sink.tick(&live, now_ms);
+    }
+
+    /// Says this node is up and holding these rooms.
+    ///
+    /// Fails on a store that cannot answer for more than one process, which is
+    /// the honest answer: a directory has no cluster in it. The caller turns
+    /// that into a refusal to start rather than into a cluster of one, because
+    /// a deployment that thinks it is clustered and is not corrupts its own
+    /// records.
+    pub fn publish_node(&self, node: &Node) -> Result<(), StoreError> {
+        self.inner.sink.publish_node(node)
+    }
+
+    /// Every node in the store, whether or not it is still beating.
+    pub fn nodes(&self) -> Result<Vec<Node>, StoreError> {
+        self.inner.sink.nodes()
+    }
+
+    pub fn forget_node(&self, id: &str) -> Result<(), StoreError> {
+        self.inner.sink.forget_node(id)
     }
 
     /// The meeting running in a room on this node, if one is.

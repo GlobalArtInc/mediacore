@@ -519,6 +519,11 @@ fn refusal(error: StoreError) -> Error {
         StoreError::Unavailable(_) => Error::unavailable(error.to_string()),
         StoreError::Unsupported(_) => Error::unimplemented(error.to_string()),
         StoreError::Nonsense(_) => Error::internal(error.to_string()),
+        // Never transient and never the caller's doing: two processes are
+        // configured with one node id. `internal` rather than `unavailable`,
+        // because retrying gets the same answer and what has to change is a
+        // configuration on this side of the wire.
+        StoreError::Taken(_) => Error::internal(error.to_string()),
     }
 }
 

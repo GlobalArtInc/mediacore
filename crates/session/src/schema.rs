@@ -299,4 +299,39 @@ ALTER TABLE mediacore_attendance DROP COLUMN IF EXISTS account_id;
 ALTER TABLE mediacore_recording DROP COLUMN IF EXISTS account_id;
 ",
     },
+    Migration {
+        version: 7,
+        name: "which nodes are up, and what each of them is holding",
+        sql: "
+-- One row per running process, rewritten by that process on its own clock.
+--
+-- Nobody writes anybody else's row. A node publishes the whole set of rooms it
+-- currently holds on every beat rather than claiming and releasing them one at
+-- a time, because a room leaves memory at four different places and only one of
+-- them announces it -- so a table built out of claims would keep rows for rooms
+-- that ended quietly and pin those names to a node for ever. A published set
+-- has nothing to forget: it is replaced whole, and a node that stopped beating
+-- takes its whole set with it.
+--
+-- `boot` is minted at startup and proves who wrote the row. Two processes
+-- configured with one `node_id` -- one value in a shared ConfigMap is all it
+-- takes -- would otherwise share this row, and each other's recordings, without
+-- anything saying so.
+CREATE TABLE IF NOT EXISTS mediacore_node (
+    id               text PRIMARY KEY,
+    boot             text NOT NULL,
+    signal_url       text NOT NULL,
+    advertise        text NOT NULL,
+    version          text NOT NULL,
+    region           text NOT NULL,
+    state            text NOT NULL,
+    started_at_ms    bigint NOT NULL,
+    kept_alive_at_ms bigint NOT NULL,
+    rooms            text[] NOT NULL DEFAULT '{}'
+);
+
+-- No index beyond the key. The table holds one row per replica and every read
+-- of it wants all of them.
+",
+    },
 ];

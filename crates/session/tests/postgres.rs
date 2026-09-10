@@ -31,7 +31,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mediacore_session::{
-    Kind, Member, PostgresSettings, Recording, SessionStore, Stage, WorkState, recording_id,
+    Kind, Member, Node, NodeState, PostgresSettings, Recording, SessionStore, Stage, WorkState,
+    recording_id,
 };
 use postgres::NoTls;
 
@@ -1743,4 +1744,166 @@ fn an_upload_waiting_for_a_node_that_never_came_back_is_counted() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn beat(id: &str, boot: &str, at: i64, rooms: &[&str]) -> Node {
+    Node {
+        id: id.to_owned(),
+        boot: boot.to_owned(),
+        signal_url: format!("ws://{id}.internal:7880"),
+        advertise: "10.0.0.1:7882".to_owned(),
+        version: "test".to_owned(),
+        region: String::new(),
+        state: NodeState::Live,
+        started_at_ms: at,
+        kept_alive_at_ms: at,
+        rooms: rooms.iter().map(|room| (*room).to_owned()).collect(),
+    }
+}
+
+/// Two nodes, each writing its own row and reading both.
+#[test]
+fn a_node_says_it_is_up_and_the_others_can_read_it() {
+    let scratch = database!("nodes_publish");
+    let one = scratch.store("ND_one");
+    let two = scratch.store("ND_two");
+
+    one.publish_node(&beat("ND_one", "boot-1", 1_000, &["standup"]))
+        .expect("one publishes");
+    two.publish_node(&beat("ND_two", "boot-2", 1_000, &["retro", "demo"]))
+        .expect("two publishes");
+
+    let seen = one.nodes().expect("one reads the table");
+    assert_eq!(seen.len(), 2, "a node cannot see the rest of the cluster");
+
+    let other = seen.iter().find(|node| node.id == "ND_two").unwrap();
+    assert_eq!(other.rooms, vec!["retro".to_owned(), "demo".to_owned()]);
+    assert_eq!(other.signal_url, "ws://ND_two.internal:7880");
+    assert_eq!(other.state, NodeState::Live);
+}
+
+/// The set is replaced, not added to. A room a node let go of has to leave its
+/// row, and there is no release step anywhere that would do it -- which is the
+/// whole reason the set is published rather than claimed.
+#[test]
+fn a_room_a_node_let_go_of_leaves_its_row() {
+    let scratch = database!("nodes_replace");
+    let store = scratch.store("ND_one");
+
+    store
+        .publish_node(&beat("ND_one", "boot-1", 1_000, &["standup", "retro"]))
+        .unwrap();
+    store
+        .publish_node(&beat("ND_one", "boot-1", 2_000, &["standup"]))
+        .unwrap();
+
+    let seen = store.nodes().unwrap();
+    assert_eq!(seen.len(), 1, "a second row was written for one node");
+    assert_eq!(
+        seen[0].rooms,
+        vec!["standup".to_owned()],
+        "a room this node stopped holding is still pinned to it"
+    );
+}
+
+/// One value in a shared ConfigMap is all it takes. Two processes under one
+/// id would take each other's recordings and write each other's meetings, and
+/// nothing anywhere would say so -- so the second one is told.
+#[test]
+fn two_processes_under_one_node_id_are_caught() {
+    let scratch = database!("nodes_duplicate");
+    let first = scratch.store("ND_same");
+    let second = scratch.store("ND_same");
+
+    first
+        .publish_node(&beat("ND_same", "boot-first", 1_000, &["standup"]))
+        .expect("the first one takes the row");
+
+    let refused = second
+        .publish_node(&beat("ND_same", "boot-second", 1_100, &["retro"]))
+        .expect_err("the second one was allowed to take it");
+
+    assert!(
+        matches!(refused, mediacore_session::StoreError::Taken(_)),
+        "a duplicate node id was reported as {refused:?}, which reads as something to retry"
+    );
+
+    let seen = first.nodes().unwrap();
+    assert_eq!(
+        seen[0].rooms,
+        vec!["standup".to_owned()],
+        "the impostor overwrote the row it was refused"
+    );
+}
+
+/// A node that stopped beating is still in the table -- the row is the
+/// evidence of what it was holding -- and every reader can tell.
+#[test]
+fn a_node_that_stopped_beating_is_readable_and_not_alive() {
+    let scratch = database!("nodes_lease");
+    let store = scratch.store("ND_one");
+    let lease = 30_000;
+
+    store
+        .publish_node(&beat("ND_one", "boot-1", 1_000, &["standup"]))
+        .unwrap();
+
+    let node = store.nodes().unwrap().pop().unwrap();
+
+    assert!(node.alive(1_000 + lease, lease), "it beat within the lease");
+    assert!(!node.alive(1_001 + lease, lease), "the lease never ran out");
+    assert!(node.takes_work(1_000, lease));
+}
+
+/// Draining is not death: the node still holds what it holds, and still
+/// answers for it. What it must not get is anything new.
+#[test]
+fn a_draining_node_is_alive_and_takes_nothing_new() {
+    let scratch = database!("nodes_draining");
+    let store = scratch.store("ND_one");
+
+    let mut going = beat("ND_one", "boot-1", 1_000, &["standup"]);
+    going.state = NodeState::Draining;
+    store.publish_node(&going).unwrap();
+
+    let node = store.nodes().unwrap().pop().unwrap();
+
+    assert_eq!(node.state, NodeState::Draining);
+    assert!(node.alive(1_000, 30_000));
+    assert!(
+        !node.takes_work(1_000, 30_000),
+        "a node on its way out is still being sent arrivals"
+    );
+}
+
+/// A planned stop takes its own row away, so the cluster converges in a beat
+/// rather than waiting out a lease nobody is going to renew.
+#[test]
+fn a_node_that_stops_on_purpose_leaves_no_row_behind() {
+    let scratch = database!("nodes_forget");
+    let store = scratch.store("ND_one");
+
+    store
+        .publish_node(&beat("ND_one", "boot-1", 1_000, &["standup"]))
+        .unwrap();
+    store.forget_node("ND_one").unwrap();
+
+    assert!(store.nodes().unwrap().is_empty());
+}
+
+/// A directory has no cluster in it. Answering with an empty one would have a
+/// caller believe it had asked and been told there is nobody.
+#[test]
+fn a_directory_refuses_to_describe_a_cluster() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::files(directory.path(), OPAQUE_BYTES).unwrap();
+
+    assert!(matches!(
+        store.nodes(),
+        Err(mediacore_session::StoreError::Unsupported(_))
+    ));
+    assert!(matches!(
+        store.publish_node(&beat("ND_one", "boot-1", 1_000, &[])),
+        Err(mediacore_session::StoreError::Unsupported(_))
+    ));
 }

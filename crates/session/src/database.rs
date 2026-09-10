@@ -36,7 +36,7 @@ use postgres::{Client, NoTls, Row, Transaction};
 
 use crate::recording::{Claim, Recording, Stage, State, Work};
 use crate::schema::{MIGRATION_LOCK, MIGRATIONS, SCHEMA_TABLE};
-use crate::{Attendance, Ending, Kind, Listing, Session, Sink, StoreError};
+use crate::{Attendance, Ending, Kind, Listing, Node, NodeState, Session, Sink, StoreError};
 
 /// How often the cluster-wide meeting count on `/healthz` is refreshed.
 ///
@@ -610,6 +610,118 @@ impl Drop for Database {
 impl Sink for Database {
     fn describe(&self) -> String {
         format!("postgres:{}", self.address)
+    }
+
+    /// Rewrites this node's row, whole.
+    ///
+    /// One statement, no transaction: the row is one node's and nobody else
+    /// writes it, so there is nothing to be consistent with. The set of rooms
+    /// is replaced rather than merged for the same reason a claim table was
+    /// not used at all -- a room leaves memory in several places and only one
+    /// of them announces it, so anything that had to be removed would
+    /// eventually not be.
+    ///
+    /// `boot` is written on insert and compared on update. A row whose boot is
+    /// not ours belongs to another process wearing our name, and taking it
+    /// would be two nodes quietly sharing one identity; the caller is told and
+    /// decides what to do about it.
+    fn publish_node(&self, node: &Node) -> Result<(), StoreError> {
+        self.ready()?;
+
+        let node = node.clone();
+
+        let ours = self.pool.run(move |client| {
+            let updated = client.execute(
+                "INSERT INTO mediacore_node
+                     (id, boot, signal_url, advertise, version, region, state,
+                      started_at_ms, kept_alive_at_ms, rooms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (id) DO UPDATE SET
+                     signal_url = EXCLUDED.signal_url,
+                     advertise = EXCLUDED.advertise,
+                     version = EXCLUDED.version,
+                     region = EXCLUDED.region,
+                     state = EXCLUDED.state,
+                     started_at_ms = EXCLUDED.started_at_ms,
+                     kept_alive_at_ms = EXCLUDED.kept_alive_at_ms,
+                     rooms = EXCLUDED.rooms
+                 WHERE mediacore_node.boot = EXCLUDED.boot",
+                &[
+                    &node.id,
+                    &node.boot,
+                    &node.signal_url,
+                    &node.advertise,
+                    &node.version,
+                    &node.region,
+                    &node.state.as_str(),
+                    &node.started_at_ms,
+                    &node.kept_alive_at_ms,
+                    &node.rooms,
+                ],
+            )?;
+
+            Ok(updated == 1)
+        })?;
+
+        self.recovered();
+
+        match ours {
+            true => Ok(()),
+            false => Err(StoreError::Taken(
+                "another process is already writing this node_id; two nodes sharing one identity \
+                 would take each other's recordings and each other's meetings",
+            )),
+        }
+    }
+
+    fn nodes(&self) -> Result<Vec<Node>, StoreError> {
+        self.ready()?;
+
+        let rows = self.pool.run(|client| {
+            let found = client.query(
+                "SELECT id, boot, signal_url, advertise, version, region, state,
+                        started_at_ms, kept_alive_at_ms, rooms
+                   FROM mediacore_node
+                  ORDER BY id",
+                &[],
+            )?;
+
+            Ok(found
+                .iter()
+                .map(|row| Node {
+                    id: row.get(0),
+                    boot: row.get(1),
+                    signal_url: row.get(2),
+                    advertise: row.get(3),
+                    version: row.get(4),
+                    region: row.get(5),
+                    // A state this build does not know is read as draining:
+                    // the safe direction is to stop sending it work, not to
+                    // start.
+                    state: NodeState::parse(row.get(6)).unwrap_or(NodeState::Draining),
+                    started_at_ms: row.get(7),
+                    kept_alive_at_ms: row.get(8),
+                    rooms: row.get(9),
+                })
+                .collect::<Vec<Node>>())
+        })?;
+
+        self.recovered();
+
+        Ok(rows)
+    }
+
+    fn forget_node(&self, id: &str) -> Result<(), StoreError> {
+        self.ready()?;
+
+        let id = id.to_owned();
+
+        self.pool.run(move |client| {
+            client.execute("DELETE FROM mediacore_node WHERE id = $1", &[&id])?;
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
     fn healthy(&self) -> bool {
