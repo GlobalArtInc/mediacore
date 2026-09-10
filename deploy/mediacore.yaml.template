@@ -106,6 +106,32 @@ rtc:
   ice_disconnected_timeout: 20
   negotiation_timeout: 15
 
+  # The relay clients are told to try when they cannot reach the address above.
+  # Built by start-sfu.sh out of MEDIACORE_TURN_* in deploy/.env, and empty --
+  # absent entirely, not an entry with nothing in it -- unless
+  # MEDIACORE_TURN_SECRET is set. A client takes an ice server it is given at
+  # its word: one pointing at an empty host costs it the seconds it spends
+  # finding that out, which is time nobody in the room can hear anything.
+  #
+  # Set, it renders as:
+  #
+  #   ice_servers:
+  #     - urls:
+  #         - "turn:203.0.113.7:3478?transport=udp"
+  #         - "turn:203.0.113.7:3478?transport=tcp"
+  #       secret: "the same secret coturn was started with"
+  #       ttl_seconds: 86400
+  #
+  # with a turns: url beside those two when certificate files were named. The
+  # rendered file is the truth of what happened:
+  # `docker compose exec sfu cat /tmp/mediacore.yaml`.
+  #
+  # No stun: entry is rendered, deliberately. This server is ice-lite: it never
+  # gathers a candidate and never uses a client's reflexive address to reach
+  # anybody, so learning that address buys the client nothing. It reaches
+  # advertise_addresses above directly, or it needs the relay.
+${MEDIACORE_ICE_SERVERS_BLOCK}
+
 video:
   dynacast_pause_delay_ms: 5000
   layer_upgrade_hold_ms: 2000

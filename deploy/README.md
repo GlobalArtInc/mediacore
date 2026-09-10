@@ -1,9 +1,11 @@
 # Deploying mediacore
 
-Three containers, one host, one URL. Someone opens it, types a name, and hears
-everyone else in the room. Audio by default; the camera stays off unless
-somebody ticks the box in the lobby. Point it at an identity provider and it
-stops asking for a name — see "Signing people in" below.
+Three containers, one host, one URL — and a fourth, off until it is asked for,
+which relays media for the clients whose own network will not carry it. Someone
+opens the URL, types a name, and hears everyone else in the room. Audio by
+default; the camera stays off unless somebody ticks the box in the lobby. Point
+it at an identity provider and it stops asking for a name — see "Signing people
+in" below.
 
 ```
                               the host
@@ -15,6 +17,7 @@ stops asking for a name — see "Signing people in" below.
         │    └── /         ──► front :8080  page, /api/token │
         │                                                    │
         │  sfu     7882/udp          media, not proxied      │
+        │  turn    3478/udp+tcp      a relay, off by default │
         └────────────────────────────────────────────────────┘
               ▲                              ▲
               │ https page, wss signalling   │ microphone audio
@@ -590,6 +593,329 @@ stuck in `in-progress` or `failed`, with bytes sent and zero received — the sa
 picture for both causes, which is why the host-side check above is the one that
 decides.
 
+A third possibility, once the host-side check shows packets arriving from
+everybody except one person: it is not this host's firewall but theirs, and no
+setting here will fix it. That is what the relay below is for.
+
+## Relaying media for clients that cannot reach the host (optional)
+
+Everything above assumes a browser can send a UDP packet to
+`MEDIACORE_ADVERTISE_IP:7882` and get one back. Nearly all of them can. The ones
+that cannot are on a network that will not pass it: UDP dropped outright, or
+allowed only towards a couple of well-known ports. A hotel, a hospital, a
+corporate laptop on a VPN. For those people the room is silent, and the server
+log is indistinguishable from case 2 and case 3 above.
+
+**It is the network's UDP policy and not the NAT**, which is worth saying
+because a relay is usually described as the cure for symmetric NAT. That is the
+peer-to-peer case. Here a client only ever talks to a server that already has a
+public address, and this server is ice-lite — it answers whoever reaches it and
+never has to reach anybody first — so whatever the NAT does to the client's
+source port is of no consequence. What decides is whether the packet is allowed
+out at all.
+
+A TURN server is the answer: a relay they *can* reach, which forwards their
+packets to the SFU and the SFU's back to them. `deploy/` ships one, and it does
+not run unless you ask for it.
+
+```
+openssl rand -hex 32                    # paste into MEDIACORE_TURN_SECRET in .env
+docker compose --profile turn up -d
+```
+
+`docker compose up` on its own never starts it: the service sits behind a
+compose profile, because a deployment that does not need a relay should not be
+running one more process on a public address than it has to. With
+`MEDIACORE_TURN_SECRET` empty the SFU renders no `ice_servers` at all and the
+browser is configured exactly as it was before this existed — a client offered
+a relay pointing at nothing spends its gathering time proving it, and that time
+is silence.
+
+**There is no password to distribute and none in the page.** coturn is started
+in its `use-auth-secret` mode, where a username is `<expiry>:<identity>` and the
+password is that username's HMAC-SHA1 under the shared secret. The SFU mints one
+per person as they join and sends it in the join response; coturn checks it by
+computing the same thing, with no user database anywhere. The consequences worth
+knowing: the credential expires (`MEDIACORE_TURN_TTL_SECONDS`, a day by
+default — long enough to outlast the call, because coturn re-checks it on every
+allocation refresh and not only at the start), it names the person in coturn's
+own log, and a stolen one is worth bandwidth through this one relay towards this
+one server.
+
+Ports the host must accept, on top of the table further up:
+
+| Port | Protocol | For |
+|---|---|---|
+| 3478 | UDP | the relay, for a client that may send UDP to 3478 but not to 7882 |
+| 3478 | TCP | the relay, for a client whose network drops UDP altogether |
+| 61000–61099 | UDP | the relayed media itself. `MEDIACORE_TURN_RELAY_*_PORT` |
+
+That range is one port per allocation and two allocations per person, because a
+client keeps a publisher transport and a subscriber transport and each is an ICE
+session of its own. Fifty people on the relay at once, as shipped.
+
+It starts above 60999 for a reason worth keeping if you widen it: a default
+Linux hands out 32768–60999 as ephemeral ports to everything else on the host,
+nothing keeps that machinery off a relay range, and an overlap is coturn losing
+an allocation to a port an outbound connection took first — on a busy day, not
+on the day it was configured. `sysctl net.ipv4.ip_local_port_range` says what
+this host actually does; a machine tuned for many outbound connections often has
+that range up against 65535 already, and then the relay range has to be carved
+out of it with the same sysctl.
+
+The `turn` service runs with `network_mode: host` rather than publishing those
+ports. Publishing a range means a docker userland proxy per port — a hundred
+processes, slow to start, each one a copy through userland in the middle of the
+media path — and it would rewrite the addresses the relay and its peers see of
+each other, which is what coturn's permission checks are made of. The cost is
+the isolation: coturn binds the host's own addresses, and this is Linux-only.
+
+**The relay is deliberately useless for anything but this server.**
+`turnserver.conf.template` denies the entire address space as a peer and then
+allows exactly one address back in — `MEDIACORE_TURN_ALLOWED_PEER_IP`, which
+follows `MEDIACORE_ADVERTISE_IP` unless you set it. Without that, a TURN server
+whose credentials anybody joining can obtain is an open proxy: a way to reach
+anything this host can reach — another container, the cloud provider's metadata
+service, a database on the LAN — from an address that is not the sender's.
+Somebody sweeping for one will find it. What the rule costs is that this coturn
+cannot be borrowed for anything else, which is the point of it.
+
+There are three ways to spend a day on TURN and still have a silent room. Each
+is below, and each is worth reading before rather than after.
+
+### 1. The relay has to reach the address the SFU advertises
+
+coturn is allowed exactly one peer, and it is the address in the SFU's ICE
+candidates. **Both on this host is the case that works**: the relayed packet
+leaves coturn addressed to the host's own public address, arrives at the
+published UDP port, and the answer comes back the same way. That is the default
+here, and it needs no thought.
+
+**coturn somewhere else while the SFU advertises a private address does not
+work, and it fails as silence.** The client reaches the relay, authenticates,
+gets its allocation, asks permission to talk to `10.0.0.5:7882`, and coturn —
+on a different network — sends into a void. Nothing errors: an allocation is not
+a connection, and TURN has no way to report that a peer never answered. On the
+SFU it looks exactly like case 2 above, right down to `rtp_packets=0`.
+
+So if the relay is not this host, `MEDIACORE_ADVERTISE_IP` has to be an address
+the relay can route to as well as the clients, and
+`MEDIACORE_TURN_ALLOWED_PEER_IP` has to name that same address. The same applies
+the day the advertised address changes: left empty the allow rule follows it,
+set by hand it does not, and what you get is
+
+```
+docker compose logs turn
+ERROR A peer IP 203.0.113.7 denied in the range: ::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+```
+
+which is the one failure in this whole section that says plainly what happened.
+
+### 2. TURN over TLS, and port 443
+
+Be clear about what each url cures, because they are not the same thing:
+
+- `turn:…?transport=udp` on 3478 cures **a network that passes UDP to a
+  well-known port and not to 7882**. It does nothing where UDP is dropped
+  outright, because it is UDP.
+- `turn:…?transport=tcp` on 3478 cures **a network that drops UDP but allows
+  outbound TCP anywhere**. This stack offers it already; for hotel and hospital
+  networks it is frequently the one that works.
+- `turns:` on **443** is the one that cures **a network that allows nothing out
+  but 443**, because it is then a TLS connection to port 443 like every other
+  one leaving that building.
+
+And 443 on this host belongs to Caddy: the page and the signalling WebSocket are
+there, and they cannot move without moving the site. The honest options are
+three, and there is no fourth:
+
+1. **A second address on the host.** The clean answer, and the one line to get
+   right is not in the `Caddyfile`. Caddy's listener on this host is docker's:
+   it comes from
+
+   ```yaml
+   ports:
+     - "80:80"
+     - "443:443"
+   ```
+
+   on the `caddy` service, which publishes on every address the host has and
+   installs a rule that catches anything arriving on those ports whatever
+   address it was sent to. A `bind` directive in the site block changes only
+   which address Caddy listens on inside its own bridge namespace, and leaves
+   coturn — on host networking — without 443 on the second address either way:
+   docker's own listener holds that port on every address the host has, and
+   traffic that did arrive on the second one would have been handed to Caddy by
+   that rule regardless. So pin the publish to the first address,
+
+   ```yaml
+   ports:
+     - "203.0.113.7:80:80"
+     - "203.0.113.7:443:443"
+   ```
+
+   and give coturn the second with `listening-ip=203.0.113.8` and
+   `tls-listening-port=443` in `turnserver.conf.template`. `listening-ip` is the
+   line the template deliberately does not carry — without it coturn discovers
+   the host's own addresses, which is what lets it work on a cloud VM whose
+   public address is on the provider's NAT and not on any interface here — so
+   this option also makes this host's addresses something a config file states
+   and somebody has to maintain. On most providers a second IP is a few minutes
+   and a small monthly charge.
+2. **SNI routing in front of both.** One listener on 443 reads the SNI out of
+   the TLS handshake and hands `turn.example.com` to coturn and
+   `meet.example.com` to Caddy — HAProxy, `sslh`, or Caddy's `layer4` module,
+   which is not in the stock `caddy` image and needs an `xcaddy` build. It works;
+   browsers do send SNI for `turns:`. It costs a component in front of
+   everything, a second name, and the relay seeing the proxy's address instead of
+   the client's — which matters to its logs and its per-IP quotas and to nothing
+   else here.
+3. **Accept 3478 and say so.** `turns:` on 5349, which is what this stack
+   configures when you give it certificate files, is TLS on a port that a 443-only
+   network blocks exactly as it blocks 3478. It buys you the networks that
+   inspect protocols but not ports, and nothing more. If the people who cannot
+   join are behind a corporate proxy with a 443 allowlist, option 3 will not
+   reach them and no tuning will change that.
+
+One trap to close: **443/udp is free on this host** — the `Caddyfile` turns
+HTTP/3 off deliberately — so it looks as though coturn's DTLS listener could
+have it. It cannot, twice over. Browsers implement `turns:` over TCP only, and
+a `turns:…?transport=udp` url is refused by Chrome and Firefox both; and there
+is no separate UDP port to point at 443 in any case, because DTLS shares
+`tls-listening-port` with TLS — one number for both listeners. There is also no
+listener to move: coturn 4.18 documents `--dtls` as "Start DTLS client
+listeners. DTLS is not started by default", nothing in
+`turnserver.conf.template` asks for one, and `no-dtls` is not a line worth
+adding — this coturn answers it with `WARNING Bad configuration format:
+no-dtls`.
+
+### 3. Caddy's certificate, and whether coturn can have it
+
+Caddy keeps what it fetches in the `caddy_data` volume, under a directory named
+after the issuer:
+
+```
+docker compose exec caddy ls /data/caddy/certificates
+acme-v02.api.letsencrypt.org-directory
+
+docker compose exec caddy ls /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/meet.example.com
+meet.example.com.crt  meet.example.com.json  meet.example.com.key
+```
+
+It is a real path and the volume can be mounted read-only into the turn
+container in one line. Do not do it. Three things have to be true at once for it
+to work, and all three fail quietly:
+
+- **The directory is named after the issuer, not after you.**
+  `acme-v02.api.letsencrypt.org-directory` today,
+  `acme.zerossl.com-v2-dv90-directory` if Caddy falls back to its second issuer,
+  which it will do on its own when Let's Encrypt refuses. A path written into a
+  config file is a guess that stops being true on a day nobody chose.
+- **The key is `0600` and owned by root**, because root is what Caddy runs as in
+  its image. Whether coturn can open it then depends on which user the coturn
+  image runs as, and if the answer is root you have arranged for a relay facing
+  the internet to run as root in order to read a certificate. What coturn does
+  with a key it cannot open is print one more warning among the certificate
+  warnings it prints anyway, and serve no TLS.
+- **Renewal.** Caddy replaces those files every sixty days without telling
+  anybody, and coturn reads its certificate once, at start. `SIGHUP` does not
+  reload it and neither does time — coturn 4.18 goes on serving the old
+  certificate until the process restarts. So the failure is TURN/TLS dying two
+  months after it was set up, on the one path your hardest-to-reach users take.
+
+**The honest answer is to give coturn its own certificate files.** Put
+`cert.pem` and `key.pem` in `deploy/certs`, uncomment the `certs` volume on the
+`turn` service, set `MEDIACORE_TURN_TLS_CERT` and `MEDIACORE_TURN_TLS_KEY`, and
+make `MEDIACORE_TURN_HOST` a name that certificate covers. Get them from
+`certbot` or `lego` for a `turn.` name of their own — those have a deploy hook,
+and the hook is exactly the right place for the `docker compose restart turn`
+that makes a renewed certificate take effect, which is the step everything else
+here is missing.
+
+### Checking that the relay actually relays
+
+The startup lines are the first thing to read. Both containers say what they
+decided:
+
+```
+docker compose logs sfu | grep start-sfu
+start-sfu: media will be advertised as 203.0.113.7:7882
+start-sfu: clients will also be offered turn:203.0.113.7:3478
+
+docker compose logs turn | grep start-turn
+start-turn: relaying on port 3478 for realm meet.example.com, advertising 203.0.113.7, peers limited to 203.0.113.7
+```
+
+`docker compose exec sfu cat /tmp/mediacore.yaml` and
+`docker compose exec turn cat /tmp/turnserver.conf` are the rendered truth if
+either line surprises you.
+
+Five lines in coturn's own log are noise, and knowing them costs less than
+chasing them:
+
+```
+ERROR no-cli option is deprecated, see --cli
+WARNING Certificate file not found or not readable: …/turn_server_cert.pem
+WARNING Private key file not found or not readable: …/turn_server_pkey.pem
+WARNING NO EXPLICIT LISTENER ADDRESS(ES) ARE CONFIGURED
+WARNING NO EXPLICIT RELAY ADDRESS(ES) ARE CONFIGURED
+```
+
+The first is a deprecation notice for a line that is there to keep the console
+off on older coturn. The certificate ones are printed even when coturn was told
+not to open a TLS listener at all — note that they name coturn's own built-in
+default paths, and only those: a warning naming a path out of `.env` is not
+noise and cannot reach the log anyway, because `start-turn.sh` refuses to start
+on a `MEDIACORE_TURN_TLS_CERT` or `_KEY` it cannot read a file at. The last two
+are the arrangement working as intended: no address is named, so coturn
+discovers the host's own, which is what lets it run on a cloud VM whose public
+address is not on any of its interfaces.
+
+Then prove the credential, which is the assertion worth the most here: a wrong
+one fails exactly like a firewall does, and looks the same from every side.
+coturn's own two test tools do it, and they come with coturn — in the image, or
+from `apt install coturn` or `brew install coturn` on any machine that can reach
+this one.
+
+```
+expiry=$(( $(date +%s) + 3600 ))
+user="$expiry:probe"
+cred=$(printf '%s' "$user" | openssl dgst -sha1 -hmac "$MEDIACORE_TURN_SECRET" -binary | openssl base64)
+
+docker compose exec -d turn turnutils_peer -L 203.0.113.7 -p 3480
+docker compose exec turn turnutils_uclient -u "$user" -w "$cred" \
+    -p 3478 -e 203.0.113.7 -r 3480 -n 3 -c 203.0.113.7
+```
+
+That mints a credential by hand exactly as the SFU mints one, allocates a relay
+port with it, and sends three packets through the relay to a peer standing where
+the SFU stands. `-e` is that peer and `-c` is a flag rather than an option —
+allocate no companion port for RTCP, which is what a browser does too — so the
+address at the end is the relay itself. Working, it ends:
+
+```
+start_mclient: tot_send_msgs=3, tot_recv_msgs=3
+Total lost packets 0 (0.000000%), total send dropped 0 (0.000000%)
+```
+
+Three sent and three received is the whole path: authentication, allocation,
+permission, and packets both ways. Anything else, read `docker compose logs
+turn` — it names the reason, and there are only ever four:
+
+| In the log | What it is |
+|---|---|
+| `Cannot find credentials of user <…>` | `MEDIACORE_TURN_SECRET` differs between the SFU and coturn: rotated in `.env` and only one of the two containers re-created (see the Notes), or the username was not minted from it |
+| `credentials of user <…> have expired` | the clock, or a `MEDIACORE_TURN_TTL_SECONDS` shorter than the call |
+| `A peer IP … denied in the range` | `MEDIACORE_TURN_ALLOWED_PEER_IP` is not the address the SFU advertises |
+| nothing at all | the client never reached 3478: firewall, security group, or a relay that is not where the clients were told it is |
+
+Finally, from a browser: `chrome://webrtc-internals` during a call, in the
+candidate-pair table, a pair whose local candidate type is `relay`. Only a
+client that needs the relay will use one — everyone else connects directly, and
+that is the intent. To make yourself into that client for a test, the shortest
+route is a phone on a mobile network with the host's UDP port closed in the
+firewall for a minute.
+
 ## Signing people in (optional)
 
 Out of the box anybody with the link types a name and joins. Point the front end
@@ -644,9 +970,28 @@ are honoured for the calls the front end makes to the provider.
 
 ## Notes
 
-- **Changing `.env`** takes effect on `docker compose up -d`; changing the
-  `Caddyfile` needs `docker compose restart caddy`, because the admin API is
-  turned off.
+- **Changing `.env`** takes effect on `docker compose up -d`, which re-creates
+  the containers whose environment changed. **With the relay running, that
+  command needs the profile** — `docker compose --profile turn up -d`, or
+  `COMPOSE_PROFILES=turn` in `.env` so it is said once for good. Without it the
+  `turn` service is not in the set compose acts on at all, so an edited
+  `MEDIACORE_TURN_SECRET` reaches the SFU and not coturn, and every allocation
+  is answered `401` for exactly the people who needed the relay. `restart` is no
+  substitute: it re-runs a container with the environment it was created with,
+  so it never picks up `.env`.
+- **Changing a file mounted from this directory** is the other half, and that
+  one is what `restart` is for: the `Caddyfile` needs
+  `docker compose restart caddy`, because the admin API is turned off, and
+  `turnserver.conf.template` — mounted here, rendered by `start-turn.sh` at
+  start, same shape as the SFU's config — needs `docker compose restart turn`.
+- **The relay is behind a profile**, and where that bites is narrower than it
+  looks. A command that names the service finds it either way: `logs turn`,
+  `restart turn`, `exec turn` all work without the flag, because compose enables
+  the profile of a service you asked for by name. It is the commands that act on
+  the whole set that do not see it — `up -d` and `pull` — and those want
+  `--profile turn`, or `COMPOSE_PROFILES=turn` in `.env`, which says it once for
+  all of them and is the form that makes a bare `docker compose up -d` do the
+  right thing after an edit to this file.
 - **Linux hosts that care about UDP throughput** can drop the port publishing
   and give the `sfu` service `network_mode: host`. The container then binds the
   host's ports directly, which removes docker's userland UDP proxy from the
@@ -657,9 +1002,14 @@ are honoured for the calls the front end makes to the provider.
   `caddy:2-alpine`). Pin them by digest for a deployment you intend to
   reproduce.
 - **Secrets.** `.env` is gitignored here. It holds the token-signing secret;
-  anyone with it can mint a token for any room and any identity. The `caddy`
-  service deliberately does not read `.env` — it is given only the two variables
-  it uses, so the signing secret is never in its environment.
+  anyone with it can mint a token for any room and any identity. The `caddy` and
+  `turn` services deliberately do not read `.env` — each is given the variables
+  it uses and nothing else, so the signing secret is never in the environment of
+  either, and both are images this repository does not build. `sfu` and `front`
+  do read the file, because both mint or verify those tokens and because between
+  them they read most of it: the OIDC pair, the branding, `HTTPS_PROXY` and
+  `NO_PROXY`. Naming their variables one by one instead would mean a `.env` line
+  that silently does nothing the day somebody adds one.
 - **The browser SDK is vendored**, not fetched. It lives in
   `crates/front/assets/vendor/`, is compiled into `mediacore-front` and is
   served from this origin under a version-stamped path, so there is no CDN in
@@ -667,7 +1017,8 @@ are honoured for the calls the front end makes to the provider.
   allow. See that directory's README to move to another version. swagger-ui,
   under `crates/server/assets/vendor/`, is vendored into the SFU on the same
   terms and for the same reasons.
-- **What this is not.** One node, no TURN, no recording switched on, and — unless you switch
+- **What this is not.** One node, no recording switched on, no relay unless you
+  start one, and — unless you switch
   signing in on — a room that anyone with the URL can join under any name. There
   *is* a room management API —
   `livekit.RoomService`, documented at `/swagger` — but it needs a token signed

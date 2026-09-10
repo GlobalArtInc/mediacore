@@ -75,6 +75,78 @@ case "$MEDIACORE_ADVERTISE_IP" in
 		;;
 esac
 
+# The relay this deployment offers its clients, if it offers one.
+#
+# The whole ice_servers block is built here rather than left in the template,
+# because substituting values into a template can fill a value in and cannot
+# leave a block out: a template that always emitted the entry would point every
+# client at `turn::3478` on a deployment that has no relay, and a client takes
+# that at its word and spends its gathering time proving it wrong.
+: "${MEDIACORE_TURN_SECRET:=}"
+MEDIACORE_ICE_SERVERS_BLOCK=""
+
+if [ -n "$MEDIACORE_TURN_SECRET" ]; then
+	# The relay is on this host unless it is said to be somewhere else, and
+	# the two port numbers are defaulted the same way in start-turn.sh, which
+	# is the side that opens them. They have to agree.
+	: "${MEDIACORE_TURN_HOST:=$MEDIACORE_ADVERTISE_IP}"
+	: "${MEDIACORE_TURN_PORT:=3478}"
+	: "${MEDIACORE_TURN_TLS_PORT:=5349}"
+	: "${MEDIACORE_TURN_TTL_SECONDS:=86400}"
+	: "${MEDIACORE_TURN_TLS_CERT:=}"
+	: "${MEDIACORE_TURN_TLS_KEY:=}"
+
+	# Unlike MEDIACORE_ADVERTISE_IP this one may be a name -- a turn: url is
+	# resolved by the client, and a name is what a certificate can be checked
+	# against -- but it is still a host and not a url.
+	case "$MEDIACORE_TURN_HOST" in
+		*://*|*/*|*[[:space:]]*)
+			fail "MEDIACORE_TURN_HOST is \`$MEDIACORE_TURN_HOST\`; it is the host part of a turn: url, so no scheme, no path and no spaces"
+			;;
+	esac
+
+	case "$MEDIACORE_TURN_TTL_SECONDS" in
+		''|*[!0-9]*) fail "MEDIACORE_TURN_TTL_SECONDS is \`$MEDIACORE_TURN_TTL_SECONDS\`, which is not a number of seconds" ;;
+	esac
+	[ "$MEDIACORE_TURN_TTL_SECONDS" -gt 0 ] || fail "MEDIACORE_TURN_TTL_SECONDS is 0, so every credential minted has expired before the client it was minted for receives it"
+
+	# The secret is written into a double-quoted YAML scalar, where a quote or
+	# a backslash would end the string early and hand the relay half a secret,
+	# which authenticates nobody and says nothing about why.
+	case "$MEDIACORE_TURN_SECRET" in
+		*'"'*|*\\*) fail "MEDIACORE_TURN_SECRET contains a quote or a backslash; keep it to hex or letters and digits, because it is written into a YAML file" ;;
+	esac
+
+	ice_urls="        - \"turn:$MEDIACORE_TURN_HOST:$MEDIACORE_TURN_PORT?transport=udp\"
+        - \"turn:$MEDIACORE_TURN_HOST:$MEDIACORE_TURN_PORT?transport=tcp\""
+
+	# Certificate files are coturn's to read and this container never sees
+	# them; what their being named decides here is whether clients are told
+	# there is a turns: url to try at all. Offering one that nothing listens on
+	# costs a client the wait.
+	#
+	# Both names or neither, which is the same rule start-turn.sh enforces on
+	# the side that opens the listener: with half a pair coturn opens none, and
+	# a turns: url offered against that is the wait with nothing at the end of
+	# it. Said rather than refused, because this container's own job -- media on
+	# the udp port -- is untouched by it, and the relay is behind a profile that
+	# may not even be running. The relay itself refuses to start, and it is also
+	# the only one of the two that can tell a named path from a readable file.
+	if [ -n "$MEDIACORE_TURN_TLS_CERT" ] && [ -n "$MEDIACORE_TURN_TLS_KEY" ]; then
+		ice_urls="$ice_urls
+        - \"turns:$MEDIACORE_TURN_HOST:$MEDIACORE_TURN_TLS_PORT?transport=tcp\""
+	elif [ -n "$MEDIACORE_TURN_TLS_CERT$MEDIACORE_TURN_TLS_KEY" ]; then
+		echo "start-sfu: only one of MEDIACORE_TURN_TLS_CERT and MEDIACORE_TURN_TLS_KEY is set; coturn opens no TLS listener on half a pair, so no turns: url is offered" >&2
+	fi
+
+	MEDIACORE_ICE_SERVERS_BLOCK="  ice_servers:
+    - urls:
+$ice_urls
+      secret: \"$MEDIACORE_TURN_SECRET\"
+      ttl_seconds: $MEDIACORE_TURN_TTL_SECONDS"
+fi
+export MEDIACORE_ICE_SERVERS_BLOCK
+
 umask 077
 # Unset, these render empty, which the server reads as "no database, no
 # recording" -- the single-process stack. Only the four checked at the top are
@@ -90,9 +162,13 @@ export MEDIACORE_POSTGRES_URL MEDIACORE_RECORDING_ENABLED MEDIACORE_S3_ENDPOINT 
 	MEDIACORE_S3_REGION MEDIACORE_S3_BUCKET MEDIACORE_S3_ACCESS_KEY_ID \
 	MEDIACORE_S3_SECRET_ACCESS_KEY
 
-envsubst '${MEDIACORE_LOG_LEVEL} ${MEDIACORE_API_KEY} ${MEDIACORE_API_SECRET} ${MEDIACORE_RTC_UDP_PORT} ${MEDIACORE_ADVERTISE_IP} ${MEDIACORE_POSTGRES_URL} ${MEDIACORE_RECORDING_ENABLED} ${MEDIACORE_S3_ENDPOINT} ${MEDIACORE_S3_REGION} ${MEDIACORE_S3_BUCKET} ${MEDIACORE_S3_ACCESS_KEY_ID} ${MEDIACORE_S3_SECRET_ACCESS_KEY}' \
+envsubst '${MEDIACORE_LOG_LEVEL} ${MEDIACORE_API_KEY} ${MEDIACORE_API_SECRET} ${MEDIACORE_RTC_UDP_PORT} ${MEDIACORE_ADVERTISE_IP} ${MEDIACORE_POSTGRES_URL} ${MEDIACORE_RECORDING_ENABLED} ${MEDIACORE_S3_ENDPOINT} ${MEDIACORE_S3_REGION} ${MEDIACORE_S3_BUCKET} ${MEDIACORE_S3_ACCESS_KEY_ID} ${MEDIACORE_S3_SECRET_ACCESS_KEY} ${MEDIACORE_ICE_SERVERS_BLOCK}' \
 	<"$TEMPLATE" >"$RENDERED"
 
 echo "start-sfu: media will be advertised as $MEDIACORE_ADVERTISE_IP:$MEDIACORE_RTC_UDP_PORT" >&2
+
+if [ -n "$MEDIACORE_ICE_SERVERS_BLOCK" ]; then
+	echo "start-sfu: clients will also be offered turn:$MEDIACORE_TURN_HOST:$MEDIACORE_TURN_PORT" >&2
+fi
 
 exec /usr/local/bin/mediacore --config "$RENDERED"

@@ -1,0 +1,155 @@
+# Rendered by deploy/start-turn.sh at container start; the result is what coturn
+# reads. start-turn.sh refuses to start when one of the values that cannot have
+# a sensible default is empty, and every ${...} below comes from deploy/.env.
+#
+# The SFU's template next door is rendered with envsubst and this one is not.
+# That is not a preference: envsubst is in the mediacore image because its
+# Dockerfile puts it there, and this is somebody else's image, in which a shell
+# and sed are the only things worth counting on.
+#
+# Two of the placeholders here are not variables from deploy/.env at all.
+# ${MEDIACORE_TURN_TLS_ON} and ${MEDIACORE_TURN_TLS_OFF} render as either
+# nothing or a `#`, so exactly one of the two TLS groups at the bottom survives
+# into the rendered file -- and the one that did not is still there, commented
+# out, where somebody reading it can see which way it went.
+
+# What clients are told to reach the relay on. coturn opens this number for UDP
+# and for TCP both, and the TCP listener is not decoration: a client on a
+# network that drops UDP outright still gets in over it, and pays in latency
+# for it.
+listening-port=${MEDIACORE_TURN_PORT}
+
+# No listening-ip, deliberately. On host networking coturn discovers the
+# addresses the host actually has, which is the only thing that works on a cloud
+# VM: its NIC holds a private address, the public one lives on the provider's
+# NAT, and there is nothing there to bind. Advertising the public address is
+# external-ip's job, below.
+
+# The name coturn puts in the 401 it answers an unauthenticated client with.
+# Under use-auth-secret it is not a lookup key -- there is no user table to look
+# anything up in -- so it only has to be stable and to mean something in a log.
+realm=${MEDIACORE_TURN_REALM}
+
+# THE TWO LINES THAT HAVE TO AGREE WITH THE SFU. use-auth-secret is coturn's
+# REST-API mode: a username is `<unix expiry>:<identity>`, the password is that
+# username's HMAC-SHA1 under the secret below in base64, and coturn checks a
+# client by computing the same thing rather than by looking anybody up. The SFU
+# mints one per person as they join, out of rtc.ice_servers[].secret, which
+# deploy/.env fills from this same variable. Two different values authenticate
+# nobody: every allocation is answered 401, and the clients that needed the
+# relay -- only those, which is the part that makes it hard to see -- are silent.
+use-auth-secret
+static-auth-secret=${MEDIACORE_TURN_SECRET}
+
+# The address coturn hands out in the relayed candidate, which is where a client
+# will send its microphone. The same class of mistake as MEDIACORE_ADVERTISE_IP
+# and the same symptom: wrong here, and the allocation succeeds, the candidate
+# is offered, and not one packet arrives. The `public/private` form is for a
+# host behind NAT -- `203.0.113.7/10.0.0.5` says advertise the first, bind the
+# second.
+external-ip=${MEDIACORE_TURN_EXTERNAL_IP}
+
+# One UDP port per allocation, and a client makes two allocations rather than
+# one: it keeps a publisher transport and a subscriber transport, and each is
+# an ICE session of its own. So this range is twice the number of people who
+# can be on the relay at once, and it is a firewall rule that has to be opened
+# as UDP. Somewhere clear of the host's own ephemeral range, or coturn will
+# eventually try to bind a port something else already took.
+min-port=${MEDIACORE_TURN_RELAY_MIN_PORT}
+max-port=${MEDIACORE_TURN_RELAY_MAX_PORT}
+
+# THE LINES THAT KEEP THIS FROM BEING AN OPEN PROXY, and the reason a TURN
+# server is worth being careful with at all. A relay that will carry a packet
+# anywhere is a way to reach anything this host can reach -- other containers,
+# the metadata service, a database on the LAN -- from an address that is not the
+# sender's, and somebody sweeping the internet for one will find it within days
+# of it existing. So the whole address space is denied and the SFU is named back
+# in. Deny is the floor and allow wins over it, which is coturn's own documented
+# shape for "ban a range except for these".
+#
+# What it costs, stated plainly: this relay is useful for nothing but this
+# server. That is the intent. Add another allowed-peer-ip line if the SFU moves
+# or there is a second one -- coturn takes as many as you write, and each takes
+# an `a.b.c.d-e.f.g.h` range as readily as a single address.
+#
+# Loopback peers are refused by coturn unless allow-loopback-peers is set, and
+# it is deliberately not set: an SFU reached over 127.0.0.1 would make this a
+# relay onto whatever else answers on this host's loopback. It costs nothing
+# here, because an SFU whose advertised address is loopback has no clients off
+# this machine to relay for anyway.
+#
+# Two deny lines because there are two address families to deny. coturn reports
+# a refused ipv4 peer as denied "in the range ::-ffff:..." -- it compares in
+# ipv6 terms, where an ipv4 address is a mapped one -- so a v4 address named
+# against the second line in the log is that, and not a line in the wrong place.
+denied-peer-ip=0.0.0.0-255.255.255.255
+denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+allowed-peer-ip=${MEDIACORE_TURN_ALLOWED_PEER_IP}
+
+# Broadcast and multicast addresses are peers nobody relays to on purpose, and
+# they are the cheap way to turn one packet into many.
+no-multicast-peers
+
+# WebRTC never asks for a TCP relay transport (RFC 6062). Refusing it takes a
+# whole kind of connection out of a process that faces the internet.
+no-tcp-relay
+
+# No no-dtls line, and not by oversight: coturn does not start a DTLS listener
+# unless `dtls` asks for one, and `no-dtls` is not an option this coturn knows
+# -- 4.18 answers it with `WARNING Bad configuration format: no-dtls` and goes
+# on. Nothing here asks for DTLS, so nothing here has to turn it off; browsers
+# speak turns: over TCP only and the SFU next door never offers anything else.
+
+# FINGERPRINT on coturn's own messages. A browser multiplexes STUN, DTLS and RTP
+# on one socket and tells them apart by their first bytes; this is what makes
+# that reliable rather than nearly reliable.
+fingerprint
+
+# NOT the CLI. coturn's telnet console has no password by default, and under
+# host networking it would be a console on this host's 127.0.0.1:5766 for
+# anything else that runs here. coturn 4.7 and later have it off by default and
+# answer this line with `ERROR no-cli option is deprecated, see --cli`, which is
+# a deprecation notice and not a failure; the line stays because the image tag
+# floats and 4.6, with the console on, is still out there.
+no-cli
+
+# The log goes to stdout, where `docker compose logs turn` reads it. simple-log
+# stops coturn decorating the file name with a pid and a date, which it does
+# even when the name is stdout.
+log-file=stdout
+simple-log
+
+# Uncomment for the per-packet story when a client is being refused and the log
+# will not say why. It is loud. This file is mounted from the host and rendered
+# at start, so `docker compose restart turn` is all an edit needs.
+#verbose
+
+# coturn writes a pid file and complains for a while when it cannot. /var/tmp is
+# writable whoever the image decided to run as.
+pidfile=/var/tmp/turnserver.pid
+
+# Concurrent allocations, per user and in total, if this relay ever needs a
+# ceiling. Left unset on purpose: a refused allocation looks, to the person
+# refused, exactly like the silence this service exists to cure, so it is a
+# limit to impose deliberately and not by default.
+#user-quota=12
+#total-quota=1200
+
+# --- TLS, or the lack of it ------------------------------------------------
+#
+# Exactly one of the two groups below is live in the rendered file.
+#
+# MEDIACORE_TURN_TLS_CERT and _KEY name files mounted into this container:
+# coturn opens a TLS listener, and the SFU puts a turns: url in what clients are
+# told. Neither is set: no listener, and no reason for one -- turn: over TCP
+# already carries a client whose network merely drops UDP, and TLS earns its
+# keep only where the port itself has to look like something else. "TURN over
+# TLS, and port 443" in deploy/README.md is that argument in full.
+#
+# coturn prints two warnings about certificate files it cannot find even here,
+# where it was told not to open a TLS listener at all. They are noise from a
+# check that runs before the flag is read, and there is nothing to fix.
+${MEDIACORE_TURN_TLS_OFF}no-tls
+${MEDIACORE_TURN_TLS_ON}tls-listening-port=${MEDIACORE_TURN_TLS_PORT}
+${MEDIACORE_TURN_TLS_ON}cert=${MEDIACORE_TURN_TLS_CERT}
+${MEDIACORE_TURN_TLS_ON}pkey=${MEDIACORE_TURN_TLS_KEY}

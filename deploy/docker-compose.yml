@@ -1,11 +1,14 @@
 name: mediacore
 
-# Three containers:
+# Three containers, and a fourth that starts only when it is asked for:
 #   caddy  terminates TLS, serves the front end at / and proxies /rtc, /twirp
 #          and /swagger to the SFU
 #   front  the page and the token endpoint
 #   sfu    signalling on 7880, the room service API and its documentation page,
 #          and, crucially, media on UDP straight from the host
+#   turn   a relay for clients that cannot reach that UDP port at all. Behind a
+#          compose profile: `docker compose up` does not start it, because a
+#          deployment that does not need a relay must not be made to run one
 #
 # Media never passes through Caddy. The UDP port is published on the host and the
 # SFU tells every client to send media to MEDIACORE_ADVERTISE_IP on that port.
@@ -37,6 +40,34 @@ services:
       MEDIACORE_ADVERTISE_IP: ${MEDIACORE_ADVERTISE_IP:?set MEDIACORE_ADVERTISE_IP in deploy/.env to the ip address clients reach this host on, e.g. 203.0.113.7}
       MEDIACORE_RTC_UDP_PORT: ${MEDIACORE_RTC_UDP_PORT:-7882}
       MEDIACORE_LOG_LEVEL: ${MEDIACORE_LOG_LEVEL:-info}
+      # Every MEDIACORE_TURN_* this container reads is named here, although
+      # `env_file` above would already carry all of them, and the reason is
+      # precedence rather than tidiness. A variable exported in the operator's
+      # shell -- a provisioning script, a sourced file, a CI runner, or
+      # `MEDIACORE_TURN_SECRET=$(openssl rand -hex 32) docker compose ... up` --
+      # wins over an interpolated ${VAR} here and loses to a line in a file
+      # named by `env_file`. The turn service below has no `env_file` and must
+      # not be given one -- that would hand a relay the token-signing secret --
+      # so it resolves these by interpolation; taking them from the file on this
+      # side would have the two halves signing and checking with different
+      # secrets the moment one is exported. What that looks like is 401 on every
+      # allocation, for exactly the clients the relay was started for, with
+      # nothing in this container's log about it.
+      #
+      # No ${VAR:?...} guards, for the reason spelled out on the turn service:
+      # a relay nobody asked for must cost nobody a refusal. Empty is how this
+      # stack ships and start-sfu.sh reads empty as "no relay".
+      MEDIACORE_TURN_SECRET: ${MEDIACORE_TURN_SECRET:-}
+      MEDIACORE_TURN_HOST: ${MEDIACORE_TURN_HOST:-}
+      MEDIACORE_TURN_PORT: ${MEDIACORE_TURN_PORT:-}
+      MEDIACORE_TURN_TTL_SECONDS: ${MEDIACORE_TURN_TTL_SECONDS:-}
+      MEDIACORE_TURN_TLS_PORT: ${MEDIACORE_TURN_TLS_PORT:-}
+      # Paths in the turn container, which this one cannot read. Named here
+      # because whether they are set is what decides that clients are offered a
+      # turns: url at all, and that decision has to be made from the same
+      # values coturn was started with.
+      MEDIACORE_TURN_TLS_CERT: ${MEDIACORE_TURN_TLS_CERT:-}
+      MEDIACORE_TURN_TLS_KEY: ${MEDIACORE_TURN_TLS_KEY:-}
     command: ["/bin/sh", "/etc/mediacore/start-sfu.sh"]
     volumes:
       - ./mediacore.yaml.template:/etc/mediacore/mediacore.yaml.template:ro
@@ -147,6 +178,94 @@ services:
       # key.pem in deploy/certs, uncomment, and set
       # MEDIACORE_TLS="/certs/cert.pem /certs/key.pem".
       # - ./certs:/certs:ro
+
+  turn:
+    # Not started by `docker compose up`. `docker compose --profile turn up -d`
+    # brings it in, and so does COMPOSE_PROFILES=turn in .env or in the shell,
+    # which is the form to want: `up -d` and `pull` act on the set of services
+    # the profiles decide, so without one of the two an edit to .env re-creates
+    # the sfu with a new secret and leaves this container running with the old
+    # one. Commands that name the service -- `logs turn`, `restart turn`,
+    # `exec turn` -- need neither.
+    #
+    # Off by default because most deployments do not need it: a relay is for
+    # the clients whose own network will not let them reach the SFU's UDP port,
+    # and one that is not needed is one more process listening on the internet.
+    profiles: ["turn"]
+    # Any coturn from 4.5 on understands this configuration. The tag floats
+    # like the rest of them here; pin it by digest for a deployment you intend
+    # to reproduce.
+    image: coturn/coturn:4
+    restart: unless-stopped
+    # THE REASON THERE IS NO PUBLISHED PORT RANGE HERE. coturn hands out one
+    # UDP port per allocation from the relay range, and publishing a range
+    # gives docker a userland proxy per port: a hundred processes for a hundred
+    # ports, slow to start, and every one of them a copy through userland in the
+    # middle of the media path. It would also rewrite the addresses the relay
+    # and its peers see of each other, which is exactly what coturn's
+    # permissions are made of.
+    #
+    # What host networking costs is the isolation: coturn binds the host's own
+    # addresses, the relay range is the host's, and a `ports:` block here would
+    # do nothing. Linux only -- Docker Desktop on macOS and Windows runs a VM,
+    # and its "host" is not the machine you are sitting at.
+    network_mode: host
+    # No depends_on. The relay never talks to the SFU: it forwards packets
+    # towards the address clients were told to send media to, whoever happens
+    # to be listening there, and it has nothing to wait for at startup.
+    #
+    # No env_file either, for the reason caddy has none: this container has no
+    # business with the token-signing secret, and .env would hand it the whole
+    # file. It gets the variables it reads and nothing else.
+    environment:
+      # None of these carry a ${VAR:?...} guard, and this is the one service in
+      # this file where a guard would be wrong: compose interpolates every
+      # service before it decides which profiles are running, so a required
+      # variable here would stop `docker compose up` for every deployment that
+      # never asked for a relay. start-turn.sh refuses instead, with the same
+      # explanations, when the relay is actually being started.
+      #
+      # The sfu service names every one of these that it reads too, in the same
+      # interpolated form, so the two containers cannot end up resolving the
+      # shared secret from different places. See the note there.
+      MEDIACORE_TURN_SECRET: ${MEDIACORE_TURN_SECRET:-}
+      MEDIACORE_TURN_PORT: ${MEDIACORE_TURN_PORT:-}
+      MEDIACORE_TURN_REALM: ${MEDIACORE_TURN_REALM:-}
+      MEDIACORE_TURN_EXTERNAL_IP: ${MEDIACORE_TURN_EXTERNAL_IP:-}
+      MEDIACORE_TURN_ALLOWED_PEER_IP: ${MEDIACORE_TURN_ALLOWED_PEER_IP:-}
+      MEDIACORE_TURN_RELAY_MIN_PORT: ${MEDIACORE_TURN_RELAY_MIN_PORT:-}
+      MEDIACORE_TURN_RELAY_MAX_PORT: ${MEDIACORE_TURN_RELAY_MAX_PORT:-}
+      MEDIACORE_TURN_TLS_PORT: ${MEDIACORE_TURN_TLS_PORT:-}
+      MEDIACORE_TURN_TLS_CERT: ${MEDIACORE_TURN_TLS_CERT:-}
+      MEDIACORE_TURN_TLS_KEY: ${MEDIACORE_TURN_TLS_KEY:-}
+      # The realm, the address to advertise and the one peer this relay may
+      # reach all follow the rest of the deployment when they are not set for
+      # themselves. start-turn.sh does that, and these two are what it needs to.
+      MEDIACORE_PUBLIC_HOST: ${MEDIACORE_PUBLIC_HOST:-}
+      MEDIACORE_ADVERTISE_IP: ${MEDIACORE_ADVERTISE_IP:-}
+    # entrypoint, not command: the coturn image has an entrypoint of its own
+    # that runs turnserver, so a command here would arrive as arguments to
+    # turnserver rather than being run at all -- the same trap the caddy service
+    # above has a note about.
+    entrypoint: ["/bin/sh", "/etc/coturn/start-turn.sh"]
+    volumes:
+      - ./turnserver.conf.template:/etc/coturn/turnserver.conf.template:ro
+      - ./start-turn.sh:/etc/coturn/start-turn.sh:ro
+      # For turns: -- TURN over TLS. Put cert.pem and key.pem in deploy/certs,
+      # uncomment, and set MEDIACORE_TURN_TLS_CERT=/certs/cert.pem and
+      # MEDIACORE_TURN_TLS_KEY=/certs/key.pem. Setting those two and leaving
+      # this line commented is how it is got wrong; start-turn.sh refuses to
+      # start on a path it cannot read a file at, rather than let coturn open no
+      # listener while the SFU tells clients there is a turns: url. Read "TURN
+      # over TLS, and port 443" in README.md first: what this cures and what it
+      # does not is worth knowing before spending an afternoon on it.
+      # - ./certs:/certs:ro
+    # No healthcheck. Nothing in this stack waits on the relay -- clients are
+    # told about it and reach the SFU directly whenever they can -- and the
+    # only honest check would be to authenticate and allocate, which needs
+    # a credential this container has no way to mint. `docker compose logs turn`
+    # is where a refusal shows up, and README.md has the one-line uclient
+    # command that proves the whole path.
 
 volumes:
   caddy_data:

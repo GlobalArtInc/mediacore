@@ -29,7 +29,33 @@ fn bare() -> Vec<(&'static str, &'static str)> {
         ("MEDIACORE_S3_BUCKET", ""),
         ("MEDIACORE_S3_ACCESS_KEY_ID", ""),
         ("MEDIACORE_S3_SECRET_ACCESS_KEY", ""),
+        ("MEDIACORE_ICE_SERVERS_BLOCK", ""),
     ]
+}
+
+/// What `start-sfu.sh` builds when `MEDIACORE_TURN_SECRET` is set, copied from
+/// it verbatim -- the indentation included, because that is the whole of what
+/// makes these lines a member of `rtc:` rather than a top-level key the server
+/// refuses.
+const ICE_SERVERS_BLOCK: &str = r#"  ice_servers:
+    - urls:
+        - "turn:turn.example.com:3478?transport=udp"
+        - "turn:turn.example.com:3478?transport=tcp"
+        - "turns:turn.example.com:5349?transport=tcp"
+      secret: "0123456789abcdef0123456789abcdef"
+      ttl_seconds: 86400"#;
+
+/// The same stack with the relay switched on: `MEDIACORE_TURN_SECRET` set, and
+/// certificate files named, which is the longest of the three shapes
+/// `start-sfu.sh` emits.
+fn relaying() -> Vec<(&'static str, &'static str)> {
+    let mut values = bare();
+    for (name, value) in &mut values {
+        if *name == "MEDIACORE_ICE_SERVERS_BLOCK" {
+            *value = ICE_SERVERS_BLOCK;
+        }
+    }
+    values
 }
 
 /// The same stack with the recording switched on: a database and a bucket.
@@ -88,6 +114,27 @@ fn the_stack_with_recording_switched_on_is_a_config_the_server_accepts() {
     assert!(config.sessions.in_postgres());
     assert!(config.recording.enabled);
     assert_eq!(config.recording.s3.bucket, "mediacore");
+}
+
+/// The relay is configured in one place a template cannot reach: `start-sfu.sh`
+/// builds the whole `ice_servers` block, because a template can fill a value in
+/// and cannot leave a block out. So the yaml it writes is checked here, where a
+/// wrong indent or a missing quote is a test and not a crash loop on a host with
+/// people waiting in a room.
+#[test]
+fn the_stack_with_the_relay_switched_on_is_a_config_the_server_accepts() {
+    let config = Config::parse(&render(&relaying())).expect("the rendered config was refused");
+
+    let [relay] = &config.rtc.ice_servers[..] else {
+        panic!(
+            "expected exactly one ice server, got {:?}",
+            config.rtc.ice_servers
+        );
+    };
+    assert_eq!(relay.urls.len(), 3);
+    assert_eq!(relay.secret, "0123456789abcdef0123456789abcdef");
+    assert_eq!(relay.ttl_seconds, 86400);
+    assert!(relay.username.is_empty());
 }
 
 /// `envsubst` is given an explicit list of names, and substitutes only those.
