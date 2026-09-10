@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{any, get};
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
@@ -204,8 +204,18 @@ async fn healthz(State(state): State<AppState>) -> String {
 async fn validate(
     State(state): State<AppState>,
     Query(query): Query<SignalQuery>,
+    headers: HeaderMap,
 ) -> (StatusCode, String) {
-    match mediacore_auth::verify_join(&query.access_token, &state.config.keys) {
+    let Some(token) = signal::token_from(&query, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "no pass on the request: put it in `access_token` or in an `Authorization: Bearer` \
+             header"
+                .to_owned(),
+        );
+    };
+
+    match mediacore_auth::verify_join(token, &state.config.keys) {
         Ok(claims) => (StatusCode::OK, claims.identity().to_owned()),
         Err(error) => (StatusCode::UNAUTHORIZED, error.to_string()),
     }

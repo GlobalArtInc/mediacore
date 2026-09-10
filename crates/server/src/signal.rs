@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
@@ -27,6 +27,13 @@ const PING_INTERVAL_SECONDS: i32 = 15;
 
 #[derive(Debug, Deserialize)]
 pub struct SignalQuery {
+    /// The pass, when the client puts it in the address.
+    ///
+    /// Optional because a client is equally entitled to put it in an
+    /// `Authorization: Bearer` header, and the newer server SDKs only do that.
+    /// A connection carrying neither is refused by `token_from`, so this being
+    /// absent is not the same as being allowed in without one.
+    #[serde(default)]
     pub access_token: String,
     #[serde(default)]
     pub protocol: Option<i32>,
@@ -62,9 +69,24 @@ impl SignalQuery {
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<SignalQuery>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let claims = match mediacore_auth::verify_join(&query.access_token, &state.config.keys) {
+    let token = match token_from(&query, &headers) {
+        Some(token) => token,
+        None => {
+            tracing::info!("rejecting a signal connection that carries no pass");
+            return (
+                StatusCode::UNAUTHORIZED,
+                "no pass on the connection: put it in `access_token` or in an `Authorization: \
+                 Bearer` header"
+                    .to_owned(),
+            )
+                .into_response();
+        }
+    };
+
+    let claims = match mediacore_auth::verify_join(token, &state.config.keys) {
         Ok(claims) => claims,
         Err(error) => {
             tracing::info!(%error, "rejecting signal connection");
@@ -594,6 +616,22 @@ fn permission_from(grant: &VideoGrant) -> mediacore::ParticipantPermission {
         hidden: grant.hidden(),
         ..Default::default()
     }
+}
+
+/// The pass on a signal connection, from wherever this client put it.
+///
+/// Browsers put it in the address, because a browser cannot set a header on a
+/// websocket handshake. Every server SDK used to do the same and the newer ones
+/// no longer do: they send `Authorization: Bearer` on both the handshake and
+/// the validate request, and a server reading only the query answers 400 to
+/// every one of them. Both are read, the header first, because a client that
+/// sent both meant the one it went out of its way to set.
+pub fn token_from<'a>(query: &'a SignalQuery, headers: &'a HeaderMap) -> Option<&'a str> {
+    if let Ok(token) = crate::twirp::bearer(headers) {
+        return Some(token);
+    }
+
+    Some(query.access_token.as_str()).filter(|token| !token.is_empty())
 }
 
 fn kind_from(claims: &Claims) -> ParticipantKind {
