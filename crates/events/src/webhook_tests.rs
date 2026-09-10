@@ -22,11 +22,17 @@ fn event() -> Event {
     })
 }
 
-/// What a LiveKit receiver does, step for step: take the bearer token,
-/// verify it with the secret belonging to the key in `iss`, then check
+/// What a LiveKit receiver does, step for step: take the header value whole
+/// and verify it with the secret belonging to the key in `iss`, then check
 /// that the base64 SHA-256 of the body it read equals the token's `sha256`
 /// claim. If any of this stops being true, an existing deployment starts
 /// answering 401 to every event and nothing here would otherwise notice.
+///
+/// Whole is the word that matters. `WebhookReceiver::receive` hands the header
+/// to its verifier without stripping a scheme, so this test verifies exactly
+/// what it is given -- an earlier version of it stripped a `Bearer ` prefix
+/// first and therefore agreed with a server that no LiveKit receiver could
+/// read. The interop job caught that; this assertion is what would have.
 #[test]
 fn a_receiver_verifies_the_token_and_the_body_the_way_livekit_does() {
     let webhook = webhook();
@@ -34,9 +40,12 @@ fn a_receiver_verifies_the_token_and_the_body_the_way_livekit_does() {
     let body = event.payload(0);
 
     let header = webhook.authorization(&body).expect("the webhook is signed");
-    let token = header
-        .strip_prefix("Bearer ")
-        .expect("LiveKit's receiver reads the token after `Bearer `, and there is none");
+    assert!(
+        !header.starts_with("Bearer "),
+        "the header carries a scheme LiveKit's receiver does not strip, so the token it verifies \
+         is `Bearer eyJ…` and no signature over it can ever check out"
+    );
+    let token = header.as_str();
 
     let keys = HashMap::from([(API_KEY.to_owned(), API_SECRET.to_owned())]);
     let claims = mediacore_auth::verify(token, &keys)
@@ -72,7 +81,7 @@ fn the_signature_is_over_the_bytes_that_are_actually_sent() {
 
     let header = webhook.authorization(&body).unwrap();
     let keys = HashMap::from([(API_KEY.to_owned(), API_SECRET.to_owned())]);
-    let claims = mediacore_auth::verify(header.strip_prefix("Bearer ").unwrap(), &keys).unwrap();
+    let claims = mediacore_auth::verify(&header, &keys).unwrap();
 
     assert_ne!(
         claims.sha256,

@@ -12,14 +12,20 @@
 //! ```text
 //! POST /hook HTTP/1.1
 //! Content-Type: application/webhook+json
-//! Authorization: Bearer eyJhbGciOiJIUzI1NiIs…
+//! Authorization: eyJhbGciOiJIUzI1NiIs…
 //!
 //! {"event":"participant_joined","room":{…},"participant":{…},
 //!  "id":"EV_1f0c9a2b7d34","createdAt":"1757155200"}
 //! ```
 //!
 //! The token is a short-lived JWT signed with the API secret, carrying the
-//! base64 of the SHA-256 of the body in its `sha256` claim. A receiver
+//! base64 of the SHA-256 of the body in its `sha256` claim. It is the bare
+//! token, with no `Bearer ` in front of it: LiveKit's `WebhookReceiver` hands
+//! the header value straight to its token verifier without stripping a scheme,
+//! so a `Bearer ` prefix makes every event unverifiable to every receiver
+//! built on their SDK. The other direction is the opposite -- a *call* to the
+//! room service does carry `Bearer` -- and it is the mismatch between the two
+//! that makes this worth writing down. A receiver
 //! verifies the signature to know the request came from this server, and the
 //! digest to know the body it just read is the body that was signed -- the
 //! second half is what makes the first half worth anything, because a
@@ -117,6 +123,10 @@ impl Webhook {
     }
 
     /// The `Authorization` header's value for one body.
+    ///
+    /// The token alone. `WebhookReceiver::receive` in `livekit-server-sdk`
+    /// passes this value to `TokenVerifier::verify` unchanged, so anything in
+    /// front of the token is part of the token as far as it is concerned.
     fn authorization(&self, body: &[u8]) -> Result<String, DeliveryError> {
         let issued_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -134,7 +144,7 @@ impl Webhook {
             DeliveryError::new(format!("the webhook could not be signed: {error}"))
         })?;
 
-        Ok(format!("Bearer {token}"))
+        Ok(token)
     }
 }
 

@@ -250,11 +250,12 @@ async fn an_event_arrives_signed_the_way_a_livekit_receiver_expects() {
          something else entirely"
     );
 
-    let token = request
-        .header("authorization")
-        .strip_prefix("Bearer ")
-        .expect("no bearer token on the request")
-        .to_owned();
+    let token = request.header("authorization").to_owned();
+    assert!(
+        !token.starts_with("Bearer "),
+        "LiveKit's WebhookReceiver verifies the header value as it stands, so a scheme in front \
+         of the token is part of the token to it and the signature never checks out"
+    );
     let keys = HashMap::from([(API_KEY.to_owned(), API_SECRET.to_owned())]);
     let claims = mediacore_auth::verify(&token, &keys)
         .expect("a receiver holding this server's key could not verify the request");
