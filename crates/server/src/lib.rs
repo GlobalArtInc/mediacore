@@ -1,11 +1,12 @@
 pub mod bandwidth;
-pub mod cluster;
 pub mod caretaker;
+pub mod cluster;
 pub mod data;
 pub mod events;
 pub mod forward;
 pub mod http;
 pub mod media;
+pub mod metrics;
 pub mod openapi;
 pub mod peer;
 pub mod publisher;
