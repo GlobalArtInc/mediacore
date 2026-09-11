@@ -21,6 +21,54 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    # A limit for a hang -- these tests hold real sockets and a real database, so
+    # the shape a hang takes here is a job that sits rather than one that stops,
+    # and a job with no limit sits for six hours.
+    #
+    # Set from what this job costs rather than from a round number, because a
+    # round number is a guess and the green runs behind the old one -- three to
+    # four minutes, warm, and before the database and the kafka steps existed --
+    # say nothing about the shape it has now. This repository is private, so
+    # `ubuntu-latest` is the two-core standard runner, and with `target` out of
+    # the cache below a cold build is the only shape there is. On the last run
+    # that had nothing usable in its cache (34524834685) clippy's check pass over
+    # the whole graph took 2m30s and the test step was 6m10s in -- codegen for
+    # that graph a second time, then 34 integration binaries to link, then the
+    # suite -- when a failing test stopped it, with both kafka steps and most of
+    # the suite still ahead. Twenty minutes for a healthy cold run is a generous
+    # reading of the numbers there are, and this is three times it.
+    #
+    # High on purpose, in that direction. A hung test sits until the limit
+    # whichever number it is and costs runner minutes; a limit that clips a cold
+    # build for being slow costs a red build on a commit that is fine, and after
+    # `build.yml` was made to wait for this workflow it costs the deploy as well.
+    timeout-minutes: 60
+
+    env:
+      # This workspace has 34 integration test targets, and `cargo test` links
+      # each into a binary of its own carrying the whole dependency graph. Full
+      # DWARF is most of what that weighs: dropping to line tables takes
+      # `libstr0m.rlib` from 149 MB to 84 MB and roughly halves every object
+      # file, and on Linux -- where `split-debuginfo` is off by default and the
+      # linker copies the DWARF into each of those 34 binaries rather than
+      # leaving it behind in the objects -- it comes off the binaries as well.
+      #
+      # This matters because when the disk fills, the linker does not get to
+      # report ENOSPC: it writes its output through a mapping, so a store that
+      # cannot be backed arrives as SIGBUS and `ld` dies with a core dump and no
+      # mention of space at all -- which is the whole reason for the two `df`
+      # readings further down. What killed the runs whose `Test` step has no end
+      # time is not on record: their logs have expired, and the one failing log
+      # that does survive ends on a test assertion and mentions neither space nor
+      # a signal. So this is a bound on the footprint, not a diagnosis of those
+      # runs.
+      #
+      # line-tables-only keeps the file and the line in a backtrace, which is the
+      # whole of what debug info is ever read for in a CI log and what
+      # `RUST_BACKTRACE` above prints. Set here rather than in Cargo.toml so that
+      # a debugger on somebody's machine still gets all of it.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
     # The session store's queue -- two nodes reaching for the same recording,
     # and what becomes of one whose claimant died -- is tested against a real
@@ -46,6 +94,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Headroom, and named as such: the cache and the debug-info settings are
+      # what keep this build's footprint bounded, and this is what puts the bound
+      # comfortably inside the disk rather than near it. First, so that
+      # everything which writes -- the toolchain, the registry, the build -- has
+      # the room before it starts. The image ships an Android SDK, a Haskell
+      # toolchain, a .NET SDK and a CodeQL bundle, together more than everything
+      # this job writes, and nothing in a Rust build reads any of them.
+      # `|| true`, because a path a future image no longer has is not a reason to
+      # fail a build; whether this step still earns its minute is a question the
+      # two `df` readings below answer.
+      - name: Free the disk of toolchains nothing here uses
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            || true
+
       - name: Install Rust toolchain
         run: |
           rustup show
@@ -53,17 +123,61 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo and target
+      # The download directories and deliberately not `target`, for two reasons
+      # that want different answers.
+      #
+      # What a `target` entry does to itself: the key is the lock file,
+      # `restore-keys` falls back to the newest entry under the prefix whatever
+      # lock file built it, and cargo adds to a target/ rather than reconciling
+      # one -- it has no reason to delete an artifact it has stopped using. So
+      # adding a dependency restores the previous lock file's tree, builds the new
+      # artifacts beside the old ones, and saves both under the new key for the
+      # next run to inherit and grow again, with nothing in the loop ever removing
+      # anything. The same accumulation in a working tree here leaves three copies
+      # of `libstr0m.rlib` -- 427 MB for one dependency at one version -- and five
+      # to sixteen copies of everything else. A key with no fallback ends that,
+      # which is what the interop job below does with its own target/.
+      #
+      # And its size, which no key fixes: a clean debug build of one crate's test
+      # targets is 3.8 GB, the whole workspace is several times that, and a
+      # repository gets 10 GB for all of its caches together -- this job's and
+      # interop's between them. An entry that large spends minutes being packed
+      # and unpacked every run, evicts everything else in the budget, and has to
+      # fit on the disk twice over while it is being restored. Against the cold
+      # build it would save: 2m30s of clippy and a test step that had linked the
+      # workspace six minutes in, on the two-core runner, measured.
+      #
+      # It is also less of a change than it reads as. A run that fails saves
+      # nothing -- `actions/cache` skips its post step -- and this job has failed
+      # 48 of its last 59 runs, so what a `target` entry here has actually been
+      # restoring is a tree older than the lock file it was keyed on, when it
+      # existed at all. And on the last runs that did carry one, before the
+      # database and the kafka steps arrived, restoring and saving it cost 1.1 to
+      # 1.6 minutes of a job whose clippy and test steps together were 2.2.
+      #
+      # Registry tarballs have neither problem: small, and a stale one is a file
+      # nothing opens.
+      - name: Cache the cargo download directories
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      # Both ends of the build, because the failure this job had is invisible in
+      # a log otherwise: a linker killed by a signal says nothing about space,
+      # and neither does anything else here. `df` before says what there was to
+      # work with, `df` after says how much of it a whole build actually needs,
+      # and until those two numbers have been seen on a real runner the size of
+      # this build is an estimate. A run that comes near the edge then says so
+      # while it is still green, instead of the next one going red with a signal
+      # and no explanation.
+      - name: Disk before the build
+        run: df -h /
 
       - name: Format
         run: cargo fmt --all --check
@@ -85,6 +199,14 @@ jobs:
 
       - name: Test with kafka
         run: cargo test -p mediacore-events --features kafka
+
+      # `always()`, because the reading that matters most is the one from the run
+      # that just died of a full disk.
+      - name: Disk after the build
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
 
   # Compatibility with LiveKit's SDKs is a declared property of this server --
   # it is why the `livekit.RoomService` alias and the lowerCamelCase protobuf
@@ -116,17 +238,29 @@ jobs:
       # A key of its own. `check` builds debug and this builds release, so the
       # two write different things into target/ -- sharing a key would have them
       # racing to save a cache that suits neither.
-      - name: Cache cargo and target
+      - name: Cache the cargo download directories
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-interop-
+
+      # This one keeps its target/, because a release build of one binary is a
+      # fraction of what `check` would have to store and rebuilding it from
+      # nothing every run is the expensive half of this job. What it does not
+      # keep is the fallback: an exact hit restores a directory built from this
+      # lock file and saves nothing back, a miss builds from empty, and there is
+      # no third case where cargo is handed another lock file's artifacts and
+      # asked to add to them. That case is what filled the disk in `check`.
+      - name: Cache the interop build directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-interop-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
       # The SDK asks for node >= 19. Pinned to a major rather than to `latest`,
       # for the same reason `lk` and the npm version are pinned: nothing in this
