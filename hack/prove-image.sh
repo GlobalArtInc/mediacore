@@ -122,6 +122,35 @@ wait_for() {
 wait_for "$sfu" /usr/local/bin/mediacore healthcheck
 wait_for "$front" /usr/local/bin/mediacore-front healthcheck
 
+# The other subcommand, and the one the chart will depend on out of this image:
+# `check` is what replaces the `/bin/sh -c` in its init container, and a shell is
+# the last thing keeping the published image on Debian. Proven here for the same
+# reason the healthcheck is -- both are exit codes read by something that is not
+# a person, in a container with no shell to read them any other way -- and
+# proven in a container of its own, `--rm` and no server, because that is how an
+# init container runs it.
+#
+# Both directions, because a check that agrees with everything is the failure
+# worth fearing here -- it installs, goes green and guards nothing. The smoke
+# config advertises loopback on purpose, so --routable-advertise has to refuse
+# it.
+#
+# Exactly 1 on the refusal, not merely non-zero: 125 is docker declining to run
+# the container and 127 is a binary that is not in this image, and a check for
+# "it failed" would read either of those as the subcommand doing its job.
+docker run --rm -v "$config:/etc/mediacore/mediacore.yaml:ro" "$IMAGE" \
+  /usr/local/bin/mediacore --config /etc/mediacore/mediacore.yaml check
+
+refusal=0
+docker run --rm -v "$config:/etc/mediacore/mediacore.yaml:ro" "$IMAGE" \
+  /usr/local/bin/mediacore --config /etc/mediacore/mediacore.yaml check --routable-advertise \
+  || refusal=$?
+if [ "$refusal" -ne 1 ]; then
+  echo "\`check --routable-advertise\` exited $refusal on a config that advertises 127.0.0.1; 1 is the refusal an init container is read by, and 0 would mean the check guards nothing" >&2
+  exit 1
+fi
+echo "check: takes this config, and refuses it when asked for a routable advertise address"
+
 # And read the body from outside the container too, rather than take
 # our own binary's word for it: /healthz has to look like the health
 # line and not merely return 200. A proxy in the way, a stale container

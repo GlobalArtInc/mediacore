@@ -45,12 +45,12 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # This workspace has 34 integration test targets, and `cargo test` links
+      # This workspace has 35 integration test targets, and `cargo test` links
       # each into a binary of its own carrying the whole dependency graph. Full
       # DWARF is most of what that weighs: dropping to line tables takes
       # `libstr0m.rlib` from 149 MB to 84 MB and roughly halves every object
       # file, and on Linux -- where `split-debuginfo` is off by default and the
-      # linker copies the DWARF into each of those 34 binaries rather than
+      # linker copies the DWARF into each of those 35 binaries rather than
       # leaving it behind in the objects -- it comes off the binaries as well.
       #
       # This matters because when the disk fills, the linker does not get to

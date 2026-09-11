@@ -41,6 +41,46 @@ fn bare() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The names this stack may set to an empty string and still have a config the
+/// server reads: six of them are how a deployment says "no database, no bucket,
+/// no relay", and the seventh is the block the relay would have been.
+///
+/// `MEDIACORE_LOG_LEVEL` is the odd one and is here because this list is about
+/// what the server takes, not about what anybody meant: it is written bare in
+/// the template, so empty renders a null there, and a null read as a string is
+/// the empty string -- which is a server that starts with no level set rather
+/// than one that says so. `start-sfu.sh` defaults it to `info` for that reason
+/// and a chart wants to do the same.
+const MAY_BE_EMPTY: [&str; 8] = [
+    "MEDIACORE_LOG_LEVEL",
+    "MEDIACORE_POSTGRES_URL",
+    "MEDIACORE_S3_ENDPOINT",
+    "MEDIACORE_S3_REGION",
+    "MEDIACORE_S3_BUCKET",
+    "MEDIACORE_S3_ACCESS_KEY_ID",
+    "MEDIACORE_S3_SECRET_ACCESS_KEY",
+    "MEDIACORE_ICE_SERVERS_BLOCK",
+];
+
+/// And the names where nothing is not an answer but a file the server will not
+/// read at all: the two that fill a bare boolean and a bare port, where a null
+/// is a type error, and the three the server's own validation refuses empty.
+const MUST_CARRY_A_VALUE: [&str; 5] = [
+    "MEDIACORE_API_KEY",
+    "MEDIACORE_API_SECRET",
+    "MEDIACORE_RTC_UDP_PORT",
+    "MEDIACORE_ADVERTISE_IP",
+    "MEDIACORE_RECORDING_ENABLED",
+];
+
+/// The bare stack with one of its names set to an empty string.
+fn emptied(name: &str) -> Vec<(&'static str, &'static str)> {
+    bare()
+        .into_iter()
+        .map(|(this, value)| (this, if this == name { "" } else { value }))
+        .collect()
+}
+
 /// What `start-sfu.sh` builds when `MEDIACORE_TURN_SECRET` is set, copied from
 /// it verbatim -- the indentation included, because that is the whole of what
 /// makes these lines a member of `rtc:` rather than a top-level key the server
@@ -206,6 +246,59 @@ fn a_variable_the_deployment_forgot_is_refused_by_name() {
     assert!(
         refusal.contains("MEDIACORE_API_SECRET"),
         "the refusal has to name the variable somebody has to set: {refusal}"
+    );
+}
+
+/// Empty is a value the server takes for some of these names and a file it will
+/// not read for the rest, and the difference is made somewhere nobody can see
+/// it: a `${...}` inside quotes fills a string, so empty is an empty string,
+/// while a bare one fills whatever YAML makes of the rest of that line, and
+/// nothing there is a null -- which a boolean and a port have no reading of.
+///
+/// A chart is what gets this wrong, and this test is the one thing in the
+/// repository that can say so. The five `MEDIACORE_S3_*` names really are
+/// emptied to mean "no bucket", so emptying the whole recording block reads as
+/// the obvious way to write "recording off" -- and `recording.enabled` is bare,
+/// so that renders `enabled:` with a null after it and every deploy of that
+/// chart is an init container exiting 1 over a config nothing else would have
+/// questioned. Every name the stack sets is in one of the two lists above, so a
+/// name cannot be added to the ledger without somebody deciding which it is.
+#[test]
+fn empty_is_a_value_for_some_of_these_names_and_a_refused_file_for_the_rest() {
+    for name in MAY_BE_EMPTY {
+        let rendered = render(&emptied(name))
+            .unwrap_or_else(|error| panic!("{name} set to empty was not rendered: {error}"));
+
+        Config::parse(&rendered).unwrap_or_else(|error| {
+            panic!(
+                "{name} set to empty is a config this stack renders on purpose and the server has \
+                 stopped reading it: {error}"
+            )
+        });
+    }
+
+    for name in MUST_CARRY_A_VALUE {
+        // Set and empty always renders -- unset is the case the expander
+        // refuses -- so the refusal to look for is the server's own.
+        let rendered = render(&emptied(name))
+            .unwrap_or_else(|error| panic!("{name} set to empty was not rendered: {error}"));
+
+        assert!(
+            Config::parse(&rendered).is_err(),
+            "{name} set to empty rendered a config the server accepts. Whatever it fills now takes \
+             nothing as an answer, so a chart that leaves it out starts a server that is quietly \
+             not the one anybody asked for -- move it to MAY_BE_EMPTY if that is really what it \
+             means now"
+        );
+    }
+
+    let ledger: BTreeSet<&str> = bare().into_iter().map(|(name, _)| name).collect();
+    let decided: BTreeSet<&str> = MAY_BE_EMPTY.into_iter().chain(MUST_CARRY_A_VALUE).collect();
+    assert_eq!(
+        ledger, decided,
+        "every name this stack sets has to be in exactly one of the two lists above: emptying it \
+         is either how a deployment says `nothing here` or a config the server refuses, and a \
+         chart author has no way of telling which from the template alone"
     );
 }
 

@@ -8,6 +8,8 @@ use mediacore_proto::mediacore;
 use mediacore_server::{http, state::AppState};
 use tracing_subscriber::EnvFilter;
 
+mod check;
+
 /// How long a planned stop waits for the meeting records to land.
 ///
 /// Long enough for a database that is merely busy and short enough that a
@@ -49,14 +51,33 @@ const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Parser)]
 #[command(name = "mediacore", version, about = "Selective forwarding unit")]
 struct Cli {
-    #[arg(long, short, env = "MEDIACORE_CONFIG", default_value = "config.yaml")]
+    // `global = true`, so that both orderings work:
+    // `mediacore --config /etc/mediacore/mediacore.yaml check --expect-postgres`
+    // and `mediacore check --config /etc/mediacore/mediacore.yaml`. The second
+    // is the one a chart author writes first -- it reads as the flag belonging
+    // to the subcommand that uses it -- and parent-only made it
+    // `error: unexpected argument '--config' found` over an argument order,
+    // in the `args:` of an init container, where a clap usage line is all the
+    // evidence there is.
+    //
+    // It leaves `healthcheck --config <path>` accepted and ignored, which is no
+    // new hazard: the parent position was always accepted and ignored there,
+    // and a healthcheck that read this file would refuse to start on a
+    // perfectly healthy server (see the subcommand below for why).
+    #[arg(
+        long,
+        short,
+        global = true,
+        env = "MEDIACORE_CONFIG",
+        default_value = "config.yaml"
+    )]
     config: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-/// One subcommand, and it does not start a server. Without it this binary is the
-/// server, exactly as it was before there was a subcommand at all.
+/// Two subcommands, and neither of them starts a server. Without one this binary
+/// is the server, exactly as it was before there was a subcommand at all.
 #[derive(Subcommand)]
 enum Command {
     /// Ask the server in this container whether it is answering. Exit 0 if it
@@ -82,14 +103,74 @@ enum Command {
         #[arg(long, default_value_t = Config::default().port)]
         port: u16,
     },
+
+    /// Whether the config this server would read is the one the deployment
+    /// asked for. Exit 0 if it is, and print what is wrong if it is not.
+    //
+    // The counterpart of `healthcheck` and its opposite in one respect: this
+    // one reads the config and nothing else, where that one deliberately reads
+    // no config at all. It exists to be an init container -- the chart's is
+    // `/bin/sh -c` running envsubst today, and that shell is the last thing
+    // keeping the published image on Debian. `crates/server/src/check.rs` has
+    // the whole of the reasoning, including why these three are not in
+    // `Config::validate`.
+    //
+    // Every flag is a statement of intent and none of them is a default: a check
+    // with no flags still reads the file, fills in the `${MEDIACORE_*}` and runs
+    // the server's own validation, which is most of what an init container is
+    // for.
+    //
+    // Each one overrides itself, which is clap's way of saying a flag may be
+    // written twice. The caller is a Helm template, and recording implies a
+    // database -- an upload is a row several nodes claim -- so a chart that
+    // emits `--expect-postgres` for its database and again for its recording is
+    // the obvious way to write it and says nothing contradictory. Without this
+    // that install fails with `cannot be used multiple times` and no hint as to
+    // which condition is the duplicate.
+    Check {
+        /// Meetings belong in Postgres: refuse an empty `sessions.postgres.url`,
+        /// which would silently keep them in a directory instead.
+        #[arg(long, overrides_with = "expect_postgres")]
+        expect_postgres: bool,
+
+        /// Meetings are recorded: refuse an object store with no bucket or no
+        /// credentials, which would record nothing and say nothing.
+        #[arg(long, overrides_with = "expect_recording")]
+        expect_recording: bool,
+
+        /// Media is advertised to clients off this node: refuse the wildcard,
+        /// loopback and link-local. Private addresses are not refused.
+        #[arg(long, overrides_with = "routable_advertise")]
+        routable_advertise: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Command::Healthcheck { port }) = cli.command {
-        return healthcheck(port).await;
+    match cli.command {
+        Some(Command::Healthcheck { port }) => return healthcheck(port).await,
+        // Tracing is deliberately not started for this one, exactly as it is not
+        // for the healthcheck: what a check writes on its way out is the whole
+        // of what somebody reads with `kubectl logs` afterwards, and a log line
+        // about something else on the same stream is noise in the one message
+        // that had to be read.
+        Some(Command::Check {
+            expect_postgres,
+            expect_recording,
+            routable_advertise,
+        }) => {
+            return check::run(
+                &cli.config,
+                check::Expected {
+                    postgres: expect_postgres,
+                    recording: expect_recording,
+                    routable_advertise,
+                },
+            );
+        }
+        None => {}
     }
 
     let config = Config::load(&cli.config)?;

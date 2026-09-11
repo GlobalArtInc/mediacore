@@ -5,9 +5,26 @@
 #
 # A name nothing set is refused at startup, by name — an empty api secret would
 # be a server that starts and rejects every token. A name set to an empty value
-# is honoured, which is how the recording settings below read back as "no
-# database, no recording"; deploy/start-sfu.sh sets them to empty on purpose and
-# refuses the four that must not be. A literal dollar is written `$$`.
+# is honoured, which is how sessions.postgres.url and the recording.s3 settings
+# below read back as "no database, no recording"; deploy/start-sfu.sh empties
+# five of them on purpose (the region gets a default instead) and refuses the
+# four that must not be. A literal dollar is written `$$`.
+#
+# Empty is not an answer everywhere, though, and which it is can be read off
+# this file: a variable inside quotes fills a string, and an empty string is a
+# value, while a variable standing bare after the colon fills whatever YAML
+# makes of the rest of the line, and nothing there is a null. recording.enabled
+# and rtc.udp_port are bare and a boolean and a port have no reading of a null,
+# so an empty one is the whole file refused — `enabled:` is not `false`, it is a
+# boolean that is not there. start-sfu.sh gives the first a default of false and
+# refuses an empty second, and a chart has to do as much in its own values.
+# log_level is bare as well, and a null there reads back as an empty level: a
+# server that starts and says nothing, which is why the script defaults it to
+# info. MEDIACORE_ICE_SERVERS_BLOCK is the one name whose emptiness is the
+# point, because it fills a block of structure rather than a value.
+#
+# crates/config/tests/deploy_template.rs holds every name to one column or the
+# other, against this very file.
 
 port: 7880
 bind_addresses:
@@ -50,6 +67,13 @@ recording:
   # happening and uploaded whole when it ends, so that directory is a volume:
   # one inside the image would take every not-yet-uploaded recording with the
   # next release. docker-compose.yml mounts the `recordings` volume here.
+  #
+  # `true` or `false`, and never nothing. This is the boolean the header warns
+  # about: the variable is bare, so an empty value is a null here and the server
+  # refuses the file — "recording.enabled: invalid type: unit value, expected a
+  # boolean". Whatever renders this environment writes `false` to turn recording
+  # off, which is what start-sfu.sh does; the empty-means-off spelling belongs
+  # to the five s3 names below and to the url above, and to nothing else here.
   enabled: ${MEDIACORE_RECORDING_ENABLED}
   directory: /var/lib/mediacore/recordings
   s3:
@@ -104,8 +128,15 @@ rtc:
   # The address the server hands out in ICE candidates. Inside a container the
   # socket's own address is a private bridge address no client can route to, so
   # it is stated here and the guesses below are turned off.
+  #
+  # Quoted, for the one address that is a whole YAML construct unquoted: `::` on
+  # its own is a mapping with a null key rather than a string, so the ipv6
+  # wildcard — the value that gives a server which signals perfectly and
+  # receives no media — arrived as a type error about this line instead of as
+  # the refusal written for it. Quoting also turns an empty value into an empty
+  # entry, which the server names as an entry that is not an address.
   advertise_addresses:
-    - ${MEDIACORE_ADVERTISE_IP}
+    - "${MEDIACORE_ADVERTISE_IP}"
   use_socket_address: false
   use_external_ip: false
 
