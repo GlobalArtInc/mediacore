@@ -6,6 +6,24 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::Deserialize;
 
+pub mod variables;
+
+/// The shortest secret this server will sign and verify a token with.
+///
+/// Every token is HS256, whose key must be at least as long as the hash it
+/// feeds -- 256 bits, and RFC 7518 section 3.2 says MUST rather than should.
+/// `openssl rand -hex 32`, which is what `deploy/README.md` tells people to
+/// generate, is twice that in characters.
+///
+/// The number is the front end's, from `MEDIACORE_API_SECRET` and the same
+/// deployment: `crates/front/src/config.rs` refuses to start below it. The two
+/// halves mint and verify each other's tokens, so a secret one of them will not
+/// start on is not a secret this deployment can use, and a server that accepts
+/// what the front end rejects is a disagreement about which tokens are valid
+/// rather than a tolerance. The one number lives in both crates because the
+/// front end does not depend on this one.
+pub const MIN_SECRET_BYTES: usize = 32;
+
 pub const DEFAULT_END_GRACE_SECONDS: u32 = 90;
 pub const DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS: u32 = 20;
 /// A day, which is not a session length but an outer bound on one.
@@ -1399,13 +1417,34 @@ impl Default for RtcConfig {
 }
 
 impl Config {
+    /// Read the config, fill in the variables it asks the environment for, and
+    /// check the result.
+    ///
+    /// **The variables are filled in here rather than by something in front of
+    /// this process.** `envsubst` used to do it -- in `deploy/start-sfu.sh`, and
+    /// in a chart's init container writing into an `emptyDir` -- which meant a
+    /// rendered copy of this file, api secret and database password and bucket
+    /// credentials in cleartext, existed on a filesystem for the life of the
+    /// container. What the server reads now is the file the deployment wrote,
+    /// `${MEDIACORE_API_SECRET}` still in it, and the secret stays an
+    /// environment variable of one process. It also means an unset name is a
+    /// refusal that names it rather than an empty string nobody notices until
+    /// every token is rejected: [`variables`] has the whole of the reasoning.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        let body = variables::expand(&body)
+            .with_context(|| format!("rendering config {}", path.display()))?;
         Self::parse(&body).with_context(|| format!("parsing config {}", path.display()))
     }
 
+    /// The text exactly as it stands, with nothing filled in.
+    ///
+    /// [`Config::load`] is the one that renders `${MEDIACORE_...}` first, and
+    /// the two are separate so that each can be tested for what it does: this
+    /// one is a function of its argument alone, and does not read the
+    /// environment.
     pub fn parse(body: &str) -> anyhow::Result<Self> {
         let config: Self = serde_yaml_ng::from_str(body)?;
         config.validate()?;
@@ -1414,6 +1453,43 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.keys.is_empty(), "no api keys configured");
+        // A non-empty map was the whole of this check, and an entry in it can be
+        // as good as no key at all. HS256 signs and verifies with an empty key
+        // without complaining, so a deployment whose secret went missing --
+        // a Secret whose api-secret key exists and holds nothing, a Helm value
+        // left as `""` -- starts, answers `/healthz`, and accepts a token minted
+        // by anybody who knows the key's *name*. The name is not a secret:
+        // `mediacore` is what the shipped template calls it. That makes this the
+        // one config mistake that hands a stranger a join token for every room,
+        // and it has to be refused here rather than in `deploy/start-sfu.sh`,
+        // which only the compose stack runs and which the published image, with
+        // no shell in it, cannot run at all.
+        for (name, secret) in &self.keys {
+            anyhow::ensure!(
+                !name.trim().is_empty(),
+                "an entry in `keys` has no name. The name is the `iss` of every token and what the \
+                 secret to check it with is looked up by, so a nameless key is one whose issuer is \
+                 the empty string -- and a token claiming that issuer verifies. It is what this \
+                 config renders when MEDIACORE_API_KEY is set to an empty value"
+            );
+            anyhow::ensure!(
+                !secret.is_empty(),
+                "the api key `{name}` has no secret, and a token signed with nothing verifies \
+                 against nothing: this server would start and then accept a token minted by \
+                 anybody who knows that the key is called `{name}`. Set it where this server reads \
+                 its config -- MEDIACORE_API_SECRET if the config asks the environment for it -- \
+                 and generate it with `openssl rand -hex 32`. An empty value is honoured elsewhere \
+                 in this file, and this is not one of the places where nothing is an answer"
+            );
+            anyhow::ensure!(
+                secret.len() >= MIN_SECRET_BYTES,
+                "the api key `{name}` has a secret of {} bytes, and every token this server issues \
+                 or is shown is signed with it, so it has to be at least {MIN_SECRET_BYTES}: that \
+                 is what RFC 7518 section 3.2 requires of an HS256 key, and the length the front \
+                 end already refuses to start below on the same secret. `openssl rand -hex 32`",
+                secret.len()
+            );
+        }
         anyhow::ensure!(self.port != 0, "port must be set");
         anyhow::ensure!(
             !self.bind_addresses.is_empty(),

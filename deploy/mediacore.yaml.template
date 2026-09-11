@@ -1,7 +1,13 @@
-# Rendered by deploy/start-sfu.sh with envsubst at container start; the result
-# is what mediacore reads. start-sfu.sh refuses to start when one of the five
-# required values is empty; the recording ones are optional and render empty,
-# which reads back as "no database, no recording".
+# This file is what mediacore reads, variables and all. The server fills every
+# MEDIACORE_ variable written below in from its own environment as it loads the
+# file, so nothing renders a copy first and the api secret never lands on a
+# filesystem: it stays an environment variable of the one process that needs it.
+#
+# A name nothing set is refused at startup, by name — an empty api secret would
+# be a server that starts and rejects every token. A name set to an empty value
+# is honoured, which is how the recording settings below read back as "no
+# database, no recording"; deploy/start-sfu.sh sets them to empty on purpose and
+# refuses the four that must not be. A literal dollar is written `$$`.
 
 port: 7880
 bind_addresses:
@@ -122,9 +128,14 @@ rtc:
   #       secret: "the same secret coturn was started with"
   #       ttl_seconds: 86400
   #
-  # with a turns: url beside those two when certificate files were named. The
-  # rendered file is the truth of what happened:
-  # `docker compose exec sfu cat /tmp/mediacore.yaml`.
+  # with a turns: url beside those two when certificate files were named. There
+  # is no rendered copy of this file to read, and MEDIACORE_ICE_SERVERS_BLOCK is
+  # not something to go looking for either: start-sfu.sh builds it and it lives
+  # in the environment of the one process it exec'd, which `docker compose exec`
+  # cannot show — exec builds a new process's environment out of the container's
+  # configured one, never out of PID 1's. What start-sfu.sh decided it says at
+  # startup in one line, and that line is the thing to read:
+  # `docker compose logs sfu | grep start-sfu`.
   #
   # No stun: entry is rendered, deliberately. This server is ice-lite: it never
   # gathers a candidate and never uses a client's reflexive address to reach

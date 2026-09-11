@@ -1,10 +1,22 @@
 #!/bin/sh
-# Renders mediacore.yaml.template into a config the server can read, then hands
-# the process over to it. Everything it needs comes from deploy/.env.
+# Checks what the SFU needs out of deploy/.env, builds the one part of the config
+# a template cannot express, and hands the process over to the server.
+#
+# It does not render the config any more. The server reads
+# mediacore.yaml.template itself and fills the ${MEDIACORE_...} in it from this
+# environment, so everything named in that file is exported here rather than
+# substituted into a copy of it. Two things come of that: the api secret stays an
+# environment variable of one process instead of sitting in a file anything in
+# this container could read, and a name nothing set is a refusal from the server
+# that says which one, where envsubst filled it in with nothing and said
+# nothing. What is left in this script is the part the server cannot do -- an
+# address that parses and is unreachable -- and the ice_servers block, which is
+# structure and not a value. The two checks below that the server now makes for
+# itself, an empty value and a secret too short to sign with, are kept because
+# here they can name the file in this repository the value comes from.
 set -eu
 
 TEMPLATE=/etc/mediacore/mediacore.yaml.template
-RENDERED=/tmp/mediacore.yaml
 
 fail() {
 	echo "start-sfu: $1" >&2
@@ -12,16 +24,28 @@ fail() {
 	exit 1
 }
 
+# Set and empty is a decision -- the server honours it for the values that have
+# one -- and unset is the absence of one, which the server refuses by name.
+# Neither is what these four want, so emptiness is refused here, first, where the
+# message can name deploy/.env instead of a key in a config file the operator of
+# this stack never wrote. The server refuses an empty api key or secret as well,
+# because a chart does not run this script.
 for name in MEDIACORE_API_KEY MEDIACORE_API_SECRET MEDIACORE_ADVERTISE_IP MEDIACORE_RTC_UDP_PORT; do
 	eval "value=\${$name:-}"
 	[ -n "$value" ] || fail "$name is empty"
 done
+# Exported because the server reads them from its own environment now. They
+# arrive exported when compose or Kubernetes sets them, and this line is what
+# makes the script correct on its own terms rather than by inheritance.
+export MEDIACORE_API_KEY MEDIACORE_API_SECRET MEDIACORE_ADVERTISE_IP MEDIACORE_RTC_UDP_PORT
 
 : "${MEDIACORE_LOG_LEVEL:=info}"
 export MEDIACORE_LOG_LEVEL
 
-# A secret shorter than this is refused by the front end, so refuse it here too
-# rather than let the two halves disagree about which tokens are valid.
+# One floor, in three places that cannot disagree: the server refuses a signing
+# secret shorter than this in Config::validate, the front end refuses to start
+# below it, and this is the same number said where the answer is "edit
+# deploy/.env" rather than "edit a Secret".
 if [ "${#MEDIACORE_API_SECRET}" -lt 32 ]; then
 	fail "MEDIACORE_API_SECRET is shorter than 32 characters"
 fi
@@ -147,10 +171,11 @@ $ice_urls
 fi
 export MEDIACORE_ICE_SERVERS_BLOCK
 
-umask 077
-# Unset, these render empty, which the server reads as "no database, no
-# recording" -- the single-process stack. Only the four checked at the top are
-# required.
+# Set to empty on purpose, and that is now load-bearing rather than tidiness:
+# the server refuses a name it cannot find at all, and an empty value is how this
+# stack says "no database, no recording" -- the single process a trial runs.
+# Leaving them unset would be nobody having said anything, which is the case the
+# server will not guess at. Only the four checked at the top are required.
 : "${MEDIACORE_POSTGRES_URL:=}"
 : "${MEDIACORE_RECORDING_ENABLED:=false}"
 : "${MEDIACORE_S3_ENDPOINT:=}"
@@ -162,13 +187,28 @@ export MEDIACORE_POSTGRES_URL MEDIACORE_RECORDING_ENABLED MEDIACORE_S3_ENDPOINT 
 	MEDIACORE_S3_REGION MEDIACORE_S3_BUCKET MEDIACORE_S3_ACCESS_KEY_ID \
 	MEDIACORE_S3_SECRET_ACCESS_KEY
 
-envsubst '${MEDIACORE_LOG_LEVEL} ${MEDIACORE_API_KEY} ${MEDIACORE_API_SECRET} ${MEDIACORE_RTC_UDP_PORT} ${MEDIACORE_ADVERTISE_IP} ${MEDIACORE_POSTGRES_URL} ${MEDIACORE_RECORDING_ENABLED} ${MEDIACORE_S3_ENDPOINT} ${MEDIACORE_S3_REGION} ${MEDIACORE_S3_BUCKET} ${MEDIACORE_S3_ACCESS_KEY_ID} ${MEDIACORE_S3_SECRET_ACCESS_KEY} ${MEDIACORE_ICE_SERVERS_BLOCK}' \
-	<"$TEMPLATE" >"$RENDERED"
-
 echo "start-sfu: media will be advertised as $MEDIACORE_ADVERTISE_IP:$MEDIACORE_RTC_UDP_PORT" >&2
 
 if [ -n "$MEDIACORE_ICE_SERVERS_BLOCK" ]; then
 	echo "start-sfu: clients will also be offered turn:$MEDIACORE_TURN_HOST:$MEDIACORE_TURN_PORT" >&2
 fi
 
-exec /usr/local/bin/mediacore --config "$RENDERED"
+# Inherited by the server, and it is the server that needs it. Nothing here
+# writes a file any more, but the process this script execs writes the meeting
+# records, the event outbox and the staged recordings, and every one of those is
+# a plain create with no mode of its own: at docker's default 022 they land 0644
+# on named volumes, which is meeting records and recorded audio readable by
+# anything else that mounts them and by any second uid in the container. This
+# line used to sit above the render that is gone and went with it, so it is back
+# where what it protects still happens.
+#
+# The right home for it is the server -- start-turn.sh has its own copy, a chart
+# does not run either script, and under Kubernetes nothing sets a umask at all,
+# which no manifest can fix because a umask is not a field a pod has. Until the
+# server sets its own, this covers the stack whose volumes are the shared ones.
+umask 077
+
+# The template itself, variables and all. There is no rendered copy to read
+# afterwards and that is the point: what this container holds is the file the
+# repository ships, and the secrets are in the process's environment.
+exec /usr/local/bin/mediacore --config "$TEMPLATE"

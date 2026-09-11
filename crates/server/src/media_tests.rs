@@ -4,9 +4,15 @@ use super::*;
 use crate::state::publisher_data;
 
 fn config(body: &str) -> RtcConfig {
-    mediacore_config::Config::parse(&format!("keys:\n  k: s\nrtc:\n{body}"))
-        .expect("config parses")
-        .rtc
+    // A key long enough to sign with. Nothing here looks at it, but a config
+    // without one no longer parses: an HS256 secret under 32 bytes is refused,
+    // because the front end refuses it too and the pair would disagree about
+    // which tokens are valid.
+    mediacore_config::Config::parse(&format!(
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nrtc:\n{body}"
+    ))
+    .expect("config parses")
+    .rtc
 }
 
 #[test]

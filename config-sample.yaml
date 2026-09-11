@@ -1,9 +1,45 @@
+# Any value in this file may be written as $${MEDIACORE_NAME}, and the server
+# fills it in from its own environment as it reads the file. Nothing renders a
+# copy first, which is the point: a Kubernetes ConfigMap holds this text with
+# $${MEDIACORE_API_SECRET} still in it, the secret itself comes out of a Secret
+# as an environment variable, and it never lands on a filesystem. The doubled
+# dollars above are the escape described below — this file asks the environment
+# for nothing, so it loads as it ships.
+#
+# Four rules, and each of the first three is a refusal rather than a guess:
+#
+#   * A name the environment does not have is refused at startup, by name, and
+#     is never filled in with nothing. An api secret that expanded to an empty
+#     string is a server that starts, answers everything and rejects every
+#     token, and the first to find out is whoever cannot join.
+#   * A name that is set to an empty value is a decision, and it is honoured.
+#     That is how sessions.postgres.url below says "no database".
+#   * Only names beginning with MEDIACORE_ are filled in. Anything else —
+#     ${HOME}, or a ${...} inside a password or a room's metadata — stays in the
+#     file exactly as written.
+#   * A doubled dollar is one literal dollar, and it is the way out of every
+#     refusal above. It happens to every config this server reads and not only
+#     to a file written as a template — there is no switch to have one read
+#     verbatim, because one rule everywhere is the only version of this anybody
+#     can keep in their head. So a value that has to contain two dollars in a
+#     row is written with four of them, and a config that was read verbatim
+#     before this release needs every dollar in it doubled once. (This very
+#     paragraph is why the dollars at the top of the file are doubled.)
+
 port: 7880
 bind_addresses:
   - 0.0.0.0
 
 log_level: info
 
+# The name is the `iss` of every token and what the secret to check it with is
+# looked up by; the secret signs it. At least 32 bytes, refused below that: that
+# is what an HS256 key has to be, and it is the length the front end has always
+# refused to start below on this same secret. `openssl rand -hex 32`.
+#
+# The pair below is in a public repository, and anybody holding it can mint a
+# token for any room and any identity on a server that runs it. It is for a trial
+# on your own machine, and it is the first line to change on anything else.
 keys:
   devkey: devsecretdevsecretdevsecretdevsecret
 

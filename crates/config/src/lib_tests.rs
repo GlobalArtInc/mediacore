@@ -2,10 +2,14 @@ use super::*;
 
 #[test]
 fn fills_defaults_around_supplied_values() {
-    let config = Config::parse("port: 8080\nkeys:\n  key1: secret1\n").unwrap();
+    let config =
+        Config::parse("port: 8080\nkeys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert_eq!(config.port, 8080);
-    assert_eq!(config.keys.get("key1").unwrap(), "secret1");
+    assert_eq!(
+        config.keys.get("key1").unwrap(),
+        "0123456789abcdef0123456789abcdef"
+    );
     assert_eq!(config.room.empty_timeout, 300);
     assert!(config.room.auto_create);
     assert!(config.node_id.starts_with("ND_"));
@@ -17,7 +21,7 @@ fn fills_defaults_around_supplied_values() {
 #[test]
 fn recording_without_a_database_is_refused_at_startup() {
     let refused = Config::parse(
-        "keys:\n  k: s\nrecording:\n  enabled: true\n  s3:\n    endpoint: \
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nrecording:\n  enabled: true\n  s3:\n    endpoint: \
              http://minio:9000\n    bucket: meetings\n    access_key_id: k\n    \
              secret_access_key: s\n",
     )
@@ -41,7 +45,7 @@ fn recording_without_a_database_is_refused_at_startup() {
 #[test]
 fn an_upload_has_its_own_deadline_and_it_has_to_fit_the_segment_it_carries() {
     let config = Config::parse(
-        "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\n    timeout_ms: \
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nsessions:\n  postgres:\n    url: postgres://x/y\n    timeout_ms: \
              10000\n    lease_ms: 30000\nrecording:\n  enabled: true\n  s3:\n    endpoint: \
              http://minio:9000\n    bucket: meetings\n    access_key_id: k\n    \
              secret_access_key: s\n",
@@ -62,7 +66,7 @@ fn an_upload_has_its_own_deadline_and_it_has_to_fit_the_segment_it_carries() {
     );
 
     let refused = Config::parse(
-        "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
              enabled: true\n  max_segment_mb: 1024\n  s3:\n    endpoint: http://minio:9000\n    \
              bucket: meetings\n    access_key_id: k\n    secret_access_key: s\n    timeout_ms: \
              10000\n",
@@ -82,7 +86,7 @@ fn an_upload_has_its_own_deadline_and_it_has_to_fit_the_segment_it_carries() {
 #[test]
 fn recording_without_a_bucket_is_refused_at_startup() {
     let refused = Config::parse(
-        "keys:\n  k: s\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nsessions:\n  postgres:\n    url: postgres://x/y\nrecording:\n  \
              enabled: true\n",
     )
     .expect_err("a recorder with nowhere to upload to must not start");
@@ -99,7 +103,7 @@ fn recording_without_a_bucket_is_refused_at_startup() {
 #[test]
 fn a_bucket_named_without_the_default_switch_is_still_a_recording_deployment() {
     let refused = Config::parse(
-        "keys:\n  k: s\nrecording:\n  s3:\n    endpoint: http://minio:9000\n    bucket: \
+        "keys:\n  k: 0123456789abcdef0123456789abcdef\nrecording:\n  s3:\n    endpoint: http://minio:9000\n    bucket: \
              meetings\n    access_key_id: k\n    secret_access_key: s\n",
     )
     .expect_err("a bucket with no database behind it must not start either");
@@ -112,7 +116,8 @@ fn a_bucket_named_without_the_default_switch_is_still_a_recording_deployment() {
 
 #[test]
 fn a_server_that_records_nothing_needs_none_of_it() {
-    let config = Config::parse("keys:\n  k: s\n").expect("a server with no recording");
+    let config = Config::parse("keys:\n  k: 0123456789abcdef0123456789abcdef\n")
+        .expect("a server with no recording");
 
     assert!(!config.recording.enabled);
     assert!(
@@ -124,15 +129,16 @@ fn a_server_that_records_nothing_needs_none_of_it() {
 
 #[test]
 fn an_unknown_recording_setting_is_a_refusal_and_not_a_silent_default() {
-    let refused = Config::parse("keys:\n  k: s\nrecording:\n  enabld: true\n")
-        .expect_err("a typo in a setting name has to be a refusal");
+    let refused =
+        Config::parse("keys:\n  k: 0123456789abcdef0123456789abcdef\nrecording:\n  enabld: true\n")
+            .expect_err("a typo in a setting name has to be a refusal");
 
     assert!(refused.to_string().contains("enabld"), "{refused}");
 }
 
 #[test]
 fn the_session_policy_is_off_until_a_room_asks_for_one() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert_eq!(
         config.room.min_humans, 0,
@@ -149,7 +155,7 @@ fn the_session_policy_is_off_until_a_room_asks_for_one() {
 
 #[test]
 fn the_livekit_twirp_alias_is_on_until_a_deployment_retires_it() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert!(
         config.twirp.livekit_alias,
@@ -158,14 +164,16 @@ fn the_livekit_twirp_alias_is_on_until_a_deployment_retires_it() {
              generated code and cannot be pointed at another one"
     );
 
-    let retired =
-        Config::parse("keys:\n  key1: secret1\ntwirp:\n  livekit_alias: false\n").unwrap();
+    let retired = Config::parse(
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\ntwirp:\n  livekit_alias: false\n",
+    )
+    .unwrap();
     assert!(!retired.twirp.livekit_alias);
 }
 
 #[test]
 fn the_sweep_has_a_tick_of_its_own() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
     assert_eq!(
         config.room.sweep_interval(),
         Duration::from_secs(1),
@@ -173,14 +181,17 @@ fn the_sweep_has_a_tick_of_its_own() {
              else on the server enforces them"
     );
 
-    let quick = Config::parse("keys:\n  key1: secret1\nroom:\n  sweep_interval_ms: 50\n").unwrap();
+    let quick = Config::parse(
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nroom:\n  sweep_interval_ms: 50\n",
+    )
+    .unwrap();
     assert_eq!(quick.room.sweep_interval(), Duration::from_millis(50));
 }
 
 #[test]
 fn the_session_policy_and_the_duplicate_rule_are_configurable() {
     let config = Config::parse(
-            "keys:\n  key1: secret1\nroom:\n  min_humans: 2\n  end_grace: 90\n  duplicate_identity: displace\n",
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nroom:\n  min_humans: 2\n  end_grace: 90\n  duplicate_identity: displace\n",
         )
         .unwrap();
 
@@ -193,14 +204,17 @@ fn the_session_policy_and_the_duplicate_rule_are_configurable() {
     );
 
     assert!(
-        Config::parse("keys:\n  key1: secret1\nroom:\n  duplicate_identity: rename\n").is_err(),
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nroom:\n  duplicate_identity: rename\n"
+        )
+        .is_err(),
         "a rule the server does not have must not be read as one it does"
     );
 }
 
 #[test]
 fn meetings_are_recorded_somewhere_whether_or_not_a_config_says_so() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert_eq!(
         config.sessions.directory,
@@ -209,19 +223,24 @@ fn meetings_are_recorded_somewhere_whether_or_not_a_config_says_so() {
              its meetings; there is no configuration that turns recording off"
     );
 
-    let chosen =
-        Config::parse("keys:\n  key1: secret1\nsessions:\n  directory: /srv/meetings\n").unwrap();
+    let chosen = Config::parse(
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nsessions:\n  directory: /srv/meetings\n",
+    )
+    .unwrap();
     assert_eq!(chosen.sessions.directory, PathBuf::from("/srv/meetings"));
 
     assert!(
-        Config::parse("keys:\n  key1: secret1\nsessions:\n  directory: \"\"\n").is_err(),
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nsessions:\n  directory: \"\"\n"
+        )
+        .is_err(),
         "an empty directory is a server that starts and quietly records nothing"
     );
 }
 
 #[test]
 fn nobody_is_told_anything_until_a_destination_is_configured() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert!(
         !config.events.has_destinations(),
@@ -237,7 +256,7 @@ fn nobody_is_told_anything_until_a_destination_is_configured() {
 #[test]
 fn the_webhook_block_is_configurable() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nevents:\n  directory: /var/lib/mediacore/events\n  attempts: 3\n  \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  directory: /var/lib/mediacore/events\n  attempts: 3\n  \
              webhooks:\n    api_key: key1\n    urls:\n      - https://example.test/hook\n",
     )
     .unwrap();
@@ -267,7 +286,7 @@ fn the_webhook_block_is_configurable() {
 fn a_webhook_signed_by_a_key_this_server_does_not_have_is_refused_at_startup() {
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  webhooks:\n    api_key: someone-elses-key\n    \
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  webhooks:\n    api_key: someone-elses-key\n    \
                  urls:\n      - https://example.test/hook\n"
         )
         .is_err(),
@@ -275,7 +294,7 @@ fn a_webhook_signed_by_a_key_this_server_does_not_have_is_refused_at_startup() {
     );
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  webhooks:\n    urls:\n \
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  webhooks:\n    urls:\n \
                  - https://example.test/hook\n"
         )
         .is_err(),
@@ -283,7 +302,7 @@ fn a_webhook_signed_by_a_key_this_server_does_not_have_is_refused_at_startup() {
     );
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  webhooks:\n    api_key: key1\n    urls:\n      \
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  webhooks:\n    api_key: key1\n    urls:\n      \
                  - example.test/hook\n"
         )
         .is_err(),
@@ -299,7 +318,7 @@ fn a_webhook_signed_by_a_key_this_server_does_not_have_is_refused_at_startup() {
 #[test]
 fn the_same_endpoint_cannot_be_named_twice() {
     let duplicated = Config::parse(
-        "keys:\n  key1: secret1\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
              api_key: key1\n    urls:\n      - https://example.test/hook\n      - \
              https://example.test/hook\n",
     );
@@ -312,7 +331,7 @@ fn the_same_endpoint_cannot_be_named_twice() {
     );
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  directory: /tmp/mediacore-events\n  webhooks:\n    \
                  api_key: key1\n    urls:\n      - https://example.test/hook\n      - \
                  https://example.test/other\n"
         )
@@ -324,20 +343,30 @@ fn the_same_endpoint_cannot_be_named_twice() {
 #[test]
 fn rejects_a_delivery_policy_that_delivers_nothing() {
     assert!(
-        Config::parse("keys:\n  key1: secret1\nevents:\n  attempts: 0\n").is_err(),
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  attempts: 0\n")
+            .is_err(),
         "a destination configured to be offered an event zero times is a destination that is \
              configured and never written to"
     );
-    assert!(Config::parse("keys:\n  key1: secret1\nevents:\n  queue: 0\n").is_err());
-    assert!(Config::parse("keys:\n  key1: secret1\nevents:\n  timeout_ms: 0\n").is_err());
+    assert!(
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  queue: 0\n")
+            .is_err()
+    );
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  backoff_ms: 5000\n  max_backoff_ms: 1000\n"
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  timeout_ms: 0\n"
         )
         .is_err()
     );
     assert!(
-        Config::parse("keys:\n  key1: secret1\nevents:\n  nope: 1\n").is_err(),
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  backoff_ms: 5000\n  max_backoff_ms: 1000\n"
+        )
+        .is_err()
+    );
+    assert!(
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  nope: 1\n")
+            .is_err(),
         "a delivery setting this server does not have must not be read as one it does"
     );
 }
@@ -345,7 +374,7 @@ fn rejects_a_delivery_policy_that_delivers_nothing() {
 #[test]
 fn a_broker_can_be_named_with_settings_of_its_own() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nevents:\n  kafka:\n    brokers: kafka1:9093,kafka2:9093\n    \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  kafka:\n    brokers: kafka1:9093,kafka2:9093\n    \
              topic: mediacore.events\n    properties:\n      security.protocol: ssl\n",
     )
     .unwrap();
@@ -366,7 +395,7 @@ fn a_broker_can_be_named_with_settings_of_its_own() {
 
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nevents:\n  kafka:\n    brokers: kafka1:9093\n    topic: \"\"\n"
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nevents:\n  kafka:\n    brokers: kafka1:9093\n    topic: \"\"\n"
         )
         .is_err(),
         "a broker with no topic is a producer with nowhere to produce to"
@@ -380,12 +409,12 @@ fn rejects_config_without_keys() {
 
 #[test]
 fn rejects_unknown_fields() {
-    assert!(Config::parse("keys:\n  key1: secret1\nnope: 1\n").is_err());
+    assert!(Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nnope: 1\n").is_err());
 }
 
 #[test]
 fn the_ice_socket_defaults_to_a_single_udp_port() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert_eq!(config.rtc.udp_port, 7882);
     assert_eq!(config.rtc.bind_address, "0.0.0.0");
@@ -396,7 +425,7 @@ fn the_ice_socket_defaults_to_a_single_udp_port() {
 #[test]
 fn a_port_range_is_used_when_no_single_port_is_set() {
     let config = Config::parse(
-            "keys:\n  key1: secret1\nrtc:\n  udp_port: 0\n  port_range_start: 50000\n  port_range_end: 50002\n",
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  udp_port: 0\n  port_range_start: 50000\n  port_range_end: 50002\n",
         )
         .unwrap();
 
@@ -406,7 +435,7 @@ fn a_port_range_is_used_when_no_single_port_is_set() {
 #[test]
 fn an_empty_port_range_leaves_the_port_to_the_operating_system() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n",
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  udp_port: 0\n  port_range_start: 0\n  port_range_end: 0\n",
     )
     .unwrap();
 
@@ -416,7 +445,7 @@ fn an_empty_port_range_leaves_the_port_to_the_operating_system() {
 #[test]
 fn advertised_addresses_take_the_bound_port_unless_they_carry_one() {
     let config = Config::parse(
-            "keys:\n  key1: secret1\nrtc:\n  advertise_addresses:\n    - 203.0.113.7\n    - 203.0.113.8:1234\n",
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  advertise_addresses:\n    - 203.0.113.7\n    - 203.0.113.8:1234\n",
         )
         .unwrap();
 
@@ -427,32 +456,37 @@ fn advertised_addresses_take_the_bound_port_unless_they_carry_one() {
 
 #[test]
 fn the_ice_disconnected_grace_period_is_configurable() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
     assert_eq!(
         config.rtc.ice_disconnected_grace(),
         Duration::from_secs(DEFAULT_ICE_DISCONNECTED_TIMEOUT_SECONDS.into())
     );
 
-    let config =
-        Config::parse("keys:\n  key1: secret1\nrtc:\n  ice_disconnected_timeout: 3\n").unwrap();
+    let config = Config::parse(
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_disconnected_timeout: 3\n",
+    )
+    .unwrap();
     assert_eq!(config.rtc.ice_disconnected_grace(), Duration::from_secs(3));
 }
 
 #[test]
 fn the_negotiation_timeout_is_configurable() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
     assert_eq!(
         config.rtc.negotiation_grace(),
         Duration::from_secs(DEFAULT_NEGOTIATION_TIMEOUT_SECONDS.into())
     );
 
-    let config = Config::parse("keys:\n  key1: secret1\nrtc:\n  negotiation_timeout: 2\n").unwrap();
+    let config = Config::parse(
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  negotiation_timeout: 2\n",
+    )
+    .unwrap();
     assert_eq!(config.rtc.negotiation_grace(), Duration::from_secs(2));
 }
 
 #[test]
 fn the_simulcast_timings_are_configurable() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
     assert_eq!(
         config.video.dynacast_pause_delay(),
         Duration::from_millis(DEFAULT_DYNACAST_PAUSE_DELAY_MS.into())
@@ -463,7 +497,7 @@ fn the_simulcast_timings_are_configurable() {
     );
 
     let config = Config::parse(
-            "keys:\n  key1: secret1\nvideo:\n  dynacast_pause_delay_ms: 250\n  layer_upgrade_hold_ms: 100\n",
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  dynacast_pause_delay_ms: 250\n  layer_upgrade_hold_ms: 100\n",
         )
         .unwrap();
     assert_eq!(
@@ -480,11 +514,12 @@ fn the_simulcast_timings_are_configurable() {
 /// can disagree with it.
 #[test]
 fn naming_a_database_is_what_chooses_the_database() {
-    let files = Config::parse("keys:\n  devkey: devsecret\n").expect("a config with no store");
+    let files = Config::parse("keys:\n  devkey: devsecretdevsecretdevsecretdevsecret\n")
+        .expect("a config with no store");
     assert!(!files.sessions.in_postgres());
 
     let database = Config::parse(
-        "keys:\n  devkey: devsecret\nsessions:\n  postgres:\n    url: \
+        "keys:\n  devkey: devsecretdevsecretdevsecretdevsecret\nsessions:\n  postgres:\n    url: \
              postgres://mediacore@db/mediacore\n",
     )
     .expect("a config that names a database");
@@ -503,7 +538,7 @@ fn naming_a_database_is_what_chooses_the_database() {
 #[test]
 fn a_lease_that_cannot_outlive_a_statement_is_refused() {
     let refusal = Config::parse(
-        "keys:\n  devkey: devsecret\nsessions:\n  postgres:\n    url: \
+        "keys:\n  devkey: devsecretdevsecretdevsecretdevsecret\nsessions:\n  postgres:\n    url: \
              postgres://mediacore@db/mediacore\n    timeout_ms: 10000\n    lease_ms: 15000\n",
     )
     .expect_err("a lease shorter than three statement timeouts was accepted");
@@ -516,8 +551,10 @@ fn a_lease_that_cannot_outlive_a_statement_is_refused() {
 
 #[test]
 fn a_directory_is_still_required_when_no_database_is_named() {
-    let refusal = Config::parse("keys:\n  devkey: devsecret\nsessions:\n  directory: \"\"\n")
-        .expect_err("a server with nowhere at all to put a meeting record started");
+    let refusal = Config::parse(
+        "keys:\n  devkey: devsecretdevsecretdevsecretdevsecret\nsessions:\n  directory: \"\"\n",
+    )
+    .expect_err("a server with nowhere at all to put a meeting record started");
 
     assert!(refusal.to_string().contains("sessions.directory"));
 }
@@ -556,7 +593,7 @@ fn the_shipped_sample_is_a_config_this_server_parses() {
 
 #[test]
 fn bandwidth_estimation_is_off_until_it_is_asked_for() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert!(!config.video.bwe.enabled);
     assert_eq!(config.video.bwe.initial_kbps, DEFAULT_BWE_INITIAL_KBPS);
@@ -590,7 +627,7 @@ fn bandwidth_estimation_is_off_until_it_is_asked_for() {
 #[test]
 fn the_bandwidth_block_is_configurable() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nvideo:\n  bwe:\n    enabled: true\n    initial_kbps: 1200\n    \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    enabled: true\n    initial_kbps: 1200\n    \
              allow_pause: true\n    audio_reserve_kbps: 64\n    allocation_interval_ms: 100\n",
     )
     .unwrap();
@@ -613,23 +650,31 @@ fn the_bandwidth_block_is_configurable() {
 #[test]
 fn rejects_a_bandwidth_block_that_cannot_run() {
     assert!(
-        Config::parse("keys:\n  key1: secret1\nvideo:\n  bwe:\n    allocation_interval_ms: 0\n")
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    allocation_interval_ms: 0\n")
             .is_err(),
         "an allocator that never ticks is a silently dead allocator"
     );
     assert!(
-        Config::parse("keys:\n  key1: secret1\nvideo:\n  bwe:\n    initial_kbps: 0\n").is_err()
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    initial_kbps: 0\n"
+        )
+        .is_err()
     );
     assert!(
             Config::parse(
-                "keys:\n  key1: secret1\nvideo:\n  bwe:\n    initial_kbps: 4000\n    max_desired_kbps: 1000\n"
+                "keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    initial_kbps: 4000\n    max_desired_kbps: 1000\n"
             )
             .is_err()
         );
     assert!(
-        Config::parse("keys:\n  key1: secret1\nvideo:\n  bwe:\n    overhead_bytes: 0\n").is_err()
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    overhead_bytes: 0\n").is_err()
     );
-    assert!(Config::parse("keys:\n  key1: secret1\nvideo:\n  bwe:\n    nope: 1\n").is_err());
+    assert!(
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nvideo:\n  bwe:\n    nope: 1\n"
+        )
+        .is_err()
+    );
 }
 
 /// Nothing is offered until somebody names a relay. A client that is handed an
@@ -637,7 +682,7 @@ fn rejects_a_bandwidth_block_that_cannot_run() {
 /// is what every deployment did before any of this existed.
 #[test]
 fn no_ice_server_is_offered_until_one_is_configured() {
-    let config = Config::parse("keys:\n  key1: secret1\n").unwrap();
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n").unwrap();
 
     assert!(config.rtc.ice_servers.is_empty());
 }
@@ -645,7 +690,7 @@ fn no_ice_server_is_offered_until_one_is_configured() {
 #[test]
 fn a_relay_can_be_named_with_a_fixed_pair_or_with_a_secret() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          stun:stun.example.test:3478\n    - urls:\n        - \
          turn:turn.example.test:3478?transport=udp\n        - \
          turns:turn.example.test:5349?transport=tcp\n      username: mediacore\n      \
@@ -684,7 +729,7 @@ fn a_relay_can_be_named_with_a_fixed_pair_or_with_a_secret() {
 #[test]
 fn a_minted_credential_outlives_a_meeting_without_being_asked_to() {
     let config = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478\n      secret: coturn-shared-secret\n",
     )
     .unwrap();
@@ -700,12 +745,12 @@ fn a_minted_credential_outlives_a_meeting_without_being_asked_to() {
 #[test]
 fn rejects_an_ice_server_that_would_never_relay_anything() {
     let refused =
-        Config::parse("keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - username: u\n")
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - username: u\n")
             .expect_err("an entry with no address at all is not an ice server");
     assert!(refused.to_string().contains("no urls"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          https://turn.example.test\n",
     )
     .expect_err("a browser refuses the whole list over a scheme it does not know");
@@ -715,14 +760,14 @@ fn rejects_an_ice_server_that_would_never_relay_anything() {
     );
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478\n",
     )
     .expect_err("a relay offered with no credentials refuses every allocation");
     assert!(refused.to_string().contains("no credentials"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478\n      username: mediacore\n      credential: \
          relay-password\n      secret: coturn-shared-secret\n",
     )
@@ -730,14 +775,14 @@ fn rejects_an_ice_server_that_would_never_relay_anything() {
     assert!(refused.to_string().contains("both"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478\n      username: mediacore\n",
     )
     .expect_err("half a pair is a pair a relay refuses");
     assert!(refused.to_string().contains("half"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          stun:stun.example.test:3478\n      username: mediacore\n      credential: \
          relay-password\n",
     )
@@ -745,14 +790,14 @@ fn rejects_an_ice_server_that_would_never_relay_anything() {
     assert!(refused.to_string().contains("stun"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          stun:stun.example.test:3478\n      secret: coturn-shared-secret\n",
     )
     .expect_err("a stun server given a minting secret is the same mistake");
     assert!(refused.to_string().contains("stun"), "{refused}");
 
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478\n      secret: coturn-shared-secret\n      ttl_seconds: 0\n",
     )
     .expect_err("a credential that has expired when it arrives was never a credential");
@@ -760,7 +805,7 @@ fn rejects_an_ice_server_that_would_never_relay_anything() {
 
     assert!(
         Config::parse(
-            "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
              turn:turn.example.test:3478\n      secret: s\n      nope: 1\n"
         )
         .is_err(),
@@ -852,7 +897,7 @@ fn takes_every_ice_url_shape_a_browser_takes() {
 #[test]
 fn an_unparseable_url_is_refused_wherever_it_sits_in_an_entry() {
     let refused = Config::parse(
-        "keys:\n  key1: secret1\nrtc:\n  ice_servers:\n    - urls:\n        - \
+        "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  ice_servers:\n    - urls:\n        - \
          turn:turn.example.test:3478?transport=udp\n        - \
          turns:turn.example.test:5349?transport=tls\n      username: mediacore\n      \
          credential: relay-password\n",
@@ -867,15 +912,116 @@ fn an_unparseable_url_is_refused_wherever_it_sits_in_an_entry() {
 
 #[test]
 fn rejects_addresses_that_are_not_addresses() {
-    assert!(Config::parse("keys:\n  key1: secret1\nrtc:\n  bind_address: nowhere\n").is_err());
     assert!(
-        Config::parse("keys:\n  key1: secret1\nrtc:\n  advertise_addresses:\n    - nowhere\n")
+        Config::parse(
+            "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  bind_address: nowhere\n"
+        )
+        .is_err()
+    );
+    assert!(
+        Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  advertise_addresses:\n    - nowhere\n")
             .is_err()
     );
     assert!(
             Config::parse(
-                "keys:\n  key1: secret1\nrtc:\n  udp_port: 0\n  port_range_start: 60000\n  port_range_end: 50000\n"
+                "keys:\n  key1: 0123456789abcdef0123456789abcdef\nrtc:\n  udp_port: 0\n  port_range_start: 60000\n  port_range_end: 50000\n"
             )
             .is_err()
         );
+}
+
+/// `load` reads a file and `parse` reads text; the variables are filled in
+/// between the two, and this is the test that the wiring exists at all -- a
+/// `load` that forgot to call the expander would hand serde a `${...}` and the
+/// deployment would find out from a token that never verifies.
+///
+/// The name asked for here is deliberately one no environment has, so the test
+/// proves the wiring without setting a variable: a process cannot set one for a
+/// single thread, and every test in this binary shares the environment.
+#[test]
+fn load_fills_in_the_variables_and_refuses_the_ones_nothing_set() {
+    let path = std::env::temp_dir().join(format!("mediacore-config-{}.yaml", short_id()));
+    std::fs::write(
+        &path,
+        "keys:\n  devkey: \"${MEDIACORE_SECRET_NOTHING_SETS}\"\n",
+    )
+    .expect("writing a config to a temporary file");
+
+    let refusal = Config::load(&path).expect_err("a config whose api secret is nothing was loaded");
+    std::fs::remove_file(&path).expect("removing the temporary config");
+
+    let refusal = format!("{refusal:#}");
+    assert!(
+        refusal.contains("MEDIACORE_SECRET_NOTHING_SETS"),
+        "the refusal has to name the variable somebody has to set: {refusal}"
+    );
+    assert!(
+        refusal.contains(&path.display().to_string()),
+        "and the file it was asked for in: {refusal}"
+    );
+}
+
+/// The state a Kubernetes Secret is in when its api-secret key exists and holds
+/// nothing: `--from-literal=api-secret=`, a Helm value left as `""`, a sealed
+/// secret that decrypted to nothing. `${MEDIACORE_API_SECRET}` fills in with an
+/// empty string, because set-and-empty is a value this server honours, and
+/// HS256 signs and verifies with an empty key perfectly happily -- so the pod
+/// would be Ready with a green `/healthz` and anybody who knows the *name* of
+/// the api key, `mediacore` in the shipped template and not a secret, could mint
+/// a join token for any room on it. `deploy/start-sfu.sh` refuses this, and a
+/// chart does not run that script -- the published image has no shell to run it
+/// with -- so the refusal belongs where the parsed document is.
+#[test]
+fn an_api_secret_that_is_empty_is_refused_rather_than_signing_with_nothing() {
+    let refusal = Config::parse("keys:\n  mediacore: \"\"\n")
+        .expect_err("a server whose tokens are signed with an empty key started");
+
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("mediacore"),
+        "the refusal has to name the key whose secret has to be set: {refusal}"
+    );
+}
+
+/// The front end refuses the same secret, out of the same variable, below the
+/// same floor (`crates/front/src/config.rs`). The two halves mint and verify
+/// each other's tokens, so a secret one of them will not start on is not a
+/// secret this deployment can use, and the server accepting what the front end
+/// rejects is the disagreement rather than the tolerance.
+#[test]
+fn an_api_secret_too_short_to_sign_a_token_with_is_refused() {
+    let refusal = Config::parse("keys:\n  mediacore: short\n")
+        .expect_err("a server whose token secret is five bytes long started");
+
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("mediacore") && refusal.contains("32"),
+        "the refusal has to name the key and the length it has to clear: {refusal}"
+    );
+}
+
+/// A floor and not a preference: exactly 32 bytes starts, so that the length
+/// `deploy/README.md` tells people to generate is not one byte from a refusal.
+#[test]
+fn an_api_secret_of_exactly_the_floor_is_accepted() {
+    let config = Config::parse("keys:\n  key1: 0123456789abcdef0123456789abcdef\n")
+        .expect("a secret at the documented length was refused");
+
+    assert_eq!(config.keys["key1"].len(), MIN_SECRET_BYTES);
+}
+
+/// The name is the `iss` of every token and the name `mediacore_auth::verify`
+/// looks the secret up by, so a key with no name is not a key nothing can use:
+/// it is a key whose name is the empty string, and a token that claims that
+/// issuer verifies. It is what the shipped template renders when
+/// `MEDIACORE_API_KEY` is set to empty, which is one forgotten Helm value away.
+#[test]
+fn an_api_key_with_no_name_is_refused() {
+    let refusal = Config::parse("keys:\n  \"\": 0123456789abcdef0123456789abcdef\n")
+        .expect_err("a server with a nameless api key started");
+
+    assert!(
+        refusal.to_string().contains("name"),
+        "the refusal has to say what is missing: {refusal}"
+    );
 }
