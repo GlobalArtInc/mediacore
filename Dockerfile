@@ -106,8 +106,21 @@ RUN install -d -o mediacore -g mediacore /var/lib/mediacore/sessions \
     && install -d -o mediacore -g mediacore /var/lib/mediacore/events \
     && install -d -o mediacore -g mediacore /var/lib/mediacore/recordings
 COPY --from=builder /out/mediacore /out/mediacore-front /usr/local/bin/
-USER mediacore
-WORKDIR /home/mediacore
+# The number, not the name, and both stages say it the same way. Kubernetes can
+# only check `runAsNonRoot` against a numeric USER -- a name means reading the
+# image's own /etc/passwd, which the kubelet will not do, so some admission
+# policies refuse such an image outright. `mediacore` here IS 10001, so this
+# changes nothing about who the process is; it changes what a reader of the image
+# can tell without running it. The volumes that already exist are owned by 10001
+# and the chart runs the pod as 10001, which is the number that has to keep
+# matching.
+USER 10001:10001
+# The same directory the distroless stage uses. Nothing in either image reads a
+# relative path -- every caller passes --config or MEDIACORE_CONFIG absolutely --
+# but a difference between the image that is tested and the image that ships is
+# the kind that is discovered by the one thing nobody tried, and proving both
+# stages is worth nothing if they are not the same shape.
+WORKDIR /var/lib/mediacore
 # 7880 signalling, 8080 front end, 7882/udp media.
 EXPOSE 7880 8080 7882/udp
 CMD ["/usr/local/bin/mediacore"]

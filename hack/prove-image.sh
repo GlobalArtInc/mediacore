@@ -169,6 +169,15 @@ echo "front /healthz: $page"
 # and a production volume full of records the server can no longer
 # write to: the chart runs the pod as 10001 with fsGroup 10001, and
 # every volume that already exists is owned by 10001.
+# Both stages have to be the same shape here, or proving one says nothing about
+# the other. WORKDIR first, because a difference in it is invisible until
+# something passes a relative path.
+workdir="$(docker image inspect --format '{{.Config.WorkingDir}}' "$IMAGE")"
+if [ "$workdir" != "/var/lib/mediacore" ]; then
+  echo "the image works out of \`$workdir\`; both runtime stages are meant to say /var/lib/mediacore" >&2
+  exit 1
+fi
+
 user="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
 if [ "$user" != "10001:10001" ]; then
   echo "the image runs as \`$user\`; the chart and every existing volume say 10001:10001" >&2
