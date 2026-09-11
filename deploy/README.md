@@ -144,6 +144,48 @@ notice is served beside it at `/swagger/NOTICE.txt`.
 
 ## Upgrading a deployment that already runs
 
+### The config file is read differently in this release
+
+Two changes here can stop a server that started yesterday, so they come before
+the commands.
+
+**The server fills in its own variables now, and `$$` is one `$`.** Nothing
+renders the config any more: `start-sfu.sh` exports what
+`mediacore.yaml.template` names and hands the server the template itself,
+variables and all, and the server fills every `${MEDIACORE_...}` in from its own
+environment as it reads the file. That is what gets the api secret off the
+filesystem — there is no rendered copy to read, to back up, or to leave behind on
+a volume. The expansion applies to **every** config this server reads, a
+hand-written `config.yaml` and a ConfigMap somebody else rendered included, and
+there is no switch to turn it off for one file: one rule everywhere is the only
+version of this that stays reasonable, and two would mean a deployment that
+renders its own config and forgets which mode it is in. So check two things in
+any config you already have:
+
+- **A value with a literal `$$` in it loses one dollar.** `pa$$word` is read as
+  `pa$word`, and what you see then is a database refusing the password, a long
+  way from the config that changed it. `$$` is how one literal dollar is
+  written, so `pa$$$$word` is the value that was meant.
+- **A value with `${MEDIACORE_...}` in it, or something close enough to be a
+  mistake, is a refusal that names it** rather than text left as it stands:
+  `$MEDIACORE_X` with no braces (which `envsubst` did substitute), or
+  `${mediacore_x}` in lower case. A `${...}` that is genuinely somebody else's —
+  `${HOME}`, or one inside a room's metadata — is left exactly as written.
+
+**A token-signing secret has to be at least 32 bytes, and may not be empty.** The
+server refuses both now, naming the key. The front end has always refused to
+start below 32 bytes on this same secret, so a shorter one was never a deployment
+that worked end to end — but an SFU running without the front end would have
+started on it, and on this tag it will not: generate one with
+`openssl rand -hex 32`. Empty is the case worth the paragraph. HS256 signs and
+verifies with an empty key perfectly happily, so a Secret whose `api-secret` key
+existed and held nothing used to give a server that was Ready, answered
+`/healthz`, and accepted a join token for any room minted by anybody who knew
+that the key is *called* `mediacore` — a name that is in this repository and is
+not a secret. Only `start-sfu.sh` refused it, and a cluster does not run
+`start-sfu.sh`. Check what your Secret actually holds before rolling this image;
+a deployment that was running on a short secret stops starting, by design.
+
 ### Using the compose file in this repository
 
 ```
@@ -846,9 +888,23 @@ docker compose logs turn | grep start-turn
 start-turn: relaying on port 3478 for realm meet.example.com, advertising 203.0.113.7, peers limited to 203.0.113.7
 ```
 
-`docker compose exec sfu cat /tmp/mediacore.yaml` and
-`docker compose exec turn cat /tmp/turnserver.conf` are the rendered truth if
-either line surprises you.
+If either line surprises you, the two halves answer differently now. `turn` still
+renders, so `docker compose exec turn cat /tmp/turnserver.conf` is its rendered
+truth. `sfu` renders nothing: the file it read is `mediacore.yaml.template` in
+this directory, byte for byte as the repository ships it, and the values that
+filled it in are the `MEDIACORE_*` in `.env` — `docker compose config` shows what
+compose will hand it, `docker compose exec sfu env | grep MEDIACORE_` shows what
+it was handed. With one exception, and it is the one this section is about: the
+`ice_servers` block is built by `start-sfu.sh` and lives only in the environment
+of the server it exec'd, which `exec` cannot show you, because `exec` starts a new
+process from the container's configured environment rather than from PID 1's. The
+startup line above is the whole of the report on that block.
+
+Both `exec` commands are for this stack. The image a cluster installs is
+distroless — no shell, no `cat`, nothing to exec into — so there the file the
+server read is the ConfigMap the chart mounts (`kubectl get configmap <name> -o
+yaml`), the values are the container's own environment (`kubectl describe pod`,
+and the Secret they come from), and the startup line is in `kubectl logs`.
 
 Five lines in coturn's own log are noise, and knowing them costs less than
 chasing them:
@@ -999,8 +1055,36 @@ are honoured for the calls the front end makes to the provider.
   needs `host.docker.internal` or the host address as its upstream instead of
   `sfu:7880`.
 - **Images are floating tags** (`rust:1-bookworm`, `debian:bookworm-slim`,
-  `caddy:2-alpine`). Pin them by digest for a deployment you intend to
-  reproduce.
+  `gcr.io/distroless/cc-debian12`, `caddy:2-alpine`). Pin them by digest for a
+  deployment you intend to reproduce.
+- **The image this stack builds is not the image a cluster installs**, and the
+  difference is one line in each compose file: `target: shell`. CI builds two
+  runtime stages on every push and proves both of them by starting the binaries
+  and reading `/healthz`: `shell`, which is debian with a certificate bundle and
+  `envsubst`, and `runtime`, which is distroless — glibc, a certificate bundle,
+  the two binaries, and no shell, no package manager, no curl, nothing in it that
+  can be talked into running anything. Today the `shell` stage is the one that
+  gets the tag, because the Helm chart still starts an init container out of this
+  image and that container is a shell script; the distroless stage is built and
+  exercised anyway, so making it the published one is a one-line change to
+  something already known to run. The `sfu` service here starts through `start-sfu.sh`, which
+  refuses an advertised address no client can reach and builds the `ice_servers`
+  block, and a shell script needs a shell — so `docker compose up --build` puts
+  the same two binaries on debian instead. Everything else about the two is the
+  same: one cargo build, one pair of binaries, the same uid 10001, the same
+  directories. What it costs is that trying something out here does not prove the
+  published image; what pays for it is that the published image is started, and
+  asked for `/healthz` on both binaries, before it is pushed anywhere. What it
+  buys the cluster is a container with nothing to exec and no writable
+  filesystem to need.
+- **The health of `sfu` and `front` is the binary's own answer**, not curl's:
+  `test: ["CMD", "/usr/local/bin/mediacore", "healthcheck"]`. There is no curl in
+  either image any more, and the subcommand reads the body as well as the status —
+  it insists on this server's health line, where `curl -fsS` would have taken a
+  200 from whatever else ended up on the port. To ask by hand, from the host:
+  `docker compose exec sfu /usr/local/bin/mediacore healthcheck; echo $?`. Zero,
+  and silent, is healthy; anything else prints what answered and why it was not
+  believed.
 - **Secrets.** `.env` is gitignored here. It holds the token-signing secret;
   anyone with it can mint a token for any room and any identity. The `caddy` and
   `turn` services deliberately do not read `.env` — each is given the variables

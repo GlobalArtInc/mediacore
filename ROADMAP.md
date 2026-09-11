@@ -698,9 +698,20 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   `README.md:1624-1632` gives the two commands that would cover it — commands CI does not run. The
   declared delivery path rots quietly and is absent from the production image. The fix is two lines
   in `ci.yml`, and it needs a C toolchain for `rdkafka-sys`.
-- **`build.yml` is not gated on `ci.yml`.** It triggers on push to main with no `needs`, so a red
-  main still builds and pushes an image to Harbor. And the `Dockerfile` is built on no pull request
-  at all — a broken cargo-chef recipe is discovered after the merge.
+- ~~**`build.yml` is not gated on `ci.yml`.**~~ Done: it starts from a finished CI run and asks for
+  `success`, and the image is started and read from before it is pushed. What is left of the item is
+  its second half — the `Dockerfile` is still built on no pull request at all, so a broken cargo-chef
+  recipe is discovered after the merge, on the self-hosted runner.
+- **Nothing sets a umask, so files land 0644 where 0600 is meant.** Meeting records, the event outbox
+  and finished recordings are created with plain `File::create`, and nothing in any crate sets a mode:
+  `crates/session/src/files.rs:446`, `crates/events/src/outbox.rs:360`,
+  `crates/recording/src/disk.rs:149`. `deploy/start-sfu.sh` sets `umask 077` before it execs, which
+  covers the compose stack — the one place the volumes are a bind mount somebody else can read. Under
+  Kubernetes nothing does, and no manifest can: a pod has no umask field. The fix is either one
+  `umask` call in `main.rs`, which wants `libc` as a direct dependency for a single line, or an
+  explicit `OpenOptionsExt::mode` at each of the three sites, which needs no dependency and cannot be
+  forgotten by a future writer only if somebody remembers to add it. Hours either way; the reason it
+  is written down rather than done is that the choice is a dependency question, not a coding one.
 - **No `cargo audit` or `cargo deny`, no dependabot, no `SECURITY.md`.** For a server exposed to the
   internet with str0m, reqwest, rdkafka and a vendored 1.3 MB `livekit-client` bundle, nothing
   watches for CVEs.

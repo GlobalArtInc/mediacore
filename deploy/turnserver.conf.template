@@ -2,10 +2,11 @@
 # reads. start-turn.sh refuses to start when one of the values that cannot have
 # a sensible default is empty, and every ${...} below comes from deploy/.env.
 #
-# The SFU's template next door is rendered with envsubst and this one is not.
-# That is not a preference: envsubst is in the mediacore image because its
-# Dockerfile puts it there, and this is somebody else's image, in which a shell
-# and sed are the only things worth counting on.
+# The SFU's template next door is not rendered at all any more -- the server
+# fills its own variables in as it reads the file. This one is rendered here
+# because coturn cannot: it is somebody else's image, in which a shell and sed
+# are the only things worth counting on, and there is no envsubst in the
+# mediacore image either now that nothing in it needed one.
 #
 # Two of the placeholders here are not variables from deploy/.env at all.
 # ${MEDIACORE_TURN_TLS_ON} and ${MEDIACORE_TURN_TLS_OFF} render as either
