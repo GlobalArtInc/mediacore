@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use clap::Parser;
+use anyhow::Context as _;
+use clap::{Parser, Subcommand};
 use mediacore_config::Config;
 use mediacore_proto::mediacore;
 use mediacore_server::{http, state::AppState};
@@ -24,16 +25,73 @@ const SHUTDOWN_FLUSH: Duration = Duration::from_secs(10);
 /// than a socket that was not said goodbye to properly.
 const SHUTDOWN_SOCKETS: Duration = Duration::from_secs(5);
 
+/// What `healthcheck` reads.
+const HEALTH_PATH: &str = "/healthz";
+
+/// The field `healthcheck` insists on finding in the answer.
+///
+/// A substring rather than the whole line, and deliberately so: the health line
+/// grows on the end (see `mediacore_server::metrics`), and a check that pinned
+/// the whole of it would call a working server unhealthy the day somebody adds a
+/// counter. `rooms=` is the first field it has ever had, and finding it is what
+/// tells a 200 from this server apart from a 200 from whatever else may end up
+/// on the port.
+const HEALTH_FIELD: &str = "rooms=";
+
+/// How long `healthcheck` waits for the answer.
+///
+/// Shorter than the three seconds `deploy/docker-compose.yml` gives the check,
+/// so a server that accepts the connection and then says nothing is reported by
+/// this process -- with the url in the message -- rather than killed by docker
+/// with nothing said at all.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Parser)]
 #[command(name = "mediacore", version, about = "Selective forwarding unit")]
 struct Cli {
     #[arg(long, short, env = "MEDIACORE_CONFIG", default_value = "config.yaml")]
     config: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// One subcommand, and it does not start a server. Without it this binary is the
+/// server, exactly as it was before there was a subcommand at all.
+#[derive(Subcommand)]
+enum Command {
+    /// Ask the server in this container whether it is answering. Exit 0 if it
+    /// is, and print why not if it is not.
+    Healthcheck {
+        /// The signalling port to ask on.
+        //
+        // Not read out of the config file, and that is the whole point: the
+        // config is rendered from the environment as it is loaded, and a
+        // healthcheck is a fresh process holding only what the container was
+        // created with. `MEDIACORE_ICE_SERVERS_BLOCK` and the rest are exported
+        // by `deploy/start-sfu.sh` into the server's own environment and
+        // nowhere else, so a check that loaded the config would refuse to start
+        // on a perfectly healthy server, by name, and report it as unhealthy.
+        //
+        // The default is `mediacore-config`'s own default, taken from it rather
+        // than written here a second time: a config that says nothing about
+        // `port:` gets that number, so this asks on it, and a 7880 copied into
+        // this file is a number that agrees until somebody changes the other
+        // one. A config that does name a port names it here too --
+        // `healthcheck --port <n>` -- which is the one thing this cannot work
+        // out for itself, and is what the compose files' healthchecks say.
+        #[arg(long, default_value_t = Config::default().port)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::Healthcheck { port }) = cli.command {
+        return healthcheck(port).await;
+    }
+
     let config = Config::load(&cli.config)?;
     init_tracing(&config.log_level);
 
@@ -107,6 +165,51 @@ fn init_tracing(level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("mediacore={level}")));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Whether the server on this host is working, as an exit code.
+///
+/// This is the container healthcheck. It is a subcommand of the server rather
+/// than `curl` because the image carries neither curl nor a shell to run one in
+/// -- and because the thing that has to be checked is this server, so the
+/// process that knows what a healthy answer looks like is this one. Nothing
+/// about it is specific to docker: `docker exec … healthcheck`, a compose
+/// `test`, and an `exec` probe in a chart all read the same exit code.
+///
+/// It asks over the loopback address on purpose. A healthcheck that resolved a
+/// name would be a healthcheck that fails when DNS does, on a server that is
+/// perfectly able to hold the meetings it already has.
+async fn healthcheck(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}{HEALTH_PATH}");
+    let answer = reqwest::Client::builder()
+        .timeout(HEALTHCHECK_TIMEOUT)
+        // The one setting here that is not obvious, and the one that matters
+        // most. This container's environment may well name an outbound proxy --
+        // `deploy/.env` carries `HTTPS_PROXY` for webhooks that leave the host
+        // -- and reqwest reads it. Asking a proxy for 127.0.0.1 asks it about
+        // itself, so the check would answer about the wrong machine, or fail
+        // while this server is fine.
+        .no_proxy()
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("asking {url}"))?;
+
+    let status = answer.status();
+    // Read before the status is judged, so a refusal can quote what was said:
+    // a proxy's error page or another service's 404 is the answer to the
+    // question "what is on this port", and it is worth printing.
+    let body = answer.text().await.unwrap_or_default();
+
+    anyhow::ensure!(status.is_success(), "{url} answered {status}: {body}");
+    anyhow::ensure!(
+        body.contains(HEALTH_FIELD),
+        "{url} answered {status}, but the body has no `{HEALTH_FIELD}` in it, so whatever is on \
+         that port is not this server: {body}"
+    );
+
+    Ok(())
 }
 
 /// Waits for the stop, then lets go of the rooms before returning.

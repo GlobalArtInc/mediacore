@@ -170,18 +170,53 @@ where
     }
 }
 
+/// One variable, trimmed, with empty counting as not set at all.
+///
+/// Emptiness is deliberately not a value. `MEDIACORE_FRONT_PORT=` is what
+/// compose interpolation of an unset variable produces, and what a chart's
+/// `value: {{ .Values.front.port | quote }}` renders when there is no value to
+/// quote, so an environment that says nothing about something has to look
+/// exactly like one that never mentioned it: anything else turns silence into a
+/// refusal to start.
+fn given(source: &dyn Environment, name: &'static str) -> Result<Option<String>, ConfigError> {
+    Ok(source
+        .lookup(name)?
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty()))
+}
+
+/// Which port the front end serves on, from an environment.
+///
+/// Public, and reachable without the rest of the config, because the container
+/// healthcheck has to answer this one question in a process that holds nothing
+/// else -- no api secret, no WebSocket url -- and has to answer it the same way.
+/// A second implementation of this rule is what had `mediacore-front
+/// healthcheck` refusing an empty `MEDIACORE_FRONT_PORT` while the server beside
+/// it read the same emptiness as silence, bound 8080 and answered `ok`: docker
+/// held a working container `unhealthy` for ever and compose held caddy back
+/// behind it, so a stack whose front end was fine served nothing at all.
+pub fn port_from(source: &dyn Environment) -> Result<u16, ConfigError> {
+    match given(source, PORT)? {
+        Some(value) => value
+            .parse()
+            .map_err(|_| ConfigError::NotAPort { name: PORT, value }),
+        None => Ok(DEFAULT_PORT),
+    }
+}
+
+/// The port this process's own environment names, for the check, which reads
+/// nothing else.
+pub fn port_from_env() -> Result<u16, ConfigError> {
+    port_from(&process_env)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(&process_env)
     }
 
     pub fn from_source(source: &dyn Environment) -> Result<Self, ConfigError> {
-        let optional = |name| -> Result<Option<String>, ConfigError> {
-            Ok(source
-                .lookup(name)?
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty()))
-        };
+        let optional = |name| given(source, name);
         let required = |name| match optional(name)? {
             Some(value) => Ok(value),
             None => Err(ConfigError::Missing(name)),
@@ -209,12 +244,7 @@ impl Config {
         let room =
             clean_room(&room).map_err(|source| ConfigError::BadRoom { name: ROOM, source })?;
 
-        let port = match optional(PORT)? {
-            Some(value) => value
-                .parse()
-                .map_err(|_| ConfigError::NotAPort { name: PORT, value })?,
-            None => DEFAULT_PORT,
-        };
+        let port = port_from(source)?;
 
         let brand = Brand::new(
             optional(BRAND_NAME)?.as_deref(),

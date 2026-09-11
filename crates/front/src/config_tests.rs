@@ -152,6 +152,55 @@ fn a_nonsense_port_is_refused() {
         Config::from_source(&env(&pairs)),
         Err(ConfigError::NotAPort { .. })
     ));
+    // And refused to the healthcheck as well. A check that quietly fell back to
+    // 8080 here would report a front end healthy while the front end was
+    // refusing to start on the same environment.
+    assert_eq!(
+        port_from(&env(&pairs)).unwrap_err(),
+        ConfigError::NotAPort {
+            name: PORT,
+            value: "https".to_owned()
+        }
+    );
+}
+
+/// One resolution of the port, not two that agree today.
+///
+/// `mediacore-front healthcheck` asks `port_from` because `from_source` does,
+/// and this is the pair pinned over the values that told them apart. An empty
+/// `MEDIACORE_FRONT_PORT` -- what compose interpolation of an unset variable
+/// produces, and what a chart renders from a value that is not there -- was
+/// silence to the server, which bound 8080 and served `/healthz`, and a value to
+/// the check, which could not parse it: docker held that container `unhealthy`
+/// for ever and compose held caddy back behind it, so a stack whose front end
+/// was fine served nothing at all.
+#[test]
+fn the_port_the_check_asks_on_is_the_port_the_front_end_binds() {
+    for (given, expected) in [
+        (None, DEFAULT_PORT),
+        (Some(""), DEFAULT_PORT),
+        (Some("   "), DEFAULT_PORT),
+        (Some("\n"), DEFAULT_PORT),
+        (Some("8080"), 8080),
+        (Some(" 9000 "), 9000),
+    ] {
+        let mut pairs = complete();
+        if let Some(value) = given {
+            pairs.push((PORT, value));
+        }
+        let source = env(&pairs);
+
+        assert_eq!(
+            port_from(&source).unwrap(),
+            expected,
+            "the healthcheck reads {given:?} as some other port"
+        );
+        assert_eq!(
+            Config::from_source(&source).unwrap().port,
+            expected,
+            "the front end binds {given:?} as some other port"
+        );
+    }
 }
 
 #[test]
