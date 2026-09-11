@@ -96,7 +96,15 @@ FROM debian:bookworm-slim AS shell
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates gettext-base \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --create-home --uid 10001 mediacore
+# The group is made explicitly, and with the same number as the user. `useradd
+# --system` on its own takes a gid out of Debian's system range -- 999 here --
+# which then owns every directory below and disagrees with the `10001:10001` this
+# stage declares and with the chart's runAsGroup and fsGroup. On Kubernetes fsGroup
+# papers over it; in the compose stack a fresh named volume arrives owned by a group
+# the process is not in, and it works only because the owner bits happen to be
+# enough. Agreeing on the number costs one line.
+RUN groupadd --system --gid 10001 mediacore \
+    && useradd --system --create-home --uid 10001 --gid 10001 mediacore
 # Docker gives a named volume the ownership of the path it is mounted over, so a
 # volume mounted at a path the image does not have would be root-owned and the
 # server -- running as uid 10001 -- would refuse to start because it cannot
