@@ -70,7 +70,7 @@ mod schema;
 
 pub use database::PostgresSettings;
 pub use recording::{
-    Claim, RECORDING_ID_PREFIX, Recording, Stage, State as WorkState, Work, recording_id,
+    Claim, Noted, RECORDING_ID_PREFIX, Recording, Stage, State as WorkState, Work, recording_id,
 };
 
 /// The prefix every session id carries, in the shape of the other ids on this
@@ -626,7 +626,7 @@ trait Sink: Send + Sync + 'static {
     /// node has stopped saying so.
     fn tick(&self, _live: &[String], _now_ms: i64) {}
 
-    fn note_recording(&self, _recording: &Recording, _now_ms: i64) -> Result<String, StoreError> {
+    fn note_recording(&self, _recording: &Recording, _now_ms: i64) -> Result<Noted, StoreError> {
         Err(StoreError::Unsupported("keep recordings"))
     }
 
@@ -1294,8 +1294,13 @@ impl SessionStore {
     /// the row it already wrote. The id that comes back is the one the store
     /// holds, which is the one to use from then on.
     ///
+    /// **It is also how a node re-offers an upload that was given up on.** The
+    /// caller is by definition holding the file -- it either just finished
+    /// writing it or just found it on its own disk -- and that is the one fact
+    /// a `failed` upload row was missing. See [`Noted::upload_offered_again`].
+    ///
     /// **Blocking**, and only Postgres does it: see [`SessionStore::files`].
-    pub fn note_recording(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError> {
+    pub fn note_recording(&self, recording: &Recording, now_ms: i64) -> Result<Noted, StoreError> {
         self.inner.sink.note_recording(recording, now_ms)
     }
 

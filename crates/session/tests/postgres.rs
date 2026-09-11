@@ -268,7 +268,8 @@ fn an_upload_goes_to_the_node_with_the_file_and_an_announcement_goes_to_anybody(
     };
     let id = holder
         .note_recording(&mine, at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
 
     let stranger = scratch.store("ND_stranger");
     assert!(
@@ -390,7 +391,8 @@ fn a_node_that_comes_back_under_a_new_name_adopts_its_own_recordings() {
             },
             now_ms(),
         )
-        .expect("the recording is written down again");
+        .expect("the recording is written down again")
+        .id;
 
     let taken = after
         .claim(Stage::Upload, now_ms(), 10)
@@ -1086,6 +1088,7 @@ fn two_claimants_never_take_the_same_work() {
             seeding
                 .note_recording(&recording(&session, "PA_1", segment, true), at)
                 .expect("the recording is written down")
+                .id
         })
         .collect();
 
@@ -1175,7 +1178,8 @@ fn a_claim_whose_holder_disappeared_comes_back_and_then_is_left_alone() {
 
     let id = seeding
         .note_recording(&recording(&session, "PA_1", 0, true), at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
 
     let taken = seeding
         .claim(Stage::Upload, at, 10)
@@ -1259,7 +1263,8 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     let open = recording(&session, "PA_1", 0, false);
     let id = store
         .note_recording(&open, at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
 
     assert!(
         store
@@ -1277,7 +1282,8 @@ fn nothing_is_uploaded_before_it_is_finished_and_nothing_is_announced_before_it_
     };
     let same = store
         .note_recording(&closed, at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
     assert_eq!(
         same, id,
         "the same segment written down twice became two rows, so the file would be uploaded twice"
@@ -1391,7 +1397,8 @@ fn a_postponed_upload_says_why_and_comes_back_when_it_is_due() {
 
     let id = store
         .note_recording(&recording(&session, "PA_1", 0, true), at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
 
     store
         .claim(Stage::Upload, at, 10)
@@ -1426,6 +1433,303 @@ fn a_postponed_upload_says_why_and_comes_back_when_it_is_due() {
         Some("the object store said 503"),
         "the reason the last attempt failed is the one thing an operator looking at a stuck queue \
          needs, and it is not there"
+    );
+}
+
+/// A node killed while its last attempt was in flight leaves the row `claimed`
+/// with its attempts spent, not `failed`: the reaper that converts one into the
+/// other lives inside `claim`, which runs after the node has already written
+/// its recordings down. So a re-offer that looked only for `failed` walked past
+/// exactly the row a restart was supposed to rescue, and the file waited for a
+/// second restart nobody had a reason to perform.
+///
+/// A LIVE claim is a different thing and must be left alone: the lease is what
+/// says somebody is uploading this right now, and re-offering it would be two
+/// nodes sending the same audio to the same key.
+#[test]
+fn an_upload_whose_node_died_mid_attempt_is_offered_again_and_a_live_claim_is_not() {
+    let scratch = database!("claimed_dead");
+    let at = now_ms();
+
+    let node = scratch.store("ND_holder");
+    node.noted(
+        "demo",
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
+        0,
+        0,
+        at,
+    );
+    let session = node.live("demo").expect("a meeting").id;
+    assert!(node.flush(Duration::from_secs(30)));
+
+    let made = Recording {
+        node: Some("ND_holder".to_owned()),
+        ..recording(&session, "PA_1", 0, true)
+    };
+    let id = node
+        .note_recording(&made, at)
+        .expect("the recording is written down")
+        .id;
+
+    // Four refusals, then a fifth claim that is never answered -- the node was
+    // killed with the request in flight, so the row stays `claimed` at its last
+    // attempt rather than being marked `failed` by anybody.
+    for _ in 1..=4 {
+        assert_eq!(
+            node.claim(Stage::Upload, at, 10)
+                .expect("the database answers")
+                .len(),
+            1
+        );
+        assert!(
+            node.postpone(&id, Stage::Upload, "the object store refused it (500)", at)
+                .expect("the database answers")
+        );
+    }
+    assert_eq!(
+        node.claim(Stage::Upload, at, 10)
+            .expect("the database answers")
+            .len(),
+        1,
+        "the fifth attempt was never handed out"
+    );
+
+    let upload = |store: &SessionStore| {
+        store
+            .work(&id)
+            .expect("the database answers")
+            .into_iter()
+            .find(|work| work.stage == Stage::Upload)
+            .expect("the upload row")
+    };
+    assert_eq!(
+        upload(&node).state,
+        WorkState::Claimed,
+        "the row under test has to be a claim that was never answered"
+    );
+
+    // While the lease is alive, writing the recording down must change nothing:
+    // as far as this database knows, somebody is uploading it this second.
+    let live = scratch.store("ND_holder");
+    let noted = live
+        .note_recording(
+            &Recording {
+                id: recording_id(),
+                node: Some("ND_holder".to_owned()),
+                ..made.clone()
+            },
+            at,
+        )
+        .expect("the recording is written down again");
+    assert!(
+        !noted.upload_offered_again,
+        "a live claim was taken away from the node holding it, which is two uploads of one file"
+    );
+    assert_eq!(upload(&live).state, WorkState::Claimed);
+
+    // An hour later the lease is long gone and the node is back with the file.
+    let back = scratch.store("ND_holder");
+    let noted = back
+        .note_recording(
+            &Recording {
+                id: recording_id(),
+                node: Some("ND_holder".to_owned()),
+                ..made
+            },
+            at + 3_600_000,
+        )
+        .expect("the recording is written down again");
+
+    assert_eq!(noted.id, id);
+    assert!(
+        noted.upload_offered_again,
+        "the first restart after the node died walked past its own file, so it would have waited \
+         for a second restart nobody had a reason to perform"
+    );
+    let row = upload(&back);
+    assert_eq!(row.state, WorkState::Waiting);
+    assert_eq!(row.attempts, 0);
+}
+
+/// An upload that was given up on is offered again when the node holding the
+/// file says it is holding it.
+///
+/// **The production failure, in SQL.** An object store refused a recording five
+/// times in eighteen seconds -- attempts are spent on the claim, so a short
+/// outage empties the whole ladder -- and the row went `failed`. The file stayed
+/// on the node's own volume, mounted and readable, under a `node` that a
+/// StatefulSet keeps stable across restarts, and the node restarted fourteen
+/// times over the next day and uploaded nothing: `note_recording` would revive
+/// an upload that was `blocked`, never one that was given up on, so every
+/// restart wrote the same row down, changed nothing, and said the upload was
+/// queued.
+///
+/// What re-offers it is the one thing a `failed` row does not know and the
+/// caller does: the file is here, on this disk, at this path. Which is what
+/// writing a recording down says.
+#[test]
+fn an_upload_that_was_given_up_on_is_offered_again_to_the_node_holding_the_file() {
+    let scratch = database!("given_up");
+    let at = now_ms();
+
+    let node = scratch.store("ND_holder");
+    node.noted(
+        "demo",
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
+        0,
+        0,
+        at,
+    );
+    let session = node.live("demo").expect("a meeting").id;
+    assert!(node.flush(Duration::from_secs(30)));
+
+    let made = Recording {
+        node: Some("ND_holder".to_owned()),
+        ..recording(&session, "PA_1", 0, true)
+    };
+    let id = node
+        .note_recording(&made, at)
+        .expect("the recording is written down")
+        .id;
+
+    // The outage: every attempt this deployment allows, spent inside a few
+    // seconds, because each claim spends one whether or not anybody comes back.
+    for attempt in 1..=5 {
+        let taken = node
+            .claim(Stage::Upload, at, 10)
+            .expect("the database answers");
+        assert_eq!(taken.len(), 1, "attempt {attempt} was never handed out");
+        assert!(
+            node.postpone(&id, Stage::Upload, "the object store refused it (500)", at)
+                .expect("the database answers")
+        );
+    }
+
+    let given_up = |store: &SessionStore| {
+        store
+            .work(&id)
+            .expect("the database answers")
+            .into_iter()
+            .find(|work| work.stage == Stage::Upload)
+            .expect("the upload row")
+    };
+    assert_eq!(
+        given_up(&node).state,
+        WorkState::Failed,
+        "five refusals did not use up five attempts"
+    );
+    assert!(
+        node.claim(Stage::Upload, at + 3_600_000, 10)
+            .expect("the database answers")
+            .is_empty(),
+        "a row that was given up on was handed out again by the queue itself"
+    );
+
+    // The node restarts, finds the file on its own disk and writes it down
+    // again -- same natural key, a new id off a sidecar, and a path that still
+    // resolves.
+    let back = scratch.store("ND_holder");
+    let noted = back
+        .note_recording(
+            &Recording {
+                id: recording_id(),
+                node: Some("ND_holder".to_owned()),
+                ..made
+            },
+            at + 3_600_000,
+        )
+        .expect("the recording is written down again");
+
+    assert_eq!(noted.id, id, "it landed on a second row for the same file");
+    assert!(
+        noted.upload_offered_again,
+        "the store did not say it had put a given-up upload back, so the log line that would tell \
+         an operator this happened cannot be written"
+    );
+
+    let row = given_up(&back);
+    assert_eq!(row.state, WorkState::Waiting);
+    assert_eq!(
+        row.attempts, 0,
+        "the attempts were not given back, so the next outage of any length gives up instantly"
+    );
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("the object store refused it (500)"),
+        "why it was given up on is the only account of the outage there will ever be, and clearing \
+         it leaves an operator a waiting row with no history"
+    );
+
+    let taken = back
+        .claim(Stage::Upload, at + 3_600_000, 10)
+        .expect("the database answers");
+    assert_eq!(
+        taken.len(),
+        1,
+        "the node holding the file said so and was still not offered its own upload; the audio \
+         sits on a readable disk for ever"
+    );
+    assert_eq!(taken[0].recording.id, id);
+    assert_eq!(taken[0].attempts, 1);
+}
+
+/// Writing a recording down does not disturb an upload that is already moving.
+///
+/// The re-offer above is deliberately narrow: `failed` and nothing else. A node
+/// that writes the same recording down while another attempt is in flight --
+/// which happens whenever a restart races a lease -- must not reset the
+/// attempts of a row somebody is holding, or a store that is merely slow would
+/// have its patience renewed for ever and a poison upload would go round the
+/// cluster without end.
+#[test]
+fn writing_a_recording_down_does_not_disturb_an_upload_that_is_already_moving() {
+    let scratch = database!("undisturbed");
+    let at = now_ms();
+
+    let node = scratch.store("ND_holder");
+    node.noted(
+        "demo",
+        &[member("PA_1", "alice", &[("accountId", "AC_alice")], at)],
+        0,
+        0,
+        at,
+    );
+    let session = node.live("demo").expect("a meeting").id;
+    assert!(node.flush(Duration::from_secs(30)));
+
+    let made = Recording {
+        node: Some("ND_holder".to_owned()),
+        ..recording(&session, "PA_1", 0, true)
+    };
+    let id = node
+        .note_recording(&made, at)
+        .expect("the recording is written down")
+        .id;
+
+    let taken = node
+        .claim(Stage::Upload, at, 10)
+        .expect("the database answers");
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].attempts, 1);
+
+    let noted = node
+        .note_recording(&made, at + 1_000)
+        .expect("the recording is written down again");
+    assert!(
+        !noted.upload_offered_again,
+        "an upload that is being done right now was reported as having been put back"
+    );
+
+    let row = node
+        .work(&id)
+        .expect("the database answers")
+        .into_iter()
+        .find(|work| work.stage == Stage::Upload)
+        .expect("the upload row");
+    assert_eq!(row.state, WorkState::Claimed, "a live claim was cleared");
+    assert_eq!(
+        row.attempts, 1,
+        "the attempts of a claim in flight were given back, so this upload can never be given up on"
     );
 }
 
@@ -1601,7 +1905,8 @@ fn a_claim_that_has_gone_cannot_be_given_back_by_the_node_that_lost_it() {
 
     let id = slow
         .note_recording(&recording(&session, "PA_1", 0, true), at)
-        .expect("the recording is written down");
+        .expect("the recording is written down")
+        .id;
     slow.uploaded(&id, "SE_x/PA_1-0.ogg", Some(4_096), now_ms())
         .expect("the upload is written down");
 

@@ -246,6 +246,31 @@ pub struct Work {
     pub last_error: Option<String>,
 }
 
+/// What the store did with a recording it has just been told about.
+///
+/// The id alone was not enough to say anything true in a log line. Writing a
+/// recording down is idempotent, so the interesting part is never "a row was
+/// created" -- it is whether the file this node is holding is now work somebody
+/// is going to do, and for a recording whose upload had been given up on the
+/// answer used to be no while the log said yes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Noted {
+    /// The id the store holds for `(session, participant, segment)`, which is
+    /// not necessarily the one that was offered: a recorder that was restarted
+    /// writes the same segment down again under a new id and lands on the row
+    /// it already wrote.
+    pub id: String,
+    /// Whether writing it down put an upload that had been given up on back
+    /// into the queue.
+    ///
+    /// True only in the one case worth a line of its own: the node holding the
+    /// file said so again, and a row that nothing was ever going to pick up is
+    /// now due. An operator who has just restarted a node to fix an object
+    /// store wants to see this; nobody wants to see it every time a meeting
+    /// ends.
+    pub upload_offered_again: bool,
+}
+
 /// One piece of work, handed to the poller that claimed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {

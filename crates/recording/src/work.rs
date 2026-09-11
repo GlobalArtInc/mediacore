@@ -43,6 +43,19 @@
 //! those and says so on `/healthz` as `stuck_recording_work=` with the remedy
 //! in the log line.
 //!
+//! # An upload that was given up on is offered again to the node holding it
+//!
+//! `attempts` is spent on the claim and not on the result, so a queue of five
+//! attempts can be emptied by an object store that is unreachable for eighteen
+//! seconds. Once they are gone the row is `failed` and the queue will never
+//! offer it again -- but the file is still on a disk, and the node with that
+//! disk knows it, because it finds it there at every start ([`crate::disk::scan`])
+//! and writes it down again. That statement is the one piece of information the
+//! failed row was missing, so `note` makes it the moment a given-up upload goes
+//! back into the queue with its attempts reset. Without that a node walks past
+//! its own readable recording for ever, and the only way back is an operator
+//! with a `psql` prompt who first has to know that any of this happened.
+//!
 //! # The announcement is at least once
 //!
 //! A node that emits the event and stops before marking the row done has the
@@ -59,7 +72,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mediacore_session::{Claim, Recording, SessionStore, Stage, StoreError, Work, WorkState};
+use mediacore_session::{
+    Claim, Noted, Recording, SessionStore, Stage, StoreError, Work, WorkState,
+};
 
 use crate::disk;
 use crate::s3::{S3, UploadError};
@@ -71,7 +86,7 @@ use crate::s3::{S3, UploadError};
 /// database. The real implementation is one line per method; see the bottom of
 /// this file.
 pub trait Queue: Send + Sync + 'static {
-    fn note(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError>;
+    fn note(&self, recording: &Recording, now_ms: i64) -> Result<Noted, StoreError>;
     /// What is happening to one recording: one row per stage.
     fn work(&self, recording: &str) -> Result<Vec<Work>, StoreError>;
     fn claim(&self, stage: Stage, now_ms: i64, limit: usize) -> Result<Vec<Claim>, StoreError>;
@@ -96,7 +111,7 @@ pub trait Queue: Send + Sync + 'static {
 }
 
 impl Queue for SessionStore {
-    fn note(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError> {
+    fn note(&self, recording: &Recording, now_ms: i64) -> Result<Noted, StoreError> {
         Self::note_recording(self, recording, now_ms)
     }
 
@@ -333,15 +348,33 @@ impl<Q: Queue, A: Announce> Worker<Q, A> {
                 tokio::task::spawn_blocking(move || queue.note(&recording, now_ms())).await;
 
             match written {
-                Ok(Ok(id)) => {
-                    tracing::info!(
-                        recording = %id,
-                        session = %owed.recording.session,
-                        "a recording is in the store and its upload is queued"
-                    );
+                Ok(Ok(noted)) => {
+                    // Said apart from the ordinary line, and said loudly,
+                    // because it is the only moment at which a recording that
+                    // had been given up on starts moving again -- and because
+                    // one line saying "its upload is queued" for both cases is
+                    // what let a node walk past a readable file fourteen
+                    // restarts running while claiming each time that it had
+                    // queued the upload.
+                    if noted.upload_offered_again {
+                        tracing::warn!(
+                            recording = %noted.id,
+                            session = %owed.recording.session,
+                            path = %owed.recording.local_path.display(),
+                            "this recording's upload had been given up on; the file is on this \
+                             node's disk, so it has been put back in the queue with its attempts \
+                             reset"
+                        );
+                    } else {
+                        tracing::info!(
+                            recording = %noted.id,
+                            session = %owed.recording.session,
+                            "a recording is in the store and its upload is queued"
+                        );
+                    }
 
                     if owed.from_disk {
-                        self.sweep_up(&id, &owed.recording).await;
+                        self.sweep_up(&noted.id, &owed.recording).await;
                     }
                 }
                 Ok(Err(error)) => {

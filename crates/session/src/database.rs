@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use postgres::{Client, NoTls, Row, Transaction};
 
-use crate::recording::{Claim, Recording, Stage, State, Work};
+use crate::recording::{Claim, Noted, Recording, Stage, State, Work};
 use crate::schema::{MIGRATION_LOCK, MIGRATIONS, SCHEMA_TABLE};
 use crate::{Attendance, Ending, Kind, Listing, Node, NodeState, Session, Sink, StoreError};
 
@@ -476,19 +476,43 @@ impl Database {
             // `state = 'failed' OR (state = 'waiting' AND ...)` in one WHERE
             // walks every row of a table that keeps a recording's history for
             // ever.
+            // Counted apart rather than added up in SQL, because the two are
+            // different outages with different remedies and the warning below
+            // used to name both and tell an operator which of them they had by
+            // saying nothing at all.
             let row = client.query_one(
+                // Uploads apart from announcements, because the remedies have
+                // nothing to do with each other. A given-up UPLOAD may be audio
+                // that exists nowhere else; a given-up ANNOUNCE is a webhook or
+                // a broker that went away while the object was already safely
+                // in the bucket. Counting them together and then explaining the
+                // total in the language of uploads is how an operator ends up
+                // deleting a recording that was never lost.
                 "SELECT (SELECT count(*) FROM mediacore_session),
                         (SELECT count(*) FROM mediacore_recording_work
-                          WHERE state = 'failed')
-                      + (SELECT count(*) FROM mediacore_recording_work
-                          WHERE state = 'waiting' AND due_at_ms <= $1)",
+                          WHERE state = 'failed' AND stage = 'upload'),
+                        (SELECT count(*) FROM mediacore_recording_work
+                          WHERE state = 'waiting' AND stage = 'upload'
+                            AND due_at_ms <= $1),
+                        (SELECT count(*) FROM mediacore_recording_work
+                          WHERE stage <> 'upload'
+                            AND (state = 'failed'
+                                 OR (state = 'waiting' AND due_at_ms <= $1)))",
                 &[&overdue],
             )?;
-            Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+            Ok((
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2),
+                row.get::<_, i64>(3),
+            ))
         });
 
         match counted {
-            Ok((sessions, stuck)) => {
+            Ok((sessions, given_up, overdue, announcements)) => {
+                let stuck = given_up
+                    .saturating_add(overdue)
+                    .saturating_add(announcements);
                 self.sessions
                     .store(sessions.max(0) as u64, Ordering::Relaxed);
                 self.stuck.store(stuck.max(0) as u64, Ordering::Relaxed);
@@ -496,7 +520,7 @@ impl Database {
                     Some(std::time::Instant::now());
 
                 if stuck > 0 {
-                    self.stranded(stuck);
+                    self.stranded(given_up, overdue, announcements);
                 }
             }
             Err(error) => self.complain(&error),
@@ -518,13 +542,30 @@ impl Database {
     /// Says that work is stranded, at most once a minute, with the remedy in
     /// the line.
     ///
-    /// The commonest cause is an upload whose node never came back: the file
-    /// is on a disk nobody has any more, so no other node can do the work and
-    /// the row stays `waiting` for ever. That is deliberate -- handing it round
-    /// the cluster would only burn its attempts and end in `failed` with the
-    /// audio still where it was -- but it must not be silent, which is what
-    /// this is.
-    fn stranded(&self, stuck: i64) {
+    /// **The two numbers are reported apart because they are two different
+    /// outages and only one of them is anybody's fault.**
+    ///
+    /// `waiting` is an upload whose node never came back: the file is on a disk
+    /// nobody has any more, so no other node can do the work and the row waits
+    /// for ever. That is deliberate -- handing it round the cluster would only
+    /// burn its attempts and end in `failed` with the audio still where it was.
+    ///
+    /// Three numbers rather than one, because the remedies have nothing in
+    /// common and a single total gets explained in the language of whichever
+    /// one the reader thought of first.
+    ///
+    /// `given_up` and `waiting_for_a_node` are UPLOADS, where the audio may
+    /// exist nowhere but a node's disk. Since [`Sink::note_recording`] re-offers
+    /// a given-up upload to the node holding the file, a `given_up` that stays
+    /// above zero across a restart of the node named on those rows means the
+    /// file is genuinely not on anybody's disk -- the one case an operator has
+    /// to decide about rather than wait out.
+    ///
+    /// `announcements` is every other stage, and it never means lost audio: the
+    /// object is in the bucket and what failed is telling somebody about it. It
+    /// is counted so that a broker outage cannot be mistaken for the sentence
+    /// above and answered by deleting a recording that was never lost.
+    fn stranded(&self, given_up: i64, overdue: i64, announcements: i64) {
         let mut last = self.stranded_at.lock().expect("session stranded lock");
         let now = std::time::Instant::now();
         if last.is_some_and(|when| now.duration_since(when) < COMPLAIN_EVERY) {
@@ -534,13 +575,24 @@ impl Database {
 
         tracing::warn!(
             database = %self.address,
-            stuck,
-            "recording work in this database is not moving: it has been given up on, or it is \
-             waiting for a node that has not come back. `select * from mediacore_recording_work \
-             where state = 'failed' or state = 'waiting'` says which; an upload waiting on a node \
-             that is gone for good is freed by clearing `node` on its row in mediacore_recording, \
-             which offers it to whoever asks -- and that one will honestly report the file is not \
-             there. Watch stuck_recording_work= on /healthz"
+            stuck = given_up + overdue + announcements,
+            given_up,
+            waiting_for_a_node = overdue,
+            announcements,
+            "recording work in this database is not moving, and the three numbers are three \
+             different outages. given_up= is an UPLOAD tried as often as this deployment allows \
+             and never finished: `select * from mediacore_recording_work where stage = 'upload' \
+             and state = 'failed'` names it, `last_error` says why, and the node holding the file \
+             offers it again by itself the next time it writes that recording down -- so a count \
+             that survives a restart of that node means the file is on nobody's disk. \
+             waiting_for_a_node= is an upload whose node has not come back: the same query with \
+             `state = 'waiting'` names it, and one whose node is gone for good is freed by \
+             clearing `node` on its row in mediacore_recording, which offers it to whoever asks -- \
+             and that one will honestly report the file is not there. announcements= is neither, \
+             and it is never lost audio: the object is in the bucket and what failed is telling \
+             somebody about it, so `select * from mediacore_recording_work where stage <> 'upload'` \
+             names a webhook or a broker to fix rather than a recording to decide about. \
+             Watch stuck_recording_work= on /healthz"
         );
     }
 
@@ -1033,7 +1085,7 @@ impl Sink for Database {
         self.recount(now_ms);
     }
 
-    fn note_recording(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError> {
+    fn note_recording(&self, recording: &Recording, now_ms: i64) -> Result<Noted, StoreError> {
         self.ready()?;
 
         let recording = recording.clone();
@@ -1114,6 +1166,7 @@ impl Sink for Database {
                 &[&id, &upload_state.as_str(), &now_ms],
             )?;
 
+            let mut upload_offered_again = false;
             if complete {
                 transaction.execute(
                     "UPDATE mediacore_recording_work
@@ -1121,10 +1174,63 @@ impl Sink for Database {
                       WHERE recording = $1 AND stage = 'upload' AND state = 'blocked'",
                     &[&id, &now_ms],
                 )?;
+
+                // **The one thing that gets a given-up upload moving again,
+                // and the reason it belongs here rather than in an operator's
+                // runbook.** `failed` means the attempts were spent and nobody
+                // is coming back; the queue will not offer the row again, and
+                // the announcement behind it stays blocked for ever. What
+                // rescues it is not a restart -- it is this statement, whose
+                // caller is by definition holding the file: it has either just
+                // finished writing it or just found it on its own disk, and it
+                // has said so in the row above, where `node` and `local_path`
+                // now point at a file that demonstrably exists. That is new
+                // information, and it is exactly the information the attempts
+                // were spent failing to establish. Without it a node can sit on
+                // a readable recording for ever, uploading nothing, while the
+                // object store that refused it five times in eighteen seconds
+                // has been healthy since the same afternoon.
+                //
+                // The attempts go back to zero rather than up by one because
+                // what is being retried is not the old attempt: it is the first
+                // attempt of whatever the operator changed. A node that is
+                // crash-looping does spend five more of them per start, which
+                // is a handful of requests against a store that is already
+                // known to be broken, and cheap next to a recording nobody ever
+                // hears about again.
+                //
+                // `last_error` is deliberately left alone. It is the only
+                // surviving account of why the upload was given up on, and a
+                // row reading "waiting, no attempts yet, and the last thing
+                // that happened was a 500" is the one an operator can act on.
+                // `failed` is the ordinary shape of a given-up upload, and it is
+                // not the only one. A node killed while its last attempt was in
+                // flight leaves the row `claimed` with its attempts spent: the
+                // reaper that turns such a row into `failed` lives inside
+                // `claim`, which runs AFTER this, so on the first restart the
+                // row is still `claimed` and a re-offer looking only for
+                // `failed` walks past it. The file would then wait for a second
+                // restart that nobody has a reason to perform.
+                //
+                // A live claim is left alone -- the lease is what says somebody
+                // is uploading this right now, and re-offering it would be two
+                // nodes sending the same audio to the same key.
+                upload_offered_again = transaction.execute(
+                    "UPDATE mediacore_recording_work
+                        SET state = 'waiting', due_at_ms = $2, attempts = 0,
+                            claimed_by = NULL, claim_ends_at_ms = NULL
+                      WHERE recording = $1 AND stage = 'upload'
+                        AND (state = 'failed'
+                             OR (state = 'claimed' AND claim_ends_at_ms <= $2))",
+                    &[&id, &now_ms],
+                )? > 0;
             }
 
             transaction.commit()?;
-            Ok(id)
+            Ok(Noted {
+                id,
+                upload_offered_again,
+            })
         });
 
         self.report(outcome)
