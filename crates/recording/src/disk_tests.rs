@@ -266,3 +266,288 @@ fn an_id_that_is_not_one_of_ours_never_becomes_a_path_of_its_own() {
         Some("json")
     );
 }
+
+// ------------------------------------- the directory a finished recording left
+
+/// Puts one participant's finished pair into a meeting's directory, and hands
+/// back the recording that names them.
+fn pair(directory: &Path, session: &str, participant: &str) -> Recording {
+    let recording = recording(directory, session, participant);
+    let folder = recording.local_path.parent().expect("a meeting directory");
+
+    fs::create_dir_all(folder).expect("the folder");
+    fs::write(&recording.local_path, audio(10, true)).expect("the audio");
+    write_sidecar(
+        &recording.local_path.with_extension("json"),
+        &Sidecar {
+            room: "standup".to_owned(),
+            identity: participant.to_owned(),
+            complete: true,
+            recording: recording.clone(),
+        },
+    )
+    .expect("the sidecar");
+
+    recording
+}
+
+/// The whole point: a meeting that has been recorded and uploaded leaves
+/// nothing at all behind.
+///
+/// It was two files and a directory, and only the files went. Bytes are not the
+/// cost -- a directory is a few hundred of them -- the count is: one more entry
+/// per meeting for ever, on a fixed volume, and inodes run out long before
+/// bytes do. The thing that fails when they do is recording.
+#[test]
+fn a_meeting_that_has_been_uploaded_leaves_no_directory_behind() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let recording = pair(directory.path(), "SE_000000000001", "PA_000000000001");
+    let folder = recording
+        .local_path
+        .parent()
+        .expect("a meeting directory")
+        .to_path_buf();
+
+    forget(&recording);
+
+    assert!(
+        !folder.exists(),
+        "the meeting directory outlived the only recording in it, and one of these is left \
+         behind by every meeting this node ever records"
+    );
+    assert!(
+        directory.path().exists(),
+        "and the volume the operator configured is not a thing this ever removes"
+    );
+}
+
+/// A participant whose upload finishes first must not take a sibling's audio
+/// with it.
+///
+/// The sibling's file is still on this disk *because* it has not reached the
+/// object store yet, so a `remove_dir_all` here would delete the one copy of a
+/// recording that exists anywhere. `remove_dir` refusing a directory with
+/// anything in it is what makes the ordering between two participants not
+/// matter at all.
+#[test]
+fn the_first_participant_uploaded_does_not_take_the_second_one_s_audio() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let session = "SE_000000000001";
+    let first = pair(directory.path(), session, "PA_000000000001");
+    let second = pair(directory.path(), session, "PA_000000000002");
+    let folder = directory.path().join(session);
+
+    forget(&first);
+
+    assert!(
+        folder.exists(),
+        "the meeting is not over for everybody just because one upload finished"
+    );
+    assert!(
+        second.local_path.exists() && second.local_path.with_extension("json").exists(),
+        "and the audio that has not been uploaded is the only copy there is"
+    );
+
+    forget(&second);
+
+    assert!(
+        !folder.exists(),
+        "the directory goes with the last pair in it and not before"
+    );
+}
+
+/// Two uploads finishing at the same moment are two threads in one directory,
+/// and the loser must not be an error anybody sees.
+///
+/// There are exactly two ways to lose. Remove the pair, look, and find a
+/// sibling's files still there -- the other thread has not got to its own
+/// deletion yet. Or remove the pair, and find the directory already gone --
+/// the other thread emptied it and swept it between the two. Both are right,
+/// and neither is a failure; this asserts on `tidy` directly because the
+/// answer, not the log line, is what the rest of the code reads.
+#[test]
+fn neither_way_of_losing_the_race_to_remove_a_directory_is_a_failure() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let folder = directory.path().join("SE_000000000001");
+    let sibling = folder.join("PA_000000000002-0.ogg");
+    fs::create_dir_all(&folder).expect("the folder");
+    fs::write(&sibling, b"a recording that is not in the object store yet").expect("the audio");
+
+    assert!(
+        !tidy(&folder),
+        "a directory with somebody else's audio in it is not this call's to remove"
+    );
+    assert!(sibling.exists(), "and the audio in it is untouched");
+
+    fs::remove_file(&sibling).expect("the sibling's upload finishes too");
+
+    assert!(tidy(&folder), "an emptied directory goes");
+    assert!(
+        !tidy(&folder),
+        "and a thread that finds it already gone has nothing to report either"
+    );
+}
+
+/// The same thing for real, on two threads, because the argument above is about
+/// an interleaving and interleavings are what a test can actually run.
+#[test]
+fn two_participants_uploads_finishing_at_once_leave_nothing_behind() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let session = "SE_000000000001";
+    let first = pair(directory.path(), session, "PA_000000000001");
+    let second = pair(directory.path(), session, "PA_000000000002");
+    let folder = directory.path().join(session);
+
+    std::thread::scope(|threads| {
+        threads.spawn(|| forget(&first));
+        threads.spawn(|| forget(&second));
+    });
+
+    assert!(
+        !folder.exists(),
+        "whichever of them was last had to remove it"
+    );
+    assert!(
+        directory.path().exists(),
+        "and neither of them may remove the volume itself"
+    );
+}
+
+/// A sidecar from before meetings had a directory of their own names a file
+/// straight in the recordings root -- and the parent of that is the volume.
+///
+/// The node that uploads the last such recording would remove the directory the
+/// operator configured, and a `create_dir_all` would quietly make it again
+/// somewhere else if the mount had gone. So the removal is not "the parent of
+/// the audio": it is "a directory this layout would have made", which is one
+/// named for the meeting.
+#[test]
+fn a_recording_from_before_meetings_had_directories_never_removes_the_volume() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let flat = directory.path().join("PA_000000000001-0.ogg");
+    fs::write(&flat, audio(10, true)).expect("the audio");
+    fs::write(flat.with_extension("json"), b"{}").expect("the sidecar");
+
+    let mut recording = recording(directory.path(), "SE_000000000001", "PA_000000000001");
+    recording.local_path = flat.clone();
+
+    forget(&recording);
+
+    assert!(!flat.exists(), "the pair still goes");
+    assert!(
+        directory.path().exists(),
+        "and the recordings directory itself survives the last recording in it"
+    );
+}
+
+/// The thirty directories already on the volume: a start clears what earlier
+/// runs left, because an empty meeting directory is the same class of leftover
+/// as a recording nobody finished.
+///
+/// A scan is the one place this is safe. It runs before the recorder exists, so
+/// an empty directory here cannot be a meeting that is about to be written
+/// into -- which is what it would be at any other moment.
+#[test]
+fn empty_meeting_directories_from_an_earlier_run_are_cleared_at_startup() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    for old in ["SE_00000000ab01", "SE_00000000ab02", "SE_00000000ab03"] {
+        fs::create_dir_all(directory.path().join(old)).expect("what an earlier run left");
+    }
+    lay_out(directory.path(), true, &audio(50, true));
+
+    let found = scan(directory.path(), "ND_after");
+
+    assert_eq!(found.len(), 1, "the recording on the disk is still found");
+    for old in ["SE_00000000ab01", "SE_00000000ab02", "SE_00000000ab03"] {
+        assert!(
+            !directory.path().join(old).exists(),
+            "{old} is a meeting that ended, uploaded and was cleaned up except for this; a \
+             volume that has recorded for a year carries one per meeting"
+        );
+    }
+    assert!(
+        directory.path().join("SE_000000000001").is_dir(),
+        "and a directory with a recording in it stays, because the recording has not been \
+         uploaded yet"
+    );
+}
+
+/// Audio with nothing beside it to say what it is keeps its directory.
+///
+/// A scan walks sidecars, so this file is invisible to it and is never
+/// uploaded -- which makes it the one thing on the volume a person has to look
+/// at by hand. Removing the directory around it would need `remove_dir_all`,
+/// and that would take the audio; `remove_dir` refuses and the file stays
+/// findable.
+#[test]
+fn a_startup_scan_leaves_the_directory_of_a_file_it_cannot_identify() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let (orphan, _) = paths(directory.path(), "SE_000000000001", "PA_000000000001", 0);
+    fs::create_dir_all(orphan.parent().expect("a meeting directory")).expect("the folder");
+    fs::write(&orphan, audio(50, true)).expect("the audio");
+
+    assert!(scan(directory.path(), "ND_after").is_empty());
+    assert!(
+        orphan.exists(),
+        "a scan that removed this would be deleting the only copy of a recording"
+    );
+    assert!(
+        orphan.parent().expect("a meeting directory").is_dir(),
+        "and the directory has to stay for the file to stay in"
+    );
+}
+
+/// A recording the scan itself throws away takes its directory with it.
+///
+/// A participant who published a track and never spoke leaves a file with
+/// nothing in it, and the scan drops both of its files -- which before this
+/// left an empty directory behind at every start, rather than only once.
+#[test]
+fn the_directory_of_a_recording_the_scan_discards_goes_with_it() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let sidecar = lay_out(directory.path(), false, &audio(0, false));
+    let folder = sidecar.parent().expect("a meeting directory").to_path_buf();
+
+    assert!(scan(directory.path(), "ND_after").is_empty());
+
+    assert!(
+        !folder.exists(),
+        "the scan emptied this directory itself, so leaving it would be litter of its own \
+         making"
+    );
+}
+
+/// The recordings root is a filesystem an operator mounted, and it has things
+/// in it that are not ours.
+///
+/// The volume in production is ext4, so its root holds a `lost+found` -- and
+/// one on a filesystem that has never been repaired is empty, so a sweep that
+/// took every empty directory would take the one place `fsck` puts an orphaned
+/// inode, on the volume holding recordings that exist nowhere else. Only a
+/// directory named the way this server names one is a directory this server
+/// made.
+#[test]
+fn a_startup_scan_only_removes_directories_this_server_named() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    for theirs in ["lost+found", "incoming", ".snapshot"] {
+        fs::create_dir_all(directory.path().join(theirs)).expect("what the volume came with");
+    }
+    fs::create_dir_all(directory.path().join("SE_00000000ab01")).expect("what an earlier run left");
+
+    assert!(scan(directory.path(), "ND_after").is_empty());
+
+    for theirs in ["lost+found", "incoming", ".snapshot"] {
+        assert!(
+            directory.path().join(theirs).is_dir(),
+            "{theirs} is empty and is still not this code's to remove"
+        );
+    }
+    assert!(
+        !directory.path().join("SE_00000000ab01").exists(),
+        "and the one that is ours still goes"
+    );
+    assert!(
+        is_session_directory("SE_794e5eb27dda") && !is_session_directory("SE_"),
+        "a bare prefix is not an id, and a directory called one is not ours either"
+    );
+}

@@ -175,11 +175,17 @@ fn read_sidecar(path: &Path) -> io::Result<Sidecar> {
 /// a new node id every start, which is the default -- becomes this node's, so
 /// its uploads are offered to the process that can actually see the files.
 ///
+/// It also throws away the meeting directories an earlier run left empty, which
+/// is the same class of leftover arriving from the other direction: not a
+/// recording nobody finished, but the hole one left behind. See the comment at
+/// the end of the loop for why a startup scan is the only place that may.
+///
 /// Nothing here fails the caller. A directory that cannot be read, a sidecar
 /// that is not JSON, an audio file that is not there: each costs one recording,
 /// is logged, and leaves the rest of them alone.
 pub fn scan(directory: &Path, node: &str) -> Vec<Recording> {
     let mut found = Vec::new();
+    let mut litter = 0usize;
 
     let sessions = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -196,34 +202,91 @@ pub fn scan(directory: &Path, node: &str) -> Vec<Recording> {
     };
 
     for session in sessions.flatten() {
-        if !session.path().is_dir() {
+        let folder = session.path();
+        if !folder.is_dir() {
             continue;
         }
 
-        let Ok(files) = fs::read_dir(session.path()) else {
-            continue;
-        };
+        if let Ok(files) = fs::read_dir(&folder) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().is_none_or(|kind| kind != "json") {
+                    continue;
+                }
 
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().is_none_or(|kind| kind != "json") {
-                continue;
+                match recover(&path, node) {
+                    Ok(Some(recording)) => found.push(recording),
+                    Ok(None) => {}
+                    Err(error) => tracing::error!(
+                        sidecar = %path.display(),
+                        %error,
+                        "a recording left on this disk could not be finished, so it will not be \
+                         uploaded and the audio in it is only here"
+                    ),
+                }
             }
+        }
 
-            match recover(&path, node) {
-                Ok(Some(recording)) => found.push(recording),
-                Ok(None) => {}
-                Err(error) => tracing::error!(
-                    sidecar = %path.display(),
-                    %error,
-                    "a recording left on this disk could not be finished, so it will not be \
-                     uploaded and the audio in it is only here"
-                ),
-            }
+        // What an earlier run left is not only files. Before the directory went
+        // with its last pair, every uploaded recording left the folder that had
+        // held it, so a volume that has recorded for a year carries one empty
+        // directory per meeting it has ever held -- nothing in bytes, an inode
+        // each, on a volume whose own answer to running out of either is that
+        // this node stops recording.
+        //
+        // **Here and nowhere else**, because an empty meeting directory is
+        // otherwise indistinguishable from one a meeting is about to be written
+        // into. A scan runs once, at startup, before the recorder exists: no
+        // file in this directory can be opened yet, and the directory belongs
+        // to one process, so there is no second writer to lose a race with.
+        // `remove_dir` refusing anything that is not empty is the rest of it --
+        // including under `keep_local`, where the copies a deployment asked to
+        // keep are what makes these directories not empty.
+        if folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_session_directory)
+            && tidy(&folder)
+        {
+            litter += 1;
         }
     }
 
+    if litter > 0 {
+        tracing::info!(
+            directories = litter,
+            directory = %directory.display(),
+            "empty meeting directories were left on this node's disk by an earlier run; they \
+             have been removed"
+        );
+    }
+
     found
+}
+
+/// Whether a directory sitting in the recordings root is one this server made.
+///
+/// **Read off a production volume rather than reasoned about.** The volume
+/// mounted there is ext4, so there is a `lost+found` in the root -- and
+/// `lost+found` on a filesystem that has never been repaired is *empty*, which
+/// makes a sweep that removed every empty directory remove the one place
+/// `fsck` has to put an orphaned inode, on the volume whose whole job is
+/// holding recordings that exist nowhere else. Nothing else an operator left in
+/// the root is this code's to delete either.
+///
+/// A session id is minted by this server and is `SE_` and alphanumerics, which
+/// is the same shape `mediacore_session` insists on before it joins an id onto
+/// a path, and for the same reason: a directory name is not a thing to trust
+/// just because it is on our own disk.
+fn is_session_directory(name: &str) -> bool {
+    let Some(tail) = name.strip_prefix(mediacore_session::SESSION_ID_PREFIX) else {
+        return false;
+    };
+
+    !tail.is_empty()
+        && tail
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
 }
 
 /// Finishes one recording found on disk, or says there is nothing to finish.
@@ -298,12 +361,15 @@ fn recover(sidecar_path: &Path, node: &str) -> io::Result<Option<Recording>> {
     Ok(Some(sidecar.recording))
 }
 
-/// Removes a recording's two files once the object store has it.
+/// Removes a recording's two files once the object store has it, and the
+/// meeting directory with them if that pair was the last one in it.
 ///
 /// A node's disk is not a second copy anybody agreed to pay for: an hour of a
 /// ten-person meeting is a few tens of megabytes, and a server that keeps every
 /// one of them fills a volume in a month and then stops recording. A deployment
-/// that wants the local copy kept says so and takes the disk on itself.
+/// that wants the local copy kept says so and takes the disk on itself -- and
+/// gets the directory with it, because this is not reached at all when the
+/// files stay.
 pub fn forget(recording: &Recording) {
     let audio = &recording.local_path;
     let sidecar = audio.with_extension("json");
@@ -318,6 +384,67 @@ pub fn forget(recording: &Recording) {
                 "an uploaded recording could not be removed from this node's disk; the object \
                  store has it, so this costs space and nothing else"
             );
+        }
+    }
+
+    // Only a directory this layout would itself have created, which is to say
+    // one named for this recording's meeting. A sidecar written before meetings
+    // had a directory of their own -- see the test that reads one -- names a
+    // file straight in the recordings root, and the parent of *that* is the
+    // volume the operator configured, which a node whose last upload finished
+    // would otherwise delete out from under itself.
+    let expected = safe(&recording.session);
+    if let Some(folder) = audio.parent()
+        && folder.file_name().and_then(|name| name.to_str()) == Some(expected.as_str())
+    {
+        tidy(folder);
+    }
+}
+
+/// Removes a meeting's directory if there is nothing left in it, and says
+/// whether it did.
+///
+/// **`remove_dir` and never `remove_dir_all`.** A meeting directory holds one
+/// pair of files per participant, and each pair leaves on its own upload; the
+/// participant whose upload finishes first must not take a sibling's audio with
+/// it, which is on this disk precisely because it has *not* reached the object
+/// store yet. A directory with anything in it is not this call's to remove, and
+/// the kernel refusing it is that check -- not a condition worth asking about
+/// separately, because between the asking and the removing is the race.
+///
+/// Two participants' uploads finishing at the same moment are two threads in
+/// one directory, and the loser of that race finds either a sibling's files
+/// still there or the directory already gone. Both are the outcome this wants,
+/// so neither is said out loud. What is left is a genuine failure -- a
+/// permission, a volume that has gone read-only -- and it is reported exactly
+/// as loudly as failing to remove the files was: this costs space, and the
+/// object store has the audio.
+fn tidy(folder: &Path) -> bool {
+    match fs::remove_dir(folder) {
+        Ok(()) => true,
+        // `AlreadyExists` is `EEXIST`, which POSIX allows a `rmdir` to answer
+        // instead of `ENOTEMPTY` for exactly this case and which some network
+        // filesystems do. There is no other thing it could mean here, and
+        // taking it for what it is costs one arm rather than a warning per
+        // finished meeting on such a mount.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::DirectoryNotEmpty
+                    | io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %folder.display(),
+                %error,
+                "an emptied meeting directory could not be removed from this node's disk; it \
+                 holds nothing, so this costs one inode and nothing else"
+            );
+            false
         }
     }
 }

@@ -19,7 +19,7 @@ use axum::routing::any;
 use mediacore_recording::{
     Announce, Queue, Recorder, S3, S3Settings, Settings, TrackSpec, Worker, WorkerSettings,
 };
-use mediacore_session::{Claim, Recording, Stage, StoreError, Work, WorkState};
+use mediacore_session::{Claim, Noted, Recording, Stage, StoreError, Work, WorkState};
 
 // ---------------------------------------------------------------- the queue
 
@@ -96,7 +96,7 @@ impl Fake {
 }
 
 impl Queue for Fake {
-    fn note(&self, recording: &Recording, now_ms: i64) -> Result<String, StoreError> {
+    fn note(&self, recording: &Recording, now_ms: i64) -> Result<Noted, StoreError> {
         let mut held = self.held.lock().expect("the queue");
         held.recordings
             .insert(recording.id.clone(), recording.clone());
@@ -125,7 +125,25 @@ impl Queue for Fake {
                 last_error: None,
             });
 
-        Ok(recording.id.clone())
+        // The caller is holding the file, which is what a given-up upload was
+        // missing, so it goes back into the queue with its attempts reset and
+        // its last error left where an operator can still read it.
+        let mut upload_offered_again = false;
+        if recording.is_complete()
+            && let Some(row) = held.work.get_mut(&(recording.id.clone(), "upload"))
+            && row.state == WorkState::Failed
+        {
+            row.state = WorkState::Waiting;
+            row.attempts = 0;
+            row.due_at_ms = now_ms;
+            row.claim_ends_at_ms = 0;
+            upload_offered_again = true;
+        }
+
+        Ok(Noted {
+            id: recording.id.clone(),
+            upload_offered_again,
+        })
     }
 
     fn claim(&self, stage: Stage, now_ms: i64, limit: usize) -> Result<Vec<Claim>, StoreError> {
@@ -519,12 +537,73 @@ async fn a_finished_recording_reaches_the_object_store_and_is_then_announced() {
         "the announcement has to say where the object is, or a consumer has to guess"
     );
 
+    // Everything, and the directory is the half that used to stay. Thirty of
+    // them were found on a production volume: one per meeting the node had ever
+    // recorded, a number that only goes up on a disk with a fixed size, and the
+    // thing that stops when a volume runs out of inodes is recording.
     until("the local copy was never removed", || {
-        std::fs::read_dir(directory.path().join("SE_000000000001"))
-            .map(|entries| entries.count() == 0)
-            .unwrap_or(true)
+        !directory.path().join("SE_000000000001").exists()
     })
     .await;
+    assert!(
+        directory.path().exists(),
+        "and the volume the operator configured is not a thing an upload ever removes"
+    );
+}
+
+/// A deployment that asked to keep its local copies keeps the directory too.
+///
+/// `keep_local` is a statement about the files, and the directory is where the
+/// files are: sweeping it would either take them with it or be a removal that
+/// cannot happen. Nothing here is a special case -- the cleanup lives inside
+/// the deletion, so a deployment that never deletes never reaches it.
+#[tokio::test]
+async fn a_node_that_keeps_its_local_copies_keeps_the_meeting_directory() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let behaviour = Behaviour {
+        refuse: Arc::new(AtomicUsize::new(0)),
+        hang: false,
+        put: Arc::new(Mutex::new(Vec::new())),
+    };
+    let addr = spawn_store(behaviour.clone()).await;
+
+    let (recorder_handle, finished) =
+        Recorder::start(recorder(directory.path())).expect("a recorder");
+    let queue = Fake::new();
+    let _running = Worker::start(
+        Arc::clone(&queue),
+        store(addr),
+        Arc::new(Said::default()),
+        WorkerSettings {
+            keep_local: true,
+            ..worker_settings()
+        },
+        Vec::new(),
+        finished,
+    );
+
+    recorder_handle.session_started("standup", "SE_000000000001", now_ms());
+    let tap = recorder_handle.track(spec());
+    for index in 0..100u64 {
+        tap.packet(index, index * 960, 48_000, payload(), Instant::now());
+    }
+    drop(tap);
+
+    until("nothing was ever uploaded", || {
+        !behaviour.put.lock().expect("what was put").is_empty()
+    })
+    .await;
+
+    let folder = directory.path().join("SE_000000000001");
+    let audio = folder.join("PA_000000000001-0.ogg");
+    assert!(
+        audio.exists() && audio.with_extension("json").exists(),
+        "the copies this deployment asked to keep are the whole point of the setting"
+    );
+    assert!(
+        folder.is_dir(),
+        "and the directory holding them cannot go while they are in it"
+    );
 }
 
 /// An object store that refuses is tried again, and the row says why in the
@@ -872,9 +951,135 @@ async fn a_recording_already_in_the_object_store_is_taken_off_the_disk_when_it_i
     })
     .await;
 
+    // The sweep is the other path that takes files off this disk, and it takes
+    // them through the same call -- so there is one place where a meeting
+    // directory stops existing and not two that have to agree.
+    assert!(
+        !left
+            .local_path
+            .parent()
+            .expect("a meeting directory")
+            .exists(),
+        "a recording swept up at startup leaves the same directory behind as one swept up after \
+         its own upload, and neither may"
+    );
     assert!(
         behaviour.put.lock().expect("what was put").is_empty(),
         "a recording the store already had was uploaded again"
+    );
+}
+
+/// A node that comes back to a recording it gave up on uploads it.
+///
+/// **This is the production failure this test exists for.** An object store
+/// went away for eighteen seconds, which is long enough to spend every attempt
+/// the deployment allows -- they are spent on the claim, and the ladder from
+/// the first try to the last takes about as long as one backoff cap. The row
+/// went `failed`, the queue stopped offering it, and the file stayed on the
+/// node's own disk: mounted, readable, named by a `node` that a StatefulSet
+/// keeps stable across restarts. The node then restarted fourteen times, found
+/// the file on every one of them, wrote it down on every one of them, said
+/// "its upload is queued" on every one of them, and uploaded nothing, while the
+/// object store had been healthy since eighteen minutes after the outage.
+///
+/// Writing a recording down is the node saying it is holding the file, which is
+/// precisely what the failed row was missing, so it is what puts the upload
+/// back in the queue.
+#[tokio::test]
+async fn a_node_that_comes_back_to_an_upload_it_gave_up_on_uploads_it() {
+    let directory = tempfile::TempDir::new().expect("a directory");
+    // Exactly as many refusals as the queue allows attempts, so the ladder ends
+    // where production's did -- with nothing left to try and the file still on
+    // the disk.
+    let behaviour = Behaviour {
+        refuse: Arc::new(AtomicUsize::new(5)),
+        hang: false,
+        put: Arc::new(Mutex::new(Vec::new())),
+    };
+    let addr = spawn_store(behaviour.clone()).await;
+
+    {
+        let (recorder_handle, _finished) =
+            Recorder::start(recorder(directory.path())).expect("a recorder");
+        recorder_handle.session_started("standup", "SE_000000000001", now_ms());
+        let tap = recorder_handle.track(spec());
+        for index in 0..50u64 {
+            tap.packet(index, index * 960, 48_000, payload(), Instant::now());
+        }
+    }
+
+    let found = mediacore_recording::disk::scan(directory.path(), "ND_one");
+    assert_eq!(found.len(), 1, "the recording was not left on the disk");
+    let left = found[0].clone();
+    let sidecar = left.local_path.with_extension("json");
+
+    let queue = Fake::new();
+
+    // The outage. The node spends every attempt it has and gives up.
+    let (_recorder, arriving) = tokio::sync::mpsc::unbounded_channel();
+    let outage = Worker::start(
+        Arc::clone(&queue),
+        store(addr),
+        Arc::new(Said::default()),
+        worker_settings(),
+        found,
+        arriving,
+    );
+
+    until("the upload was never given up on", || {
+        queue
+            .row(&left.id, "upload")
+            .is_some_and(|row| row.state == WorkState::Failed)
+    })
+    .await;
+    assert!(
+        left.local_path.exists() && sidecar.exists(),
+        "an upload that failed took the audio with it"
+    );
+    assert!(
+        behaviour.put.lock().expect("what was put").is_empty(),
+        "the store kept a file it had refused"
+    );
+
+    // The node stops. Nothing in the queue will ever offer this row again, and
+    // the file is on this node's disk and nowhere else.
+    outage.task.abort();
+
+    // The store is well again -- it refused five times and no more -- and the
+    // node comes back, scans its disk and finds what it left there.
+    let again = mediacore_recording::disk::scan(directory.path(), "ND_one");
+    assert_eq!(again.len(), 1, "the recording was not found on the disk");
+    assert_eq!(
+        again[0].id, left.id,
+        "the sidecar is what keeps a recording's id across a restart"
+    );
+
+    let (_recorder, arriving) = tokio::sync::mpsc::unbounded_channel();
+    let _running = Worker::start(
+        Arc::clone(&queue),
+        store(addr),
+        Arc::new(Said::default()),
+        worker_settings(),
+        again,
+        arriving,
+    );
+
+    until(
+        "the recording that was given up on was never uploaded",
+        || !behaviour.put.lock().expect("what was put").is_empty(),
+    )
+    .await;
+
+    until("the local copy was never removed", || {
+        !left.local_path.exists() && !sidecar.exists()
+    })
+    .await;
+
+    let row = queue.row(&left.id, "upload").expect("the upload row");
+    assert_eq!(row.state, WorkState::Done);
+    assert!(
+        row.last_error.is_some(),
+        "why the upload was given up on is the only thing that says the outage happened"
     );
 }
 
