@@ -9,27 +9,88 @@ name: Build
 # cluster pinned to a moving tag reinstalls whatever happens to be behind it on
 # the next pod restart, which is how a call ends in the middle for a reason
 # nobody can reconstruct afterwards.
+#
+# Gated on CI, which is why this starts from a finished CI run and not from the
+# push. Both used to begin at the same push and finish independently, so a red
+# CI -- a failing test, or a run cancelled by its own timeout -- still built this
+# image, pushed it to Harbor and had Flux roll it into production minutes later.
+# It was not a theoretical hole: of the ten pushes to main before this was
+# written, nine failed CI and one had CI cancelled, and all ten shipped an image
+# that Flux was free to take. `workflow_run` fires when the CI workflow as a
+# whole is over, which is both of its jobs, and the conclusion this job asks
+# about below is what says they passed.
+#
+# It costs the overlap. A deploy is now CI's ten to twenty minutes and then this
+# job's five to twenty-five, one after the other, where the two used to run side
+# by side; and a push whose CI is cancelled by the next push produces no image at
+# all, which is the intended half of that. `workflow_dispatch` is the way to an
+# image from a commit CI cannot pass, and it is deliberately a hand on a button.
+#
+# Build, then run, then push -- in that order, because for a long time this
+# pushed an artifact nothing had ever started and Flux took it straight to
+# production, so a runtime image that could not exec its own binary was
+# discovered as a crash loop in a cluster. Proving it here is the step that
+# makes the runtime base a decision this repository is allowed to change: it
+# starts both binaries out of the image and reads /healthz from each, so a
+# missing shared library, a missing certificate bundle or a bad entrypoint is a
+# red build instead.
+#
+# Both runtime stages are proven, and only one is pushed. The Dockerfile says
+# which is which and why; the short version is that the chart still runs a shell
+# out of this image, so the distroless stage is built and exercised on every
+# build without yet being the thing a cluster takes.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: [self-hosted]
+    # The trigger on its own gates nothing, and gates less than it looks like it
+    # does. `workflow_run` fires for every conclusion a run can have --
+    # `failure`, `cancelled` and `timed_out` among them -- so the conclusion has
+    # to be asked about here. And `branches: [main]` above filters the HEAD
+    # branch of the run that triggered this one, not "a push to main": CI also
+    # runs on `pull_request`, so a pull request whose own branch is called `main`
+    # -- which is every pull request opened from the default branch of a fork --
+    # produces a CI run this trigger matches. Without the two conditions below,
+    # that fork's code would be checked out and built on the self-hosted runner,
+    # which holds the Harbor credentials, and the image it produced would be
+    # pushed under a tag Flux is watching. So: the run has to have come from a
+    # push, and from this repository rather than somebody's copy of it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          # The commit CI passed, and not the tip of the branch: main may have
+          # moved on while CI was running, and the tag this job mints below is
+          # `git rev-parse HEAD` of whatever is checked out here, so an image must
+          # not be able to carry a sha nothing has tested. `github.ref` is for the
+          # dispatch case, where there is no run to take a sha from.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
           fetch-depth: 0
 
       - name: Work out the tag
         id: tag
+        env:
+          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
         run: |
           set -eu
-          echo "value=$(date -u +%Y%m%d%H%M%S)-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "repo=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          repo="${GITHUB_REPOSITORY##*/}"
+          value="$(date -u +%Y%m%d%H%M%S)-$(git rev-parse --short=7 HEAD)"
+          {
+            echo "value=$value"
+            echo "repo=$repo"
+            echo "image=$HARBOR_HOST/prod/$repo:$value"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to Harbor
         env:
@@ -38,17 +99,48 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" -u "$HARBOR_USERNAME" --password-stdin
 
-      - name: Build and push
+      # Two runtime stages, both built and both proven, only one pushed. The
+      # Debian stage is what production takes today, because the Helm chart runs
+      # an init container out of this same image and that init container needs a
+      # shell; the distroless stage is where it is going, and building and
+      # proving it here is what makes that a one-line change to something known
+      # to work rather than a crash loop discovered in a cluster.
+      #
+      # WHEN THE CHART NO LONGER RUNS A SHELL FROM THIS IMAGE: swap the two
+      # --target values below, so that `runtime` is the stage that gets the real
+      # tag and `compose` is the one only proven. Nothing else here changes.
+      - name: Build
         env:
           DOCKER_BUILDKIT: '1'
-          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
+          IMAGE: ${{ steps.tag.outputs.image }}
         run: |
           set -eu
-          tag="$HARBOR_HOST/prod/${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.value }}"
-          docker build -f Dockerfile -t "$tag" .
-          docker push "$tag"
-          echo "built: $tag"
-          echo "### \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          docker build -f Dockerfile --target shell -t "$IMAGE" .
+          docker build -f Dockerfile --target runtime -t "$IMAGE-distroless" .
+
+      - name: Prove the image that is about to be pushed
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: hack/prove-image.sh "$IMAGE" shell
+
+      # Not pushed, and still a red build if it fails. This is the step that
+      # says whether the distroless runtime can exec its own binaries, find its
+      # certificate bundle and own its volumes -- the three things that cannot
+      # be checked on a machine that has no shell to ask with.
+      - name: Prove the distroless runtime, which is not pushed yet
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: hack/prove-image.sh "$IMAGE-distroless" distroless
+
+
+      - name: Push
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: |
+          set -eu
+          docker push "$IMAGE"
+          echo "built: $IMAGE"
+          echo "### \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up old images
         env:

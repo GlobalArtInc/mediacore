@@ -22,6 +22,14 @@ x-mediacore-image: &mediacore-image
   build:
     context: ..
     dockerfile: Dockerfile
+    # Not the image the chart installs, and that is deliberate. The published
+    # image is distroless -- no shell in it at all -- and the sfu service below
+    # starts through `/bin/sh start-sfu.sh`, which checks the things the server
+    # cannot and builds the ice_servers block. This target is that same build
+    # with debian under it, so the script has a shell to run in. Both stages take
+    # the same two binaries out of the same cargo build; the Dockerfile says the
+    # rest.
+    target: shell
   image: mediacore:local
 
 x-api-secret: &api-secret
@@ -103,7 +111,17 @@ services:
       # candidate the client was given.
       - "${MEDIACORE_RTC_UDP_PORT:-7882}:${MEDIACORE_RTC_UDP_PORT:-7882}/udp"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7880/healthz"]
+      # The server asks itself. There is no curl in the image any more -- the
+      # published one has no shell either -- and the binary already knows what a
+      # healthy answer looks like: it reads `/healthz` and insists the body is
+      # this server's health line, where curl would have accepted a 200 from
+      # anything that happened to be on the port. Its default port is the one
+      # mediacore-config defaults to -- taken from it rather than written out
+      # again -- which is the 7880 mediacore.yaml.template sets below. A
+      # deployment that changes the template's `port:` changes this line with it,
+      # `healthcheck --port <n>`: a fresh process here cannot read the config, so
+      # that is the one thing it has to be told.
+      test: ["CMD", "/usr/local/bin/mediacore", "healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -136,7 +154,16 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      # As on the sfu, and it works out the port with the same code the front end
+      # binds from -- one reading of MEDIACORE_FRONT_PORT, so the two cannot
+      # disagree about which port to ask on. That includes reading it the same way
+      # when it is set and empty, which is what an unset variable interpolates to
+      # here and what a chart renders from a value that is not there: silence,
+      # and 8080. Two readings of it had this check refusing an empty value while
+      # the front end beside it served happily on 8080, which is a container
+      # docker holds `unhealthy` for ever and a caddy that never starts, on a
+      # stack with nothing wrong with it.
+      test: ["CMD", "/usr/local/bin/mediacore-front", "healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5

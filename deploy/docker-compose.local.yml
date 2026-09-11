@@ -20,6 +20,10 @@ x-mediacore-image: &mediacore-image
   build:
     context: ..
     dockerfile: Dockerfile
+    # The stage with a shell in it, because the sfu service starts through
+    # start-sfu.sh. The image this repository publishes is distroless and has
+    # none; see docker-compose.yml and the Dockerfile.
+    target: shell
   image: mediacore:local
 
 x-credentials: &credentials
@@ -57,7 +61,9 @@ services:
       - "127.0.0.1:7880:7880"
       - "127.0.0.1:7882:7882/udp"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7880/healthz"]
+      # The server asks itself: there is no curl in the image, and the binary
+      # checks the answer as well as the status code. See docker-compose.yml.
+      test: ["CMD", "/usr/local/bin/mediacore", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -87,7 +93,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "/usr/local/bin/mediacore-front", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 5
