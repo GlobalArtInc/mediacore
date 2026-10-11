@@ -82,6 +82,7 @@ jobs:
         id: tag
         env:
           HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
         run: |
           set -eu
           repo="${GITHUB_REPOSITORY##*/}"
@@ -90,6 +91,7 @@ jobs:
             echo "value=$value"
             echo "repo=$repo"
             echo "image=$HARBOR_HOST/prod/$repo:$value"
+            echo "mirror=$ASTRUM_HOST/docker-prod/$repo:$value"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to Harbor
@@ -98,6 +100,13 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Log in to Astrum
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          ASTRUM_USERNAME: ${{ secrets.ASTRUM_USERNAME }}
+          ASTRUM_PASSWORD: ${{ secrets.ASTRUM_PASSWORD }}
+        run: printf '%s' "$ASTRUM_PASSWORD" | docker login "$ASTRUM_HOST" -u "$ASTRUM_USERNAME" --password-stdin
 
       # Two runtime stages, both built and both proven, only one pushed. The
       # Debian stage is what production takes today, because the Helm chart runs
@@ -136,11 +145,16 @@ jobs:
       - name: Push
         env:
           IMAGE: ${{ steps.tag.outputs.image }}
+          MIRROR: ${{ steps.tag.outputs.mirror }}
         run: |
           set -eu
+          docker tag "$IMAGE" "$MIRROR"
           docker push "$IMAGE"
+          docker push "$MIRROR"
           echo "built: $IMAGE"
+          echo "built: $MIRROR"
           echo "### \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### \`$MIRROR\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up old images
         env:
@@ -184,4 +198,54 @@ jobs:
               removed += 1
 
           print(f'kept {min(len(artifacts), keep)}, removed {removed}')
+          PYEOF
+
+      - name: Clean up old images in Astrum
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          ASTRUM_USERNAME: ${{ secrets.ASTRUM_USERNAME }}
+          ASTRUM_PASSWORD: ${{ secrets.ASTRUM_PASSWORD }}
+          REPO: ${{ steps.tag.outputs.repo }}
+          KEEP: '15'
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os, re, urllib.parse, urllib.request
+
+          host, repo = os.environ['ASTRUM_HOST'], os.environ['REPO']
+          keep = int(os.environ['KEEP'])
+          auth = base64.b64encode(
+              f"{os.environ['ASTRUM_USERNAME']}:{os.environ['ASTRUM_PASSWORD']}".encode()
+          ).decode()
+          base = f'https://{host}/service/rest/v1/components'
+
+          def call(url, method='GET'):
+              request = urllib.request.Request(url, method=method)
+              request.add_header('Authorization', f'Basic {auth}')
+              request.add_header('Accept', 'application/json')
+              with urllib.request.urlopen(request, timeout=60) as answer:
+                  body = answer.read()
+                  return json.loads(body) if body else None
+
+          components, token = [], None
+          while True:
+              query = {'repository': 'docker-prod'}
+              if token:
+                  query['continuationToken'] = token
+              page = call(f'{base}?{urllib.parse.urlencode(query)}')
+              components += [
+                  c for c in page.get('items', [])
+                  if c.get('name') == repo and re.fullmatch(r'\d{14}-[0-9a-f]+', c.get('version') or '')
+              ]
+              token = page.get('continuationToken')
+              if not token:
+                  break
+
+          components.sort(key=lambda c: c['version'], reverse=True)
+
+          removed = 0
+          for component in components[keep:]:
+              call(f"{base}/{component['id']}", method='DELETE')
+              removed += 1
+
+          print(f'kept {min(len(components), keep)}, removed {removed}')
           PYEOF
