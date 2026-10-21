@@ -10,8 +10,8 @@ M0 through M5 are done and M5.5 (meeting records, events, audio recording and up
 M6 is done without the SDKs, M7 with TURN taken out of it -- a node registry, a signal relay and a
 drain -- and M8 with all three of its parts: `/metrics`, an interop job that runs somebody else's
 SDK against this server, and a load bench that has found this node's ceiling on one machine.
-See [Status](README.md#status). Nothing below contradicts that table: it is the work between the
-milestones and inside them, ordered by what it costs against what it returns.
+What follows is the work between the milestones and inside them, ordered by what it costs against
+what it returns.
 
 ## The next three
 
@@ -92,7 +92,7 @@ asks for a new one.
 *Effort:* a day or two. While temporal layers are not selected and frames are not dropped, the
 offset per source is constant, which is the same arithmetic as `shift()`, not a history of deltas.
 *Depends on:* nothing; the parser is reused by temporal layers.
-*Evidence:* `README.md:405-406`; `crates/sfu/src/forwarder.rs:118-160` — `translate` touches only
+*Evidence:* `d6cfa79:README.md:405-406`; `crates/sfu/src/forwarder.rs:118-160` — `translate` touches only
 seq and timestamp; `crates/sfu/src/packet.rs:76` — the payload is the same `Arc<[u8]>`; greps for
 `picture_id`, `tl0` and `keyidx` come back empty.
 
@@ -113,7 +113,7 @@ two, immediately and without a keyframe.
 *Effort:* a day or two; the parser is already there.
 *Depends on:* worth doing alongside turning `video.bwe.enabled` on — until the flag is on, nothing
 but the allocator drives the second axis.
-*Evidence:* `README.md:377` and `:405` — "temporal layers are still not selected";
+*Evidence:* `d6cfa79:README.md:377` and `:405` — "temporal layers are still not selected";
 `crates/sfu/src/layer.rs:1-27` — the layer type is `SpatialLayer(u8)` and nothing else;
 `selector.rs:27-33`; `alloc.rs:68-79` — arrays of `LAYER_COUNT`.
 
@@ -249,7 +249,7 @@ that there is nothing to delete with.
 will get a 404 afterwards.
 *Evidence:* `crates/recording/src/s3.rs:5-8`; `crates/config/src/lib.rs:412` — no key for a
 lifetime; `crates/session/src/recording.rs:139-148` — `Stage` has exactly two variants;
-`README.md:776-779` — `find -mtime` covers the sessions directory only.
+`d6cfa79:README.md:776-779` — `find -mtime` covers the sessions directory only.
 
 ### A manifest for a closed meeting in the bucket
 
@@ -436,7 +436,7 @@ states outright. So the server-side restart is mandatory for resume, and pointle
 *Effort:* half a day.
 *Depends on:* plan it with resume; on its own it has no visible effect.
 *Evidence:* `crates/transport/src/peer.rs:1800` and `tests/session.rs:282` — `ice_restart(true)` is
-called from tests only; the word does not occur in `crates/server`; `README.md:411`.
+called from tests only; the word does not occur in `crates/server`; `d6cfa79:README.md:411`.
 
 ## Moderation and traces
 
@@ -463,7 +463,7 @@ deliberately, not against automation.
 *Effort:* a day for the ban by person; a day and a half to two with real `revokeTokenTs`, and that
 is a token-format change for everybody embedding this.
 *Depends on:* the `revokeTokenTs` variant is blocked on adding `iat` to `Claims` and to minting.
-*Evidence:* `README.md:592-593`; `crates/server/src/rooms.rs:609-632`;
+*Evidence:* `d6cfa79:README.md:592-593`; `crates/server/src/rooms.rs:609-632`;
 `crates/auth/src/lib.rs:146-152`; `revoke_token_ts` is read nowhere.
 
 ### The caller in the logs and in the events of moderation calls
@@ -695,7 +695,7 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   **Originally:** `ci.yml` runs `fmt`, `clippy --workspace --all-targets`
   and `cargo test --workspace`, all with default features, and `Dockerfile:47` builds without
   features too. `crates/events/src/lib.rs:48` gates a 147-line module with zero tests, and
-  `README.md:1624-1632` gives the two commands that would cover it — commands CI does not run. The
+  `d6cfa79:README.md:1624-1632` gives the two commands that would cover it — commands CI does not run. The
   declared delivery path rots quietly and is absent from the production image. The fix is two lines
   in `ci.yml`, and it needs a C toolchain for `rdkafka-sys`.
 - ~~**`build.yml` is not gated on `ci.yml`.**~~ Done: it starts from a finished CI run and asks for
@@ -719,7 +719,7 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   points for a forwarding hot loop — and exactly the thing that cannot be measured until the load
   bench exists.
 - **`rtc.use_external_ip` is a setting that does nothing.** `crates/server/src/media.rs:166-170`
-  logs a WARN saying so, `README.md:410-412` admits it, and `config-sample.yaml:374` prints it
+  logs a WARN saying so, `d6cfa79:README.md:410-412` admits it, and `config-sample.yaml:374` prints it
   without one word of comment, in a file where every other setting gets a paragraph.
 - **The `rtc:` block in `config-sample.yaml` (lines 367-376) is the only uncommented one**, and it
   is incomplete: `region`, `node_id` (`crates/config/src/lib.rs:51-52`) and
@@ -728,7 +728,7 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   parses, not that it is complete.
 - **The server does not check the length of an API key secret.** `Config::validate`
   (`crates/config/src/lib.rs:974`) only asserts that the key list is non-empty, while the front end
-  refuses to start on a secret under 32 bytes (`crates/front/src/config.rs:31`). `README.md:1472`
+  refuses to start on a secret under 32 bytes (`crates/front/src/config.rs:31`). `d6cfa79:README.md:1472`
   says `cp config-sample.yaml config.yaml`, and the sample carries a working, publicly known
   `devkey` secret that mints any `roomAdmin` token. Neither a length check nor a refusal of the
   sample value exists.
@@ -749,31 +749,26 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
   commit a running node holds.
 - ~~**SIGTERM is unhandled in the front end too.**~~ Done with M7: both binaries catch it, and the
   front end has nothing to drain, so it closes its listener and exits.
-- **Rolling back a release with a migration is undefined.** `README.md:797-799` says there is no
+- **Rolling back a release with a migration is undefined.** `d6cfa79:README.md:797-799` says there is no
   down migration, and migration 4 is forward-only. Production is on Flux, where a rollback is a
   `git revert` of the image tag — and what to do then is written nowhere. At minimum a README
   paragraph and the rule that a migration must survive the previous binary; at most a compatibility
   check in CI.
 - **TLS to Postgres is not implemented** — `sslmode=require` is rejected at startup
-  (`README.md:818-820`), which rules out any managed Postgres and any network where the database is
+  (`d6cfa79:README.md:818-820`), which rules out any managed Postgres and any network where the database is
   not trusted.
-- **`/rtc/v1` is not implemented** (`README.md:413-416`), so a recent `livekit-client` makes a failing
+- **`/rtc/v1` is not implemented** (`d6cfa79:README.md:413-416`), so a recent `livekit-client` makes a failing
   request on every connection before falling back to `/rtc`.
-- **`UpdateTrackSettings.fps` and `priority` are accepted and ignored** (`README.md:406`).
+- **`UpdateTrackSettings.fps` and `priority` are accepted and ignored** (`d6cfa79:README.md:406`).
   `priority` stings: the allocator reasons about priority in `BweConfig`
   (`config-sample.yaml:415`), and the subscriber's declared priority never reaches it.
-- **Unsubscribing parks the m-line instead of renegotiating** (`README.md:408-410`), so SDP sections
+- **Unsubscribing parks the m-line instead of renegotiating** (`d6cfa79:README.md:408-410`), so SDP sections
   accumulate through a long meeting with churn, and a subscriber does not renegotiate on a codec
   change.
 - **There are no `track_published` / `track_unpublished` events.** `crates/events/src/lib.rs:103-111`
   has exactly seven names without them, while the signalling replies `TrackPublished` and
   `TrackUnpublished` are sent (`signal.rs:347`, `peer.rs:606`). A LiveKit webhook consumer learns
   that somebody joined but not that they started publishing.
-- **The README contradicts itself about recording.** `README.md:640` says "Nothing here reads
-  `recordingEnabled`: recording is egress, and there is none yet", while recording is implemented and
-  documented at `README.md:1399+` and the real key is `sessionPolicy.record`
-  (`crates/room/src/lib.rs:124,159`). An integrator reading the metadata section straight through
-  will set `recordingEnabled: true` and get nothing.
 - **The production deployment shape is undocumented here.** Greps for kubernetes, helm, k8s and
   chart across `README.md` and `deploy/README.md` are still empty, while `build.yml` says "Builds
   the image the Helm chart installs". The chart itself has caught up — it installs more than one

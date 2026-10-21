@@ -23,8 +23,8 @@ Two things follow from that one rename, and neither is a rewrite of anything on 
 - the Rust types are `mediacore_proto::mediacore::*`;
 - the room API is served at `POST /twirp/mediacore.RoomService/<Method>`, because Twirp derives its
   path from `<package>.<service>`. The old path is kept as a compatibility alias — LiveKit's server
-  SDKs build it in generated code — under `twirp.livekit_alias`, on by default. See "Server API" in
-  the root README.
+  SDKs build it in generated code — under `twirp.livekit_alias`, on by default. `/swagger` on a running
+  server documents both.
 
 None of it is visible to a client. Protobuf transmits field numbers, not names, and the one
 construct that would put a fully-qualified type name into the bytes, `google.protobuf.Any`, appears

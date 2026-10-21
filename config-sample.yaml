@@ -72,7 +72,7 @@ room:
   # — emptiness is the only thing that ends one. These two are the default for
   # every room; a room can carry a policy of its own in its metadata, under a
   # sessionPolicy key, which is how one reaches CreateRoom through an
-  # unmodified LiveKit server SDK. See "Server API" in the README.
+  # unmodified LiveKit server SDK. See /swagger on a running server.
   min_humans: 0
   end_grace: 90
 
