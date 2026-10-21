@@ -715,9 +715,6 @@ Smaller than the work above and cheaper than all of it, and none of it is in any
 - **No `cargo audit` or `cargo deny`, no dependabot, no `SECURITY.md`.** For a server exposed to the
   internet with str0m, reqwest, rdkafka and a vendored 1.3 MB `livekit-client` bundle, nothing
   watches for CVEs.
-- **No `LICENSE`** in the root, while `Cargo.toml:8` says `license = "Apache-2.0"` and the vendored
-  protos carry Apache headers. `crates/front/assets/vendor` has its `NOTICE.txt`; the repository has
-  nothing.
 - **No `[profile.release]`** at all: the default sixteen codegen units and no LTO. Free percentage
   points for a forwarding hot loop — and exactly the thing that cannot be measured until the load
   bench exists.

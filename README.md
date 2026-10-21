@@ -2087,3 +2087,8 @@ archive was downloaded and nothing about this server. `interop/README.md` says w
 what the job has already found — the first thing it found was that webhook deliveries carried
 `Authorization: Bearer <jwt>` where LiveKit sends the bare token, so no receiver built on their SDK
 could verify one.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). Every feature of the server is free to use, with no licence key and no
+paid tier. Vendored third-party code keeps its own licence, listed in the `NOTICE.txt` next to it.

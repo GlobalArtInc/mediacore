@@ -143,8 +143,8 @@ fn build() -> Value {
             "version": mediacore_proto::SERVER_VERSION,
             "description": preamble(),
             "license": {
-                "name": "Apache-2.0",
-                "url": "https://www.apache.org/licenses/LICENSE-2.0",
+                "name": "MIT",
+                "url": "https://github.com/GlobalArtInc/mediacore/blob/main/LICENSE",
             },
         },
         "tags": [
